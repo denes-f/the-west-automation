@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.6 - Játékablak, görgethető lista)
+// @name         The-West Modular Job Queue (Lisa v11.7 - Alacsonyabb ablak, visszanyitó gomb)
 // @namespace   http://tampermonkey.net/
-// @version     11.6
+// @version     11.7
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -42,7 +42,9 @@
         BOOT_MAX_ATTEMPTS: 60,
         WINDOW_ID: 'lisaExtraQueue',
         PANEL_WIDTH: 320,
-        PANEL_MAX_HEIGHT: 700,
+        PANEL_HEIGHT: 300,           // kb. 9 munkasor látszik, a többi görgetéssel
+        PANEL_TOP: 140,
+        PANEL_RIGHT: 35,
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_QUEUE_LIMIT: 4,     // csak ha a játék TaskQueue-ja elérhetetlen
@@ -1157,6 +1159,7 @@
     // következőt. Kizárólag a sorhossz CSÖKKENÉSÉRE lépünk, így ha a játék
     // mégis elutasítaná az indítást, nem kezdünk el kétmásodpercenként próbálkozni.
     function watchGameQueue() {
+        ensureMenuButton();
         updateQueueBadge();
         updateExtraEtas();
         observePendingHost();
@@ -1233,54 +1236,50 @@
         const st = document.createElement('style');
         st.id = 'lisa-panel-style';
         st.textContent = `
-            .${CONFIG.WINDOW_ID} .tw2gui_window_inset { background-size: 100% 100% !important; }
-            .${CONFIG.WINDOW_ID} .tw2gui_inner_window_bg2 { background-size: auto 100% !important; }
             #lisa-body { display: flex; flex-direction: column; height: 100%; font-family: Georgia,'Times New Roman',serif; }
-            #lisa-status {
-                font: italic 11px Georgia,serif; color: #4a3b28;
-                padding: 2px 4px 4px; flex: 0 0 auto;
-            }
+            #lisa-status { font: italic 11px Georgia,serif; color: #4a3b28; padding: 1px 4px 3px; flex: 0 0 auto; }
+            /* A keret bal és jobb oldalán sötét széldísz fut. A listát beljebb húzzuk,
+               hogy se a szöveg, se az eltávolító ✕ ne lógjon rá. */
             #lisa-scroll {
                 flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+                margin: 0 20px 0 2px;
                 border-top: 1px solid rgba(90,70,45,0.35);
                 border-bottom: 1px solid rgba(90,70,45,0.35);
-                min-height: 60px;
             }
-            #lisa-scroll::-webkit-scrollbar { width: 9px; }
+            #lisa-scroll::-webkit-scrollbar { width: 8px; }
             #lisa-scroll::-webkit-scrollbar-track { background: rgba(90,70,45,0.12); }
-            #lisa-scroll::-webkit-scrollbar-thumb {
-                background: #8a7048; border-radius: 4px; border: 1px solid #6b5636;
-            }
+            #lisa-scroll::-webkit-scrollbar-thumb { background: #8a7048; border-radius: 4px; border: 1px solid #6b5636; }
             #lisa-scroll::-webkit-scrollbar-thumb:hover { background: #a3855a; }
             #lisa-extra-list { list-style: none; margin: 0; padding: 0; }
             #lisa-extra-list li {
                 display: flex; align-items: center; justify-content: space-between;
-                padding: 3px 4px; border-bottom: 1px dotted rgba(90,70,45,0.35);
+                padding: 2px 4px; border-bottom: 1px dotted rgba(90,70,45,0.35);
                 font-size: 12px; color: #3b2f1e;
             }
             #lisa-extra-list li:nth-child(even) { background: rgba(120,95,60,0.07); }
             .lisa-job-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-            .lisa-eta {
-                font-size: 10px; color: #6b5a42; white-space: nowrap;
-                margin-left: 6px; font-variant-numeric: tabular-nums;
-            }
-            #lisa-extra-list .remove {
-                color: #a03020; cursor: pointer; font-weight: bold;
-                margin-left: 8px; font-size: 13px; line-height: 1;
-            }
+            .lisa-eta { font-size: 10px; color: #6b5a42; white-space: nowrap; margin-left: 6px; font-variant-numeric: tabular-nums; }
+            #lisa-extra-list .remove { color: #a03020; cursor: pointer; font-weight: bold; margin-left: 8px; font-size: 13px; line-height: 1; }
             #lisa-extra-list .remove:hover { color: #d04030; }
-            #lisa-empty { padding: 10px 4px; font: italic 11px Georgia,serif; color: #6b5a42; text-align: center; }
+            #lisa-empty { padding: 8px 4px; font: italic 11px Georgia,serif; color: #6b5a42; text-align: center; }
             #lisa-toolbar {
                 flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
-                padding: 5px 2px 0; font-size: 11px; color: #4a3b28;
+                padding: 4px 20px 0 2px; font-size: 11px; color: #4a3b28;
             }
             #lisa-toolbar button {
                 font: 11px Georgia,serif; color: #f0e4c6; cursor: pointer;
                 background: linear-gradient(#6b5636,#4a3b28);
-                border: 1px solid #2e2416; border-radius: 3px; padding: 3px 9px;
+                border: 1px solid #2e2416; border-radius: 3px; padding: 2px 8px;
                 text-shadow: 0 1px 1px #000;
             }
             #lisa-toolbar button:hover { background: linear-gradient(#8a7048,#5c4a30); }
+            #lisa-menu-btn {
+                display: flex; align-items: center; justify-content: center;
+                width: 29px; height: 29px; margin: 2px;
+                font: bold 12px Georgia,serif; color: #e6d5b8; cursor: pointer;
+                background: rgba(70,55,35,0.9); border: 1px solid #b89a6b; border-radius: 3px;
+            }
+            #lisa-menu-btn:hover { background: #b89a6b; color: #1e160e; }
         `;
         document.head.appendChild(st);
     }
@@ -1289,9 +1288,20 @@
         try { return wman.getById(CONFIG.WINDOW_ID) || null; } catch(e) { return null; }
     }
 
-    // A magasságot a nézetablakhoz igazítjuk, hogy minél több munka elférjen.
+    // Az ablak szándékosan alacsony: kb. 9 sor fér el, a többi görgetéssel érhető el.
+    // Ennél magasabbra nem érdemes menni, mert a pergamen háttér natúr magassága
+    // 420 px, efölé nyúlva a keret teteje üresen maradna.
     function panelHeight() {
-        return Math.max(320, Math.min(CONFIG.PANEL_MAX_HEIGHT, window.innerHeight - 140));
+        return Math.max(220, Math.min(CONFIG.PANEL_HEIGHT, window.innerHeight - 180));
+    }
+
+    function applyPanelGeometry(win) {
+        try { win.setSize(CONFIG.PANEL_WIDTH, panelHeight()); } catch(e) {}
+        const el = document.querySelector('.' + CONFIG.WINDOW_ID);
+        if (!el) return;
+        // A korábbi panel helye: jobb felső sarok, a térkép alatt.
+        el.style.left = Math.max(0, window.innerWidth - CONFIG.PANEL_WIDTH - CONFIG.PANEL_RIGHT) + 'px';
+        el.style.top = CONFIG.PANEL_TOP + 'px';
     }
 
     function buildPanelContent(win) {
@@ -1322,25 +1332,55 @@
         return true;
     }
 
-    // Idempotens: ha az ablakot bezárták, a következő hívás újra felépíti.
+    // Idempotens. A wman.close() teljesen megszünteti az ablakot (a getById is
+    // üresen tér vissza), és az újranyitás ÜRES tartalompanelt ad -- ezért a
+    // tartalmat mindig újra fel kell építeni, ha hiányzik.
     function ensurePanel() {
         injectPanelStyles();
         let win = panelWindow();
-        if (win && document.querySelector('.' + CONFIG.WINDOW_ID)) return win;
-        try {
-            win = wman.open(CONFIG.WINDOW_ID, 'Extra Queue');
-        } catch(e) {
-            console.error('[Lisa] Nem sikerült megnyitni a játékablakot:', e);
-            return null;
+        if (!win || !document.querySelector('.' + CONFIG.WINDOW_ID)) {
+            try {
+                win = wman.open(CONFIG.WINDOW_ID, 'Extra Queue');
+            } catch(e) {
+                console.error('[Lisa] Nem sikerült megnyitni a játékablakot:', e);
+                return null;
+            }
+            if (!win) return null;
+            applyPanelGeometry(win);
         }
-        if (!win) return null;
-        try { win.setSize(CONFIG.PANEL_WIDTH, panelHeight()); } catch(e) {}
-        if (!buildPanelContent(win)) return null;
-        updateUI();
+        if (!document.getElementById('lisa-body')) {
+            if (!buildPanelContent(win)) return null;
+            updateUI();
+        }
         return win;
     }
 
-    function showLisaPanel() { ensurePanel(); }
+    function showLisaPanel() {
+        const win = ensurePanel();
+        try { if (win) win.bringToTop(); } catch(e) {}
+    }
+
+    // Visszanyitó gomb a menüsorban, a fogaskerék alatt -- a wman ✕-e teljesen
+    // bezárja az ablakot, e nélkül nem lenne út vissza.
+    function ensureMenuButton() {
+        if (document.getElementById('lisa-menu-container')) return;
+        const menubar = document.getElementById('ui_menubar');
+        if (!menubar) return;
+        const container = document.createElement('div');
+        container.className = 'ui_menucontainer';
+        container.id = 'lisa-menu-container';
+        const link = document.createElement('div');
+        link.className = 'menulink';
+        link.id = 'lisa-menu-btn';
+        link.title = 'Extra Queue megnyitása';
+        link.textContent = 'EQ';
+        link.addEventListener('click', showLisaPanel);
+        const bottom = document.createElement('div');
+        bottom.className = 'menucontainer_bottom';
+        container.appendChild(link);
+        container.appendChild(bottom);
+        menubar.appendChild(container);
+    }
 
     function updateUI() { updateExtraList(); updateQueueBadge(); }
 
@@ -1438,6 +1478,7 @@
         // újra migrálnánk, és a normalizált alak sosem rögzülne.
         saveHistoryToStorage();
         ensurePanel();
+        ensureMenuButton();
         updateUI();
         updateUIStatus(isLeaderTab
             ? 'Kész.'
@@ -1468,5 +1509,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.6 betöltve.');
+    console.log('[Lisa] Modular v11.7 betöltve.');
 })();

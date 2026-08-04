@@ -127,15 +127,25 @@ window** — frame, title bar, minimize/close buttons, dragging. The returned ob
 `destroy`. `wman.getById(uid)` retrieves it; `wman.close(uid)` closes it. `west.gui` also offers
 `Scrollpane`, `Button`, `Table` etc. if native widgets are ever wanted.
 
-Background layers, measured — this matters for tall windows:
+Background layers, measured — these cap how tall a window can usefully be:
 
 - `.tw2gui_window_inset` carries the **parchment field**: natural **721×420**, `no-repeat`, anchored
   bottom-left. Any window taller than ~454 px leaves the top bare.
 - `.tw2gui_inner_window_bg2` is a **32×420** right-hand edge strip anchored bottom-right.
 
-Fix (scoped to our window class only): `background-size: 100% 100%` on the inset, and
-`background-size: auto 100%` on `bg2`. Stretching `bg2` in both directions smears its dark edge into
-a wide band across the window — it must only stretch vertically.
+**Keep the window under ~450 px and no override is needed** — the parchment covers it naturally and
+the frame looks exactly like the game's. Stretching the layers to allow a taller window is possible
+(`background-size: 100% 100%` on the inset, `auto 100%` on `bg2` — never both axes on `bg2`, it
+smears the dark edge into a wide band) but it isn't worth it: the panel scrolls instead.
+
+The frame has dark edge decorations on **both sides** that intrude into the content pane (the right
+strip reaches ~21 px in). Inset the content (`margin: 0 20px 0 2px`) so the remove ✕ doesn't sit on
+them.
+
+`wman.close(uid)` **destroys** the window — `getById` then returns nothing and reopening yields an
+**empty** content pane. So the panel must be rebuilt on reopen, and there must be a way back:
+a `.ui_menucontainer` + `.menulink` appended to `#ui_menubar` renders right under the gear icon.
+(`#ui_scripts` exists and looks like the natural home, but the game keeps it `display:none`.)
 
 ### Cancel-all
 
