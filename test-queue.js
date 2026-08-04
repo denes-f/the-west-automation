@@ -63,7 +63,6 @@ const offerSleepIfForecastRunsOut = () => {};
 const renderPendingInGameQueue = () => {};
 const observePendingHost = () => {};
 const ensureMenuButton = () => {};
-const ensureProcessing = () => {};
 const scheduleNextJob = (ms) => { scheduled = ms; nextJobTimer = 1; };
 const generateId = (() => { let n = 0; return () => 'id' + (++n); })();
 const quiet = () => {};
@@ -72,7 +71,7 @@ console.log = quiet; console.warn = quiet; console.error = quiet;
 
 eval([
     'gameReady', 'gameQueueLength', 'gameQueueLimit', 'freeSlots', 'nextFreeAtMs',
-    'waitUntilFreeSlotMs', 'startJobsViaGame', 'addExtraJobs', 'formatDuration',
+    'waitUntilFreeSlotMs', 'startJobsViaGame', 'addExtraJobs', 'formatDuration', 'ensureProcessing',
 ].map(extract).join('\n'));
 eval(extract('processQueue'));
 console.log = real;
@@ -700,6 +699,67 @@ eq('az alvás a mögötte állókra gyűjt', sleepGoalForEntry(extraJobs[0], 0),
 extraJobs[0].sleepMode = 'full';
 eq('teljes módban a szoba szintjéig', sleepGoalForEntry(extraJobs[0], 0), 150);
 extraJobs = [];
+
+// ============================================================
+//  Az alvás módja csak akkor öröklődik, ha tényleg VÁLASZTOTTÁK
+// ============================================================
+// Élesben: kézzel indított alvás után a script meg sem kérdezte, meddig
+// aludjon, és teljesnek vette -- mert a kézi alvás alapértelmezett 'full'
+// módját is döntésnek hitte, és azt a következő alvásra is átvitte.
+console.log('\n=== Alvásmód öröklése ===');
+eval(extract('makeSleepEntry'));
+const estimateSleepSecondsOrig = estimateSleepSeconds;
+eq('a felajánlásból választott mód döntés',
+   (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'enough')), ['enough', true]);
+eq('a teljes alvás választása is döntés',
+   (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'full')), ['full', true]);
+eq('a kézi alvásnál nincs döntés, csak alapértelmezés',
+   (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, undefined)), ['full', false]);
+eq('a döntés nélküli mód nem kerül a névbe',
+   makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, undefined).jobName, 'Alvás – Kamra');
+eq('az "amennyi kell" viszont látszik a néven',
+   makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'enough').jobName, 'Alvás – Kamra (amennyi kell)');
+
+// A mentés is megőrzi, hogy volt-e döntés
+eq('a döntés túléli a mentést', sanitizeJobs([
+    { taskType: 'sleep', townId: 4206, room: 'cubby', sleepMode: 'enough', modeChosen: true },
+])[0].modeChosen, true);
+eq('a döntés hiánya is túléli', sanitizeJobs([
+    { taskType: 'sleep', townId: 4206, room: 'cubby', sleepMode: 'full' },
+])[0].modeChosen, false);
+
+// ============================================================
+//  Új munka előrehozza a következő kört
+// ============================================================
+// Élesben: a sorba tett alvás "nem csinált semmit", és csak egy oldalfrissítés
+// hozta meg -- mert egy hosszú visszatartás alatt az ensureProcessing nem
+// ütemezett újra.
+console.log('\n=== Új munka és a futó várakozás ===');
+CONFIG.NEW_WORK_DELAY = 500;
+const armed = (deadlineInMs) => { nextJobTimer = 1; nextJobDeadline = Date.now() + deadlineInMs; scheduled = null; };
+
+extraJobs = mkJobs(1); processing = false; paused = false;
+armed(600000);                                   // tízperces visszatartás fut
+ensureProcessing();                              // szívverés: NE nyúljon hozzá
+eq('a szívverés nem rúgja fel a visszatartást', scheduled, null);
+ensureProcessing(CONFIG.NEW_WORK_DELAY);         // új munka érkezett
+eq('új munka viszont előrehozza', scheduled, 500);
+
+armed(200);                                      // már amúgy is hamarosan indul
+ensureProcessing(CONFIG.NEW_WORK_DELAY);
+eq('a közelebbi határidőt nem tolja ki', scheduled, null);
+
+nextJobTimer = null; scheduled = null;
+ensureProcessing(CONFIG.NEW_WORK_DELAY);
+eq('időzítő nélkül ütemez', scheduled, 500);
+
+paused = true; scheduled = null; nextJobTimer = null;
+ensureProcessing(CONFIG.NEW_WORK_DELAY);
+eq('szüneteltetve nem indul', scheduled, null);
+paused = false;
+extraJobs = []; scheduled = null;
+ensureProcessing(CONFIG.NEW_WORK_DELAY);
+eq('üres listára nem ütemez', scheduled, null);
 
 // ============================================================
 //  Alvás: szobaválasztás és célszint

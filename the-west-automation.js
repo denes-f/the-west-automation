@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.8)
+// @name         The-West Modular Job Queue (Lisa v12.9)
 // @namespace   http://tampermonkey.net/
-// @version     12.8
+// @version     12.9
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -39,6 +39,7 @@
         MIN_SEND_GAP: 2000,          // két egymást követő küldés között
         WATCH_INTERVAL: 1000,        // ilyen sűrűn nézzük a játék sorát és az időpontokat
         SLOT_FREED_DELAY: 400,       // felszabadult slot után ennyivel indítjuk a következőt
+        NEW_WORK_DELAY: 500,         // új munka érkezésekor eddig hozzuk előre a következő kört
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
         TIMER_CHUNK: 60000,          // hosszú várakozást ekkora darabokban ébresztünk
         LEADER_HEARTBEAT: 5000,
@@ -752,11 +753,27 @@
     // teljes alvás: az alvó karaktert nem lehet párbajra hívni.
     function runningSleepMode(task) {
         if (!task) return 'full';
-        if (pendingSleepMode && !runningSleepDecision) return pendingSleepMode;
         if (runningSleepDecision && runningSleepDecision.queueId === task.queueId) {
             return runningSleepDecision.mode;
         }
         return 'full';
+    }
+
+    // A saját listánkból indított alvás VÁLASZTOTT módját hozzákötjük a most
+    // létrejött munkához. Ez nem várhat a "van-e munka" feltételre: ha addig
+    // várna, egy döntés nélkül maradt mód később egy TELJESEN MÁS alváshoz
+    // ragadna hozzá -- élesben pontosan ez történt, egy kézzel indított alvás
+    // után a script meg sem kérdezte, meddig aludjon, és teljesnek vette.
+    function adoptPendingSleepMode() {
+        if (!pendingSleepMode || !gameReady()) return;
+        const task = window.TaskQueue.queue.find(t => t && t.type === 'sleep');
+        if (task && task.queueId) {
+            saveSleepDecision(task.queueId, pendingSleepMode);
+            pendingSleepMode = null;
+            return;
+        }
+        // Nincs alvás sem a játék sorában, sem a miénkben: a függő mód elárvult.
+        if (!extraJobs.some(j => j.taskType === 'sleep')) pendingSleepMode = null;
     }
 
     function canSleep() {
@@ -861,10 +878,14 @@
     // mert épp az a dolga, hogy a soron következő munkát tegye indíthatóvá.
     function makeSleepEntry(townId, room, roomName, x, y, mode) {
         const sleepMode = mode === 'enough' ? 'enough' : 'full';
+        // A hotelben kézzel indított alvásnál a felhasználó NEM választott
+        // hosszt -- a 'full' csak alapértelmezés. Ezt külön jelöljük, különben
+        // úgy vennénk, mintha döntött volna, és soha nem kérdeznénk meg.
+        const modeChosen = mode === 'enough' || mode === 'full';
         return {
             id: generateId(), retries: 0, deferrals: 0, rejections: 0,
             taskType: 'sleep',
-            townId, room, sleepMode,
+            townId, room, sleepMode, modeChosen,
             jobName: `Alvás – ${roomName || room}${sleepMode === 'enough' ? ' (amennyi kell)' : ''}`,
             jobId: 0,
             x: x || 0, y: y || 0,
@@ -895,7 +916,7 @@
                 saveExtraQueueToStorage();
                 updateUI();
                 updateUIStatus(`Alvás sorba állítva (${extraJobs.length} várakozik).`);
-                ensureProcessing();
+                ensureProcessing(CONFIG.NEW_WORK_DELAY);
 
                 // A szoba adatai kellenek a megszakításhoz is (meddig tölt fel),
                 // nem csak a névhez. Ha még nincsenek meg, most kérjük le.
@@ -935,7 +956,7 @@
             updateUIStatus(pos === 0
                 ? `Alvás beszúrva a sor elejére (${room.name || room.key}).`
                 : `Alvás beszúrva a(z) ${pos + 1}. helyre (${room.name || room.key}).`);
-            ensureProcessing();
+            ensureProcessing(CONFIG.NEW_WORK_DELAY);
         });
     }
 
@@ -1030,18 +1051,15 @@
     // menjen végig, vagy szakadjon meg, amint a munkákra elég energia gyűlt.
     // Alvásonként egyszer kérdezünk, a válasz a munka azonosítójához kötve marad.
     function askRunningSleepMode() {
-        if (!CONFIG.AUTO_SLEEP || sleepModeAsked) return;
+        if (!CONFIG.AUTO_SLEEP) return;
         if (!gameReady() || !isLeaderTab) return;
+        // A választott mód átvétele nem függhet attól, van-e épp várakozó munka.
+        adoptPendingSleepMode();
+        if (sleepModeAsked) return;
         const task = window.TaskQueue.queue.find(t => t && t.type === 'sleep');
         if (!task || !task.queueId) return;
         if (!hasWorkWaiting()) return;                       // nincs miért ébredni
         if (runningSleepDecision && runningSleepDecision.queueId === task.queueId) return;
-        // A saját listánkból indított alvás döntése már megvan: vegyük át.
-        if (pendingSleepMode) {
-            saveSleepDecision(task.queueId, pendingSleepMode);
-            pendingSleepMode = null;
-            return;
-        }
         if (!window.west || !west.gui || typeof west.gui.Dialog !== 'function') {
             saveSleepDecision(task.queueId, 'full');         // kérdezni sem tudunk
             return;
@@ -1601,7 +1619,7 @@
         addJobToHistory({ ...jobData, jobName: name });
         updateUI();
         updateUIStatus(`${added} munka sorba állítva (${extraJobs.length} várakozik).`);
-        ensureProcessing();
+        ensureProcessing(CONFIG.NEW_WORK_DELAY);
     }, true);
 
     // ------------------------------------------------------------
@@ -1670,7 +1688,7 @@
         addJobToHistory({ ...jobData, jobName: name });
         updateUI();
         updateUIStatus(`${name} sorba állítva (${extraJobs.length} várakozik).`);
-        ensureProcessing();
+        ensureProcessing(CONFIG.NEW_WORK_DELAY);
     }, true);
 
     // ------------------------------------------------------------
@@ -1831,7 +1849,7 @@
                         const queued = addExtraJobs(task, remaining, jobName);
                         updateUI();
                         updateUIStatus(`${queued} maradék munka az extra sorba helyezve.`);
-                        ensureProcessing();
+                        ensureProcessing(CONFIG.NEW_WORK_DELAY);
                     }
                 }
 
@@ -1917,9 +1935,23 @@
     // ============================================================
     //  12. FELDOLGOZÁS
     // ============================================================
-    function ensureProcessing() {
-        if (!processing && !paused && extraJobs.length > 0 && !nextJobTimer) {
-            scheduleNextJob(500);
+    // Alaphelyzetben csak akkor ütemez, ha egyáltalán nincs időzítő -- így a
+    // szándékos várakozásokat (tele sor, elutasítás utáni visszatartás) nem
+    // rúgja fel a másodpercenkénti szívverés.
+    //
+    // ÚJ munka érkezésekor viszont a `pullInMs`-szel előre lehet hozni a
+    // határidőt: enélkül egy épp futó, akár tízperces visszatartás alatt
+    // hozzáadott munka csak a visszatartás végén indult volna el. Élesben ez
+    // úgy nézett ki, hogy a sorba tett alvás "nem csinál semmit", és csak egy
+    // oldalfrissítés hozta meg.
+    function ensureProcessing(pullInMs) {
+        if (processing || paused || extraJobs.length === 0) return;
+        if (!nextJobTimer) {
+            scheduleNextJob(pullInMs || 500);
+            return;
+        }
+        if (typeof pullInMs === 'number' && nextJobDeadline > Date.now() + pullInMs) {
+            scheduleNextJob(pullInMs);
         }
     }
 
@@ -2015,7 +2047,9 @@
                 started.forEach(j => { j.retries = 0; });
                 // Az alvás módja utazzon tovább a most induló munkára: így nem
                 // kérdezzük meg újra azt, amiről a felhasználó épp döntött.
-                const startedSleep = started.find(j => j.taskType === 'sleep');
+                // CSAK a ténylegesen választott mód utazik tovább. A kézzel
+                // indított alvásnál nincs döntés, azt majd megkérdezzük.
+                const startedSleep = started.find(j => j.taskType === 'sleep' && j.modeChosen);
                 if (startedSleep) pendingSleepMode = startedSleep.sleepMode || 'full';
                 saveExtraQueueToStorage();
                 updateUI();
@@ -2127,6 +2161,7 @@
                     base.townId = parseInt(j.townId, 10);
                     base.room = j.room;
                     base.sleepMode = j.sleepMode === 'enough' ? 'enough' : 'full';
+                    base.modeChosen = !!j.modeChosen;
                 }
                 return base;
             })
@@ -2353,7 +2388,7 @@
                 if (data) {
                     extraJobs = sanitizeJobs(data);
                     updateExtraList();
-                    ensureProcessing();
+                    ensureProcessing(CONFIG.NEW_WORK_DELAY);
                 }
             } else if (e.key === CONFIG.STORAGE_HISTORY) {
                 loadHistoryFromStorage();
@@ -2832,5 +2867,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.8 betöltve.');
+    console.log('[Lisa] Modular v12.9 betöltve.');
 })();

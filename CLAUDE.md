@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 187 assertions, no dependencies.
+  name and runs them against stubs. 200 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.8.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.9.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `187 passed, 0 failed`.
+2. `node test-queue.js` should print `200 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -62,7 +62,7 @@ you spent.
 **Only one game tab.** A second tab holding the leader lock is what made v11.0 look completely
 broken. Close your own tab when finished.
 
-## State of play (end of the v12.8 session)
+## State of play (end of the v12.9 session)
 
 Everything is committed and pushed on `dev`; `main` is at v12.0 and has not been moved since.
 The user runs the script on two accounts: the `hu27` test character (level 10, max energy 100, in a
@@ -75,10 +75,12 @@ and their forced visibility, the travel-rate formula, motivation and energy-cost
 regeneration formula, the forecast bar's placement and appearance (including alongside *twdb*), all
 three dialogs' rendering, and cancelling a running sleep.
 
-Verified **only by unit tests**, never yet exercised end-to-end in a real game: the
-rejected-job requeue path (its trigger was reproduced live, but the recovery was written
-afterwards), and the `'enough'` sleep mode with its live-recalculated goal. Both are worth watching
-the first time they fire for real.
+Also confirmed live by the user in v12.9: the running-sleep dialog, the `'enough'` mode and its
+live-recalculated goal (queueing more jobs mid-sleep moved the wake-up correctly).
+
+Verified **only by unit tests**, never yet exercised end-to-end in a real game: the rejected-job
+requeue path — its trigger was reproduced live, but the recovery was written afterwards. Worth
+watching the first time it fires for real.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -424,6 +426,12 @@ and "Nem" correctly does nothing.
   (`STORAGE_SLEEP_MODE`), so a reload doesn't re-ask; a sleep the script started carries the
   decision over via `pendingSleepMode`. **Dismissing either dialog means `'full'`** — the safe
   default, since a sleeping character cannot be duelled.
+  **Only an explicitly chosen mode carries over** (`modeChosen`). A sleep started by hand in the
+  hotel gets `'full'` merely as a *default*, and treating that as a decision is what made the
+  script stop asking entirely: the defaulted mode was adopted by the next, unrelated sleep, which
+  then silently ran full-length. For the same reason `adoptPendingSleepMode` binds a pending mode
+  to its queue entry on the very next tick, **before** the "is there work waiting" check — an
+  unbound mode must never survive long enough to be picked up by a different sleep.
   `queueTailAnchor` also clamps a running sleep's 8-hour `date_done` to the predicted wake-up,
   otherwise every following ETA would be pushed eight hours out.
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
@@ -435,6 +443,12 @@ and "Nem" correctly does nothing.
   The game rebuilds that container on every queue change and drops our rows with it; waiting for the
   poll made them visibly blink out and back. The observer only re-renders when our separator is
   *absent*, so our own writes don't loop.
+- **`ensureProcessing(pullInMs)`** deliberately does nothing when a timer is already armed —
+  otherwise the 5-second leadership heartbeat would trample every intentional wait (full queue,
+  rejection backoff). But *new* work must pass `pullInMs` to pull the deadline in, or a job added
+  during a ten-minute backoff sits idle until that backoff expires. Live symptom: a sleep queued
+  by hand "did nothing" and only a page reload started it. Every user-facing add path passes
+  `CONFIG.NEW_WORK_DELAY`; the heartbeat and boot deliberately do not.
 - **`watchGameQueue`** every 1 s: refreshes the badge and ETAs, re-injects in-game rows, and on a
   **decrease** in queue length starts the next job within 0.4 s. Keying on the decrease (not on
   "free slots exist") is deliberate — otherwise a refusal would retry every 2 s forever.
