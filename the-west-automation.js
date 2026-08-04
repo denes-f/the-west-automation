@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.4 - Utazási idő és időtartamsávok)
+// @name         The-West Modular Job Queue (Lisa v11.5 - Gyorsindítás, összes törlése, egyszerűbb panel)
 // @namespace   http://tampermonkey.net/
-// @version     11.4
+// @version     11.5
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -41,12 +41,12 @@
         MAX_HISTORY: 60,
         BOOT_MAX_ATTEMPTS: 60,
         PANEL_WIDTH: 320,
-        BUTTON_COOLDOWN: 1500,
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_QUEUE_LIMIT: 4,     // csak ha a játék TaskQueue-ja elérhetetlen
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
+        JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
         GAME_QUEUE_PREVIEW: 8,       // ennyi várakozó munka látszik a játék sorában
         PANEL_PREVIEW: 8,            // ennyi látszik a script paneljén (a játékbelivel egyezően)
     };
@@ -68,10 +68,8 @@
     let lastSeenQueueLen = 0;
     let renderedPendingKey = '';
 
-    let uiPanel, uiExtraList, uiHistoryList, uiStatus, uiExtraCount, uiHistoryCount;
+    let uiPanel, uiExtraList, uiStatus, uiExtraCount;
     let uiQueueStatus;
-    let addingFromHistory = false;
-    let addButton = null;
     let showButton = null; // a menüsorban lévő gomb
 
     const OriginalXHR = window.XMLHttpRequest;
@@ -640,6 +638,130 @@
         ensureProcessing();
     }, true);
 
+    // ------------------------------------------------------------
+    //  Gyorsindító nyilak a térképen
+    // ------------------------------------------------------------
+    // A térképen egy munkacsoportra kattintva körben szétnyílnak az egyes munkák
+    // ikonjai (.job.job-{jobId}), és fölé húzva megjelenik a gyorsindító nyíl
+    // (.instantwork-short | -middle | -long). Ez megkerüli a nagy munkaablakot,
+    // ezért ugyanúgy el kell kapnunk, különben az így indított munka beelőzne a
+    // már sorban állók elé.
+    //
+    // A .job elem közvetlenül a #map gyereke, koordinátát nem hordoz. A szétnyílt
+    // kör alatt viszont ott marad a csoport ikonja a posx-/posy- osztályokkal,
+    // pontosan a kör közepén: mérve 0 px-re a középponttól, míg a következő
+    // csoport 528 px-re volt. Ezért a helyszínt a legközelebbi csoportból vesszük,
+    // biztonsági távolsághatárral.
+    function nearestJobGroup(el) {
+        const r = el.getBoundingClientRect();
+        const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        let best = null;
+        for (const g of document.querySelectorAll('.jobgroup')) {
+            const m = String(g.className).match(/posx-(\d+)\s+posy-(\d+)/);
+            if (!m) continue;
+            const gr = g.getBoundingClientRect();
+            if (!gr.width) continue;
+            const dist = Math.hypot(gr.x + gr.width / 2 - cx, gr.y + gr.height / 2 - cy);
+            if (!best || dist < best.dist) best = { x: parseInt(m[1], 10), y: parseInt(m[2], 10), dist };
+        }
+        return (best && best.dist <= CONFIG.JOBGROUP_MAX_DIST) ? best : null;
+    }
+
+    document.addEventListener('click', function(e) {
+        const arrow = e.target.closest('[class*="instantwork-"]');
+        if (!arrow || !gameReady()) return;
+
+        const base = (String(arrow.className).match(/instantwork-(short|middle|long)/) || [])[1];
+        const jobEl = arrow.closest('[class*="job-"]');
+        const idMatch = jobEl && String(jobEl.className).match(/\bjob-(\d+)\b/);
+        if (!base || !idMatch) return;
+
+        const jobId = parseInt(idMatch[1], 10);
+        const spot = nearestJobGroup(jobEl);
+        let duration = null;
+        try {
+            const all = JobList.getDurations();
+            duration = all && all[base] && all[base].duration;
+        } catch(err) {}
+
+        // Ha bármi hiányzik, NEM nyúlunk hozzá: menjen a játék saját útján.
+        // Rossz koordinátával indítani rosszabb, mint nem elkapni a kattintást.
+        if (!spot || !duration) {
+            console.warn('[Lisa] Gyorsindítás: nincs meg a helyszín vagy az időtartam, marad a játéké.');
+            return;
+        }
+
+        // A #map delegált kezelője a .job és .instantwork elemekre is figyel,
+        // ezért itt kell megállítani, különben a játék is elindítaná a munkát.
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        let name = `Job #${jobId}`;
+        try { const j = JobList.getJobById(jobId); if (j && j.name) name = j.name; } catch(err) {}
+
+        const jobData = { jobId, x: spot.x, y: spot.y, duration, taskType: 'job' };
+        addExtraJobs(jobData, 1, name);
+        addJobToHistory({ ...jobData, jobName: name });
+        updateUI();
+        updateUIStatus(`${name} sorba állítva (${extraJobs.length} várakozik).`);
+        ensureProcessing();
+    }, true);
+
+    // ------------------------------------------------------------
+    //  "Összes munka törlése" -- a várakozókat is törli
+    // ------------------------------------------------------------
+    // A gomb megerősítő dialógust nyit ("Az összes munka törlése", Igen/Nem), és
+    // csak jóváhagyás után ürít. Ilyenkor a szándék egyértelmű: álljon meg minden.
+    // Ha csak a játék sora ürülne, a script másfél másodperc múlva újratöltené a
+    // slotokat, azaz visszacsinálná a törlést -- és újra elköltené a megszakítással
+    // visszakapott energiát.
+    //
+    // Nem a gombra lépünk, hanem a MEGERŐSÍTÉSRE: a dialógus valamelyik gombja
+    // után rövid ablakban figyeljük, tényleg kiürült-e a sor. Így a "Nem" nem
+    // töröl semmit, és nem függünk a dialógus szövegétől sem.
+    function clearExtraAfterCancelAll() {
+        if (!extraJobs.length) return;
+        const count = extraJobs.length;
+        extraJobs = [];
+        saveExtraQueueToStorage();
+        updateUI();
+        updateUIStatus(`Minden munka törölve – ${count} várakozó is.`);
+        console.log(`[Lisa] Összes törlése megerősítve: ${count} várakozó munka törölve.`);
+    }
+
+    function watchCancelAllConfirm() {
+        let waited = 0;
+        const findDialog = setInterval(() => {
+            waited++;
+            const dlg = document.querySelector('.tw2gui_dialog');
+            if (!dlg) {
+                if (waited > 15) clearInterval(findDialog);
+                return;
+            }
+            clearInterval(findDialog);
+            dlg.addEventListener('click', (ev) => {
+                if (!ev.target.closest('.tw2gui_button')) return;
+                const before = gameQueueLength();
+                if (!before) return;
+                let ticks = 0;
+                const confirmed = setInterval(() => {
+                    ticks++;
+                    if (gameQueueLength() === 0) {
+                        clearInterval(confirmed);
+                        clearExtraAfterCancelAll();
+                    } else if (ticks > 15) {
+                        clearInterval(confirmed);   // "Nem" -- a sor megmaradt
+                    }
+                }, 200);
+            }, true);
+        }, 200);
+    }
+
+    document.addEventListener('click', function(e) {
+        // Csak megfigyelünk, a játék gombja a szokásos módon működik tovább.
+        if (e.target.closest('#cancelAllInQueue')) watchCancelAllConfirm();
+    }, true);
+
     function InterceptedXHR() {
         const xhr = new OriginalXHR();
         const origOpen = xhr.open;
@@ -710,7 +832,6 @@
                 jobHistory[existingIndex].timestamp = Date.now();
                 jobHistory.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                 saveHistoryToStorage();
-                if (uiHistoryList) updateUI();
             }
             return;
         }
@@ -726,7 +847,6 @@
         });
         if (jobHistory.length > CONFIG.MAX_HISTORY) jobHistory.length = CONFIG.MAX_HISTORY;
         saveHistoryToStorage();
-        if (uiHistoryList) updateUI();
     }
 
     // ============================================================
@@ -838,7 +958,7 @@
                 console.log(`[Lisa] Elfogadva ${accepted} munka (sor: ${gameQueueLength()}/${gameQueueLimit()})`);
 
                 if (extraJobs.length === 0) {
-                    updateUIStatus(`Kész – minden munka elindítva (sor: ${gameQueueLength()}/${gameQueueLimit()}).`);
+                    updateUIStatus('Kész – minden munka elindítva.');
                     return;
                 }
                 if (freeSlots() > 0) {
@@ -1065,7 +1185,6 @@
                 }
             } else if (e.key === CONFIG.STORAGE_HISTORY) {
                 loadHistoryFromStorage();
-                updateHistoryList();
             }
         });
     }
@@ -1189,28 +1308,6 @@
                 margin: 4px 10px;
                 font-style: italic;
             }
-            #lisa-panel .tab-bar {
-                display: flex;
-                margin: 0 6px;
-            }
-            #lisa-panel .tab {
-                flex: 1;
-                text-align: center;
-                padding: 4px;
-                border: 1px solid #b89a6b;
-                cursor: pointer;
-                background: rgba(60, 50, 40, 0.8);
-                border-radius: 4px 4px 0 0;
-                font-size: 12px;
-                color: #c8b48c;
-                margin-right: -1px;
-            }
-            #lisa-panel .tab.active {
-                background: #b89a6b;
-                color: #1e160e;
-                font-weight: bold;
-                border-bottom: 1px solid #b89a6b;
-            }
             #lisa-panel .list-container {
                 flex: 1;
                 overflow-y: auto;
@@ -1243,7 +1340,7 @@
             #lisa-panel li .remove:hover {
                 color: #ff7070;
             }
-            #lisa-panel .extra-controls, #lisa-panel .history-controls {
+            #lisa-panel .extra-controls {
                 padding: 5px 8px;
                 border-top: 1px solid #5a4a3a;
                 display: flex;
@@ -1251,7 +1348,7 @@
                 align-items: center;
                 font-size: 11px;
             }
-            #lisa-panel .extra-controls button, #lisa-panel .history-controls button {
+            #lisa-panel .extra-controls button {
                 background: rgba(70, 55, 35, 0.8);
                 border: 1px solid #b89a6b;
                 color: #e6d5b8;
@@ -1261,23 +1358,13 @@
                 padding: 3px 8px;
                 border-radius: 3px;
             }
-            #lisa-panel .extra-controls button:hover, #lisa-panel .history-controls button:hover {
+            #lisa-panel .extra-controls button:hover {
                 background: #b89a6b;
                 color: #1e160e;
             }
             #lisa-panel .count-info {
                 font-size: 10px;
                 color: #8a7a6a;
-            }
-            .lisa-count-input {
-                width: 45px;
-                background: rgba(30, 25, 20, 0.9);
-                border: 1px solid #5a4a3a;
-                color: #e6d5b8;
-                font-family: inherit;
-                text-align: center;
-                margin-left: 6px;
-                border-radius: 3px;
             }
             .lisa-more-row {
                 justify-content: center;
@@ -1299,10 +1386,6 @@
                 text-overflow: ellipsis;
                 white-space: nowrap;
             }
-            #lisa-queue-selected:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
             #lisa-queue-status {
                 font-size: 11px;
                 margin-left: 8px;
@@ -1322,55 +1405,27 @@
                 </div>
             </div>
             <div class="status" id="lisa-status">Inicializálás...</div>
-            <div class="tab-bar">
-                <div id="tab-extra" class="tab active">Extra Sor</div>
-                <div id="tab-history" class="tab">Előzmények</div>
-            </div>
-            <div id="extra-tab-content">
-                <div class="list-container"><ul id="lisa-extra-list"></ul></div>
-                <div class="extra-controls">
-                    <button id="lisa-clear-extra">Törlés</button>
-                    <span class="count-info">Munkák: <span id="lisa-extra-count">0</span></span>
-                </div>
-            </div>
-            <div id="history-tab-content" style="display:none;">
-                <div class="list-container"><ul id="lisa-history-list"></ul></div>
-                <div class="history-controls">
-                    <button id="lisa-queue-selected">Kiválasztottak sorba</button>
-                    <button id="lisa-clear-history">Előzmények törlése</button>
-                    <span class="count-info">Rögzítve: <span id="lisa-history-count">0</span></span>
-                </div>
+            <div class="list-container"><ul id="lisa-extra-list"></ul></div>
+            <div class="extra-controls">
+                <button id="lisa-clear-extra">Törlés</button>
+                <span class="count-info">Munkák: <span id="lisa-extra-count">0</span></span>
             </div>
         `;
         document.body.appendChild(uiPanel);
 
         uiStatus = document.getElementById('lisa-status');
         uiExtraList = document.getElementById('lisa-extra-list');
-        uiHistoryList = document.getElementById('lisa-history-list');
         uiExtraCount = document.getElementById('lisa-extra-count');
-        uiHistoryCount = document.getElementById('lisa-history-count');
         uiQueueStatus = document.getElementById('lisa-queue-status');
-        addButton = document.getElementById('lisa-queue-selected');
 
         document.getElementById('lisa-pause-btn').addEventListener('click', togglePause);
         document.getElementById('lisa-hide-btn').addEventListener('click', hideLisaPanel);   // átkötve az új függvényre
         document.getElementById('lisa-clear-extra').addEventListener('click', clearExtraQueue);
-        addButton.addEventListener('click', addSelectedToExtra);
-        document.getElementById('lisa-clear-history').addEventListener('click', clearHistory);
-        document.getElementById('tab-extra').addEventListener('click', () => switchTab('extra'));
-        document.getElementById('tab-history').addEventListener('click', () => switchTab('history'));
 
         makeDraggable(uiPanel);
         updateQueueBadge();
         updateUI();
-        updateUIStatus('Kész. Indíts egy munkát a hash megszerzéséhez.');
-    }
-
-    function switchTab(tab) {
-        document.getElementById('tab-extra').classList.toggle('active', tab === 'extra');
-        document.getElementById('tab-history').classList.toggle('active', tab === 'history');
-        document.getElementById('extra-tab-content').style.display = tab === 'extra' ? 'block' : 'none';
-        document.getElementById('history-tab-content').style.display = tab === 'history' ? 'block' : 'none';
+        updateUIStatus('Kész.');
     }
 
     function makeDraggable(el) {
@@ -1396,7 +1451,7 @@
         }
     }
 
-    function updateUI() { updateExtraList(); updateHistoryList(); updateQueueBadge(); }
+    function updateUI() { updateExtraList(); updateQueueBadge(); }
 
     function removeExtraJobById(id) {
         const idx = extraJobs.findIndex(j => j.id === id);
@@ -1469,50 +1524,6 @@
         });
     }
 
-    function updateHistoryList() {
-        if (!uiHistoryList) return;
-
-        // Kijelölés és darabszám megőrzése: egy háttérben rögzített munka
-        // eddig újrarajzolással eltüntette a felhasználó félkész kiválasztását.
-        const checked = new Set(
-            Array.from(uiHistoryList.querySelectorAll('.hist-check')).filter(c => c.checked).map(c => c.dataset.id)
-        );
-        const counts = {};
-        uiHistoryList.querySelectorAll('.lisa-count-input').forEach(i => { counts[i.dataset.id] = i.value; });
-
-        uiHistoryList.textContent = '';
-        jobHistory.forEach(job => {
-            const li = document.createElement('li');
-
-            const label = document.createElement('label');
-            label.className = 'lisa-job-name';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.className = 'hist-check';
-            cb.dataset.id = job.id;
-            cb.checked = checked.has(job.id);
-            const text = document.createElement('span');
-            text.textContent = ` ${job.jobName} (ID:${job.jobId}, ${formatDuration(job.duration)})`;
-            label.appendChild(cb);
-            label.appendChild(text);
-
-            const countWrap = document.createElement('span');
-            const num = document.createElement('input');
-            num.type = 'number';
-            num.className = 'lisa-count-input';
-            num.min = String(CONFIG.MIN_AMOUNT);
-            num.max = String(CONFIG.MAX_AMOUNT);
-            num.value = counts[job.id] || '1';
-            num.dataset.id = job.id;
-            countWrap.appendChild(num);
-
-            li.appendChild(label);
-            li.appendChild(countWrap);
-            uiHistoryList.appendChild(li);
-        });
-        if (uiHistoryCount) uiHistoryCount.textContent = jobHistory.length;
-    }
-
     function togglePause() {
         paused = !paused;
         document.getElementById('lisa-pause-btn').textContent = paused ? '▶️' : '⏸️';
@@ -1531,46 +1542,6 @@
         updateExtraList();
         updateUIStatus('Extra sor törölve.');
     }
-    function clearHistory() {
-        jobHistory = [];
-        saveHistoryToStorage();
-        updateHistoryList();
-        updateUIStatus('Előzmények törölve.');
-    }
-
-    function addSelectedToExtra() {
-        if (addingFromHistory || !uiHistoryList) return;
-
-        const checks = Array.from(uiHistoryList.querySelectorAll('.hist-check')).filter(c => c.checked);
-        if (checks.length === 0) {
-            updateUIStatus('Válassz ki legalább egy munkát!');
-            return;
-        }
-        addingFromHistory = true;
-        addButton.disabled = true;
-        setTimeout(() => { addingFromHistory = false; addButton.disabled = false; }, CONFIG.BUTTON_COOLDOWN);
-
-        // Sorbaállításhoz nem kell hash, csak küldéshez – a processQueue úgyis
-        // megvárja, amíg lesz. Egy hiányzó hash miatt eddig nem lehetett tervezni.
-        let total = 0;
-        checks.forEach(cb => {
-            const job = jobHistory.find(j => j.id === cb.dataset.id);
-            if (!job) return;
-            const input = uiHistoryList.querySelector(`.lisa-count-input[data-id="${cb.dataset.id}"]`);
-            const raw = parseInt(input && input.value, 10) || CONFIG.MIN_AMOUNT;
-            const count = Math.min(Math.max(raw, CONFIG.MIN_AMOUNT), CONFIG.MAX_AMOUNT);
-            total += addExtraJobs(job, count, job.jobName);
-        });
-
-        updateUI();
-        if (total > 0) {
-            updateUIStatus(`${total} munka az extra sorba (${extraJobs.length} várakozik).`);
-            ensureProcessing();
-        } else {
-            updateUIStatus('Nem került új munka a sorba (a sor megtelt?).');
-        }
-    }
-
     // ============================================================
     // BOOT
     // ============================================================
@@ -1586,7 +1557,7 @@
         injectUI();
         updateUI();
         updateUIStatus(isLeaderTab
-            ? `Kész (sor: ${gameQueueLength()}/${gameQueueLimit()}).`
+            ? 'Kész.'
             : 'Passzív fül – egy másik, látható fül dolgozza fel a sort.');
         initAmountPatch();
         // A játék sora kívülről is változik (munka lejár, a felhasználó megszakít),
@@ -1614,5 +1585,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.4 betöltve.');
+    console.log('[Lisa] Modular v11.5 betöltve.');
 })();

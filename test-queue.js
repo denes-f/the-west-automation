@@ -384,6 +384,58 @@ eq('29 mp út + 15 mp munka', formatClock(29 + 15), '00:00:44');
 eq('10 perces munka', formatClock(0 + 600), '00:10:00');
 eq('1 órás munka úttal', formatClock(120 + 3600), '01:02:00');
 
+
+// ============================================================
+//  Gyorsindító nyilak: helyszín a legközelebbi munkacsoportból
+// ============================================================
+console.log('\n=== Gyorsindítás ===');
+CONFIG.JOBGROUP_MAX_DIST = 200;
+function rectOf(x, y, w = 54, h = 54) {
+    return { getBoundingClientRect: () => ({ x: x - w/2, y: y - h/2, width: w, height: h }) };
+}
+function mkGroup(posx, posy, sx, sy) {
+    return Object.assign(rectOf(sx, sy, 120, 65), { className: `image x-1 y-2 posx-${posx} posy-${posy} jobgroup jobgroup-7` });
+}
+let groups = [];
+global.document = { querySelectorAll: sel => (sel === '.jobgroup' ? groups : []) };
+eval(extract('nearestJobGroup'));
+
+// Élesben mért elrendezés: a csoport a szétnyílt kör közepén, a következő 528 px-re
+groups = [mkGroup(41966, 16411, 816, 464), mkGroup(40224, 16507, 816 - 528, 464)];
+eq('a kör közepi csoport nyer', (g => [g.x, g.y])(nearestJobGroup(rectOf(816, 389))), [41966, 16411]);
+eq('szélső ikonnál is ugyanaz', (g => [g.x, g.y])(nearestJobGroup(rectOf(886, 504))), [41966, 16411]);
+
+// Túl messze -> nincs találat, a kattintás a játéké marad
+groups = [mkGroup(41966, 16411, 100, 100)];
+eq('távoli csoportot nem fogadunk el', nearestJobGroup(rectOf(816, 389)), null);
+groups = [];
+eq('csoport nélkül null', nearestJobGroup(rectOf(816, 389)), null);
+
+// A jobId/base kiolvasás osztálynevekből (a valódi osztályokkal)
+const idOf  = cls => (cls.match(/\bjob-(\d+)\b/) || [])[1];
+const baseOf = cls => (cls.match(/instantwork-(short|middle|long)/) || [])[1];
+eq('jobId a .job-128-ból', idOf('job job-128 hasMousePopup'), '128');
+eq('jobgroup nem ad jobId-t', idOf('image x-157 y-64 posx-40224 posy-16507 jobgroup jobgroup-12'), undefined);
+eq('short nyíl', baseOf('instantwork-short'), 'short');
+eq('middle nyíl', baseOf('instantwork-middle'), 'middle');
+eq('long nyíl', baseOf('instantwork-long'), 'long');
+eq('a base időtartamra képez', JobList.getDurations()[baseOf('instantwork-long')].duration, 3600);
+
+// ============================================================
+//  "Összes törlése" csak megerősítés után ürít
+// ============================================================
+console.log('\n=== Összes törlése ===');
+let statusText = '';
+const updateUIStatusReal = (t) => { statusText = t; };
+eval(extract('clearExtraAfterCancelAll').replace('updateUIStatus(', 'updateUIStatusReal('));
+extraJobs = mkJobs(5);
+clearExtraAfterCancelAll();
+eq('megerősítés után ürül a lista', extraJobs.length, 0);
+eq('a státusz megmondja, mennyit törölt', /5 várakozó/.test(statusText), true);
+statusText = '';
+clearExtraAfterCancelAll();
+eq('üres listánál nincs üzenet', statusText, '');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 })();
