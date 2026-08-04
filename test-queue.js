@@ -53,6 +53,7 @@ const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
 const renderPendingInGameQueue = () => {};
+const observePendingHost = () => {};
 const ensureProcessing = () => {};
 const scheduleNextJob = (ms) => { scheduled = ms; nextJobTimer = 1; };
 const generateId = (() => { let n = 0; return () => 'id' + (++n); })();

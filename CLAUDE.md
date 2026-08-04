@@ -118,6 +118,25 @@ window entirely.
   `stopImmediatePropagation()`.
 - `JobList.getJobById(id).name` gives the display name.
 
+### Window manager (`wman`) — the script's own panel
+
+`wman.open(uid, title, windowclass, notanimated, noDrag, minimize_if_open)` creates a **real game
+window** — frame, title bar, minimize/close buttons, dragging. The returned object has
+`getContentPane()`, `appendToContentPane()`, `clearContentPane()`, `setSize`, `setMinSize/MaxSize`,
+`setTitle`, `setResizeable`, `center`, `bringToTop`, `doLayout`, `saveAppearance`/`restoreAppearance`,
+`destroy`. `wman.getById(uid)` retrieves it; `wman.close(uid)` closes it. `west.gui` also offers
+`Scrollpane`, `Button`, `Table` etc. if native widgets are ever wanted.
+
+Background layers, measured — this matters for tall windows:
+
+- `.tw2gui_window_inset` carries the **parchment field**: natural **721×420**, `no-repeat`, anchored
+  bottom-left. Any window taller than ~454 px leaves the top bare.
+- `.tw2gui_inner_window_bg2` is a **32×420** right-hand edge strip anchored bottom-right.
+
+Fix (scoped to our window class only): `background-size: 100% 100%` on the inset, and
+`background-size: auto 100%` on `bg2`. Stretching `bg2` in both directions smears its dark edge into
+a wide band across the window — it must only stretch vertically.
+
 ### Cancel-all
 
 `#cancelAllInQueue` opens a confirm dialog ("Az összes munka törlése", Igen/Nem) and only empties the
@@ -134,8 +153,12 @@ and "Nem" correctly does nothing.
   FIFO — otherwise a new job would jump into a free slot ahead of jobs already waiting.
 - **`processQueue`** peek → `TaskQueue.add(batch)` → splice only what was accepted. On refusal it
   backs off; after `MAX_RETRIES` a job moves to the back, after `MAX_DEFERRALS` it is dropped loudly.
-- **`watchGameQueue`** every 2 s: refreshes the badge and ETAs, re-injects in-game rows, and on a
-  **decrease** in queue length starts the next job within 1.5 s. Keying on the decrease (not on
+- **In-game rows are re-injected by a `MutationObserver`** on `#queuedTasks`, not just by the timer.
+  The game rebuilds that container on every queue change and drops our rows with it; waiting for the
+  poll made them visibly blink out and back. The observer only re-renders when our separator is
+  *absent*, so our own writes don't loop.
+- **`watchGameQueue`** every 1 s: refreshes the badge and ETAs, re-injects in-game rows, and on a
+  **decrease** in queue length starts the next job within 0.4 s. Keying on the decrease (not on
   "free slots exist") is deliberate — otherwise a refusal would retry every 2 s forever.
 - **Leader lock** in `localStorage`: only one tab processes. A **visible** tab always takes over from
   a background one, leadership is released on `pagehide`. Without the visibility rule a forgotten

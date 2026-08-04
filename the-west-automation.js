@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.5 - Gyorsindítás, összes törlése, egyszerűbb panel)
+// @name         The-West Modular Job Queue (Lisa v11.6 - Játékablak, görgethető lista)
 // @namespace   http://tampermonkey.net/
-// @version     11.5
+// @version     11.6
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -17,7 +17,7 @@
     // ============================================================
     const CONFIG = {
         JOB_ADD_ENDPOINT: 'window=task&action=add',
-        SAFETY_MARGIN_MS: 3000,
+        SAFETY_MARGIN_MS: 800,
         FULL_QUEUE_POLL_MIN: 15000,
         FULL_QUEUE_POLL_MAX: 25000,
         MAX_RETRIES: 5,              // ennyi hiba után a munka a sor végére kerül
@@ -32,15 +32,17 @@
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         LEGACY_HISTORY: 'lisa_modular_history_v97',
         MIN_SEND_GAP: 2000,          // két egymást követő küldés között
-        WATCH_INTERVAL: 2000,        // ilyen sűrűn nézzük a játék sorát és az időpontokat
-        SLOT_FREED_DELAY: 1500,      // felszabadult slot után ennyivel indítjuk a következőt
+        WATCH_INTERVAL: 1000,        // ilyen sűrűn nézzük a játék sorát és az időpontokat
+        SLOT_FREED_DELAY: 400,       // felszabadult slot után ennyivel indítjuk a következőt
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
         TIMER_CHUNK: 60000,          // hosszú várakozást ekkora darabokban ébresztünk
         LEADER_HEARTBEAT: 5000,
         LEADER_TTL: 15000,           // ennyi néma szívverés után átvehető a feldolgozás
         MAX_HISTORY: 60,
         BOOT_MAX_ATTEMPTS: 60,
+        WINDOW_ID: 'lisaExtraQueue',
         PANEL_WIDTH: 320,
+        PANEL_MAX_HEIGHT: 700,
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_QUEUE_LIMIT: 4,     // csak ha a játék TaskQueue-ja elérhetetlen
@@ -48,7 +50,6 @@
         MAX_EXTRA_QUEUE: 500,
         JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
         GAME_QUEUE_PREVIEW: 8,       // ennyi várakozó munka látszik a játék sorában
-        PANEL_PREVIEW: 8,            // ennyi látszik a script paneljén (a játékbelivel egyezően)
     };
 
     // ============================================================
@@ -67,10 +68,11 @@
     let dialogCloseTimer = null;
     let lastSeenQueueLen = 0;
     let renderedPendingKey = '';
+    let pendingObserver = null;
+    let observedHost = null;
 
-    let uiPanel, uiExtraList, uiStatus, uiExtraCount;
+    let uiExtraList, uiStatus, uiExtraCount, uiEmpty, uiPauseBtn;
     let uiQueueStatus;
-    let showButton = null; // a menüsorban lévő gomb
 
     const OriginalXHR = window.XMLHttpRequest;
 
@@ -353,6 +355,27 @@
     function clearPendingRows(host) {
         host.querySelectorAll('.lisa-pending, .lisa-pending-sep, .lisa-pending-more')
             .forEach(el => el.remove());
+    }
+
+    // A játék minden sorváltozáskor újraépíti a #queuedTasks tartalmát, és ilyenkor
+    // a mi sorainkat is eldobja. A kétmásodperces figyelőre hagyva ez látható
+    // villanás: a várakozók eltűnnek, majd visszajönnek. Ezért azonnal, ugyanabban
+    // a körben pótoljuk őket.
+    //
+    // Nem okoz végtelen ciklust: csak akkor rajzolunk újra, ha az elválasztónk
+    // HIÁNYZIK, a saját beszúrásunk után pedig már ott van.
+    function observePendingHost() {
+        const host = pendingHost();
+        if (!host || host === observedHost) return;
+        if (pendingObserver) pendingObserver.disconnect();
+        observedHost = host;
+        pendingObserver = new MutationObserver(() => {
+            if (!extraJobs.length) return;
+            if (host.querySelector('.lisa-pending-sep')) return;
+            renderedPendingKey = '';
+            renderPendingInGameQueue();
+        });
+        pendingObserver.observe(host, { childList: true });
     }
 
     function buildPendingItem(job, eta) {
@@ -1136,6 +1159,7 @@
     function watchGameQueue() {
         updateQueueBadge();
         updateExtraEtas();
+        observePendingHost();
         renderPendingInGameQueue();
 
         const len = gameQueueLength();
@@ -1190,266 +1214,133 @@
     }
 
     // --- Menüsor gomb kezelése ---
-    function createShowButton() {
-        if (showButton) return;
-        const menubar = document.getElementById('ui_menubar');
-        if (!menubar) return;
-
-        const container = document.createElement('div');
-        container.className = 'ui_menucontainer';
-        container.id = 'lisa-show-container';
-        container.innerHTML = `
-            <div class="menulink lisa-show-btn" title="Lisa Extra Queue megjelenítése">LQ</div>
-            <div class="menucontainer_bottom"></div>
-        `;
-        menubar.appendChild(container);
-        showButton = container.querySelector('.lisa-show-btn');
-        showButton.addEventListener('click', showLisaPanel);
-
-        // Némi stílus, hogy illeszkedjen a menühöz
-        const btnStyle = document.createElement('style');
-        btnStyle.textContent = `
-            .lisa-show-btn {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-weight: bold;
-                font-size: 12px;
-                color: #e6d5b8;
-                background: rgba(70, 55, 35, 0.9);
-                border: 1px solid #b89a6b;
-                border-radius: 3px;
-                cursor: pointer;
-                width: 28px;
-                height: 28px;
-                margin: 2px;
+    // ============================================================
+    //  A PANEL: A JÁTÉK SAJÁT ABLAKKERETÉBEN
+    // ============================================================
+    // A wman a játék ablakkezelője: wman.open(uid, cím) valódi játékablakot ad
+    // kerettel, címsorral, minimalizálás/bezárás gombokkal és fogd-és-vidd
+    // mozgatással. Így a panel ugyanúgy néz ki és viselkedik, mint bármelyik
+    // másik ablak, saját keret-utánzat helyett.
+    //
+    // Két háttérréteget igazítani kell, mert magas ablaknál elfogynak:
+    //  - .tw2gui_window_inset hordozza a pergament (natúr 721x420, no-repeat,
+    //    balra-lentre igazítva), efölé nyúlva üresen maradna a teteje;
+    //  - .tw2gui_inner_window_bg2 a jobb oldali 32x420-as széldísz, ezt csak
+    //    FÜGGŐLEGESEN szabad nyújtani, különben sötét sávvá kenődik szét.
+    // Mindkét felülírás a saját ablakunk osztályára van szűkítve.
+    function injectPanelStyles() {
+        if (document.getElementById('lisa-panel-style')) return;
+        const st = document.createElement('style');
+        st.id = 'lisa-panel-style';
+        st.textContent = `
+            .${CONFIG.WINDOW_ID} .tw2gui_window_inset { background-size: 100% 100% !important; }
+            .${CONFIG.WINDOW_ID} .tw2gui_inner_window_bg2 { background-size: auto 100% !important; }
+            #lisa-body { display: flex; flex-direction: column; height: 100%; font-family: Georgia,'Times New Roman',serif; }
+            #lisa-status {
+                font: italic 11px Georgia,serif; color: #4a3b28;
+                padding: 2px 4px 4px; flex: 0 0 auto;
             }
-            .lisa-show-btn:hover {
-                background: #b89a6b;
-                color: #1e160e;
+            #lisa-scroll {
+                flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+                border-top: 1px solid rgba(90,70,45,0.35);
+                border-bottom: 1px solid rgba(90,70,45,0.35);
+                min-height: 60px;
             }
-        `;
-        document.head.appendChild(btnStyle);
-    }
-
-    function removeShowButton() {
-        const container = document.getElementById('lisa-show-container');
-        if (container) container.remove();
-        showButton = null;
-    }
-
-    function showLisaPanel() {
-        if (uiPanel) {
-            uiPanel.style.display = 'block';
-            removeShowButton();
-        }
-    }
-
-    function hideLisaPanel() {
-        if (uiPanel) {
-            uiPanel.style.display = 'none';
-            createShowButton();
-        }
-    }
-
-    function injectUI() {
-        const style = document.createElement('style');
-        style.textContent = `
-            #lisa-panel {
-                position: fixed;
-                top: 140px;                  /* Térkép alá – saját pozíciód szerint */
-                right: 35px;                /* Jobb széltől kicsit beljebb */
-                width: ${CONFIG.PANEL_WIDTH}px;
-                background: rgba(90, 75, 60, 0.95); /* Világosabb barna háttér */
-                border: 1px solid #b89a6b;
-                border-radius: 6px;
-                color: #e6d5b8;
-                font-family: 'Georgia', 'Times New Roman', serif;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.6);
-                z-index: 99999;
-                user-select: none;
-                backdrop-filter: blur(3px);
-                display: flex;
-                flex-direction: column;
-                max-height: calc(100vh - 160px);
+            #lisa-scroll::-webkit-scrollbar { width: 9px; }
+            #lisa-scroll::-webkit-scrollbar-track { background: rgba(90,70,45,0.12); }
+            #lisa-scroll::-webkit-scrollbar-thumb {
+                background: #8a7048; border-radius: 4px; border: 1px solid #6b5636;
             }
-            #lisa-panel .header {
-                cursor: move;
-                font-weight: bold;
-                border-bottom: 1px solid #b89a6b;
-                padding: 6px 10px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                background: rgba(50, 40, 30, 0.8);
-                border-radius: 6px 6px 0 0;
-                font-size: 14px;
-                color: #f0e4c6;
+            #lisa-scroll::-webkit-scrollbar-thumb:hover { background: #a3855a; }
+            #lisa-extra-list { list-style: none; margin: 0; padding: 0; }
+            #lisa-extra-list li {
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 3px 4px; border-bottom: 1px dotted rgba(90,70,45,0.35);
+                font-size: 12px; color: #3b2f1e;
             }
-            #lisa-panel .controls button {
-                background: none;
-                border: 1px solid #b89a6b;
-                color: #e6d5b8;
-                margin-left: 4px;
-                cursor: pointer;
-                font-family: inherit;
-                font-size: 12px;
-                padding: 2px 6px;
-                border-radius: 3px;
-                background: rgba(70, 55, 35, 0.8);
-            }
-            #lisa-panel .controls button:hover {
-                background: #b89a6b;
-                color: #1e160e;
-            }
-            #lisa-panel .status {
-                color: #c8b48c;
-                font-size: 11px;
-                margin: 4px 10px;
-                font-style: italic;
-            }
-            #lisa-panel .list-container {
-                flex: 1;
-                overflow-y: auto;
-                border: 1px solid #5a4a3a;
-                margin: 0 6px 4px;
-                background: rgba(40, 30, 25, 0.9);
-                min-height: 40px;
-                max-height: 250px;
-            }
-            #lisa-panel ul {
-                list-style: none;
-                padding: 0;
-                margin: 0;
-            }
-            #lisa-panel li {
-                padding: 3px 8px;
-                border-bottom: 1px dotted #5a4a3a;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-size: 12px;
-            }
-            #lisa-panel li .remove {
-                color: #c06050;
-                cursor: pointer;
-                font-weight: bold;
-                margin-left: 6px;
-                font-size: 14px;
-            }
-            #lisa-panel li .remove:hover {
-                color: #ff7070;
-            }
-            #lisa-panel .extra-controls {
-                padding: 5px 8px;
-                border-top: 1px solid #5a4a3a;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-size: 11px;
-            }
-            #lisa-panel .extra-controls button {
-                background: rgba(70, 55, 35, 0.8);
-                border: 1px solid #b89a6b;
-                color: #e6d5b8;
-                cursor: pointer;
-                font-family: inherit;
-                font-size: 11px;
-                padding: 3px 8px;
-                border-radius: 3px;
-            }
-            #lisa-panel .extra-controls button:hover {
-                background: #b89a6b;
-                color: #1e160e;
-            }
-            #lisa-panel .count-info {
-                font-size: 10px;
-                color: #8a7a6a;
-            }
-            .lisa-more-row {
-                justify-content: center;
-                font-style: italic;
-                color: #a99372;
-                font-size: 11px;
-            }
+            #lisa-extra-list li:nth-child(even) { background: rgba(120,95,60,0.07); }
+            .lisa-job-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .lisa-eta {
-                font-size: 10px;
-                color: #a99372;
-                white-space: nowrap;
-                margin-left: 4px;
-                font-variant-numeric: tabular-nums;
+                font-size: 10px; color: #6b5a42; white-space: nowrap;
+                margin-left: 6px; font-variant-numeric: tabular-nums;
             }
-            .lisa-job-name {
-                flex-grow: 1;
-                margin-right: 10px;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
+            #lisa-extra-list .remove {
+                color: #a03020; cursor: pointer; font-weight: bold;
+                margin-left: 8px; font-size: 13px; line-height: 1;
             }
-            #lisa-queue-status {
-                font-size: 11px;
-                margin-left: 8px;
-                font-weight: normal;
+            #lisa-extra-list .remove:hover { color: #d04030; }
+            #lisa-empty { padding: 10px 4px; font: italic 11px Georgia,serif; color: #6b5a42; text-align: center; }
+            #lisa-toolbar {
+                flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+                padding: 5px 2px 0; font-size: 11px; color: #4a3b28;
             }
+            #lisa-toolbar button {
+                font: 11px Georgia,serif; color: #f0e4c6; cursor: pointer;
+                background: linear-gradient(#6b5636,#4a3b28);
+                border: 1px solid #2e2416; border-radius: 3px; padding: 3px 9px;
+                text-shadow: 0 1px 1px #000;
+            }
+            #lisa-toolbar button:hover { background: linear-gradient(#8a7048,#5c4a30); }
         `;
-        document.head.appendChild(style);
+        document.head.appendChild(st);
+    }
 
-        uiPanel = document.createElement('div');
-        uiPanel.id = 'lisa-panel';
-        uiPanel.innerHTML = `
-            <div class="header">
-                <span>Extra Queue <span id="lisa-queue-status">Sor: –</span></span>
-                <div class="controls">
-                    <button id="lisa-pause-btn" title="Szünet / Folytatás">⏸️</button>
-                    <button id="lisa-hide-btn" title="Elrejtés">_</button>
+    function panelWindow() {
+        try { return wman.getById(CONFIG.WINDOW_ID) || null; } catch(e) { return null; }
+    }
+
+    // A magasságot a nézetablakhoz igazítjuk, hogy minél több munka elférjen.
+    function panelHeight() {
+        return Math.max(320, Math.min(CONFIG.PANEL_MAX_HEIGHT, window.innerHeight - 140));
+    }
+
+    function buildPanelContent(win) {
+        const pane = win.getContentPane();
+        const el = pane && pane.jquery ? pane[0] : pane;
+        if (!el) return false;
+
+        el.innerHTML = `
+            <div id="lisa-body">
+                <div id="lisa-status">Inicializálás...</div>
+                <div id="lisa-scroll"><ul id="lisa-extra-list"></ul><div id="lisa-empty"></div></div>
+                <div id="lisa-toolbar">
+                    <button id="lisa-pause-btn" title="Szünet / Folytatás">Szünet</button>
+                    <span>Sor: <span id="lisa-queue-status">–</span> · Várakozó: <span id="lisa-extra-count">0</span></span>
+                    <button id="lisa-clear-extra" title="A teljes várakozó lista törlése">Törlés</button>
                 </div>
-            </div>
-            <div class="status" id="lisa-status">Inicializálás...</div>
-            <div class="list-container"><ul id="lisa-extra-list"></ul></div>
-            <div class="extra-controls">
-                <button id="lisa-clear-extra">Törlés</button>
-                <span class="count-info">Munkák: <span id="lisa-extra-count">0</span></span>
-            </div>
-        `;
-        document.body.appendChild(uiPanel);
+            </div>`;
 
-        uiStatus = document.getElementById('lisa-status');
-        uiExtraList = document.getElementById('lisa-extra-list');
-        uiExtraCount = document.getElementById('lisa-extra-count');
-        uiQueueStatus = document.getElementById('lisa-queue-status');
+        uiStatus = el.querySelector('#lisa-status');
+        uiExtraList = el.querySelector('#lisa-extra-list');
+        uiExtraCount = el.querySelector('#lisa-extra-count');
+        uiQueueStatus = el.querySelector('#lisa-queue-status');
+        uiEmpty = el.querySelector('#lisa-empty');
+        uiPauseBtn = el.querySelector('#lisa-pause-btn');
 
-        document.getElementById('lisa-pause-btn').addEventListener('click', togglePause);
-        document.getElementById('lisa-hide-btn').addEventListener('click', hideLisaPanel);   // átkötve az új függvényre
-        document.getElementById('lisa-clear-extra').addEventListener('click', clearExtraQueue);
+        uiPauseBtn.addEventListener('click', togglePause);
+        el.querySelector('#lisa-clear-extra').addEventListener('click', clearExtraQueue);
+        return true;
+    }
 
-        makeDraggable(uiPanel);
-        updateQueueBadge();
+    // Idempotens: ha az ablakot bezárták, a következő hívás újra felépíti.
+    function ensurePanel() {
+        injectPanelStyles();
+        let win = panelWindow();
+        if (win && document.querySelector('.' + CONFIG.WINDOW_ID)) return win;
+        try {
+            win = wman.open(CONFIG.WINDOW_ID, 'Extra Queue');
+        } catch(e) {
+            console.error('[Lisa] Nem sikerült megnyitni a játékablakot:', e);
+            return null;
+        }
+        if (!win) return null;
+        try { win.setSize(CONFIG.PANEL_WIDTH, panelHeight()); } catch(e) {}
+        if (!buildPanelContent(win)) return null;
         updateUI();
-        updateUIStatus('Kész.');
+        return win;
     }
 
-    function makeDraggable(el) {
-        const header = el.querySelector('.header');
-        let offsetX, offsetY, startX, startY;
-        header.addEventListener('mousedown', (e) => {
-            startX = e.clientX;
-            startY = e.clientY;
-            offsetX = el.offsetLeft;
-            offsetY = el.offsetTop;
-            document.addEventListener('mousemove', onDrag);
-            document.addEventListener('mouseup', stopDrag);
-        });
-        function onDrag(e) {
-            el.style.left = (offsetX + e.clientX - startX) + 'px';
-            el.style.top = (offsetY + e.clientY - startY) + 'px';
-            el.style.bottom = 'auto';
-            el.style.right = 'auto';
-        }
-        function stopDrag() {
-            document.removeEventListener('mousemove', onDrag);
-            document.removeEventListener('mouseup', stopDrag);
-        }
-    }
+    function showLisaPanel() { ensurePanel(); }
 
     function updateUI() { updateExtraList(); updateQueueBadge(); }
 
@@ -1467,9 +1358,7 @@
     function updateExtraList() {
         if (!uiExtraList) return;
         uiExtraList.textContent = '';
-        const shownJobs = extraJobs.slice(0, CONFIG.PANEL_PREVIEW);
-        const hiddenCount = extraJobs.length - shownJobs.length;
-        shownJobs.forEach(job => {
+        extraJobs.forEach(job => {
             const li = document.createElement('li');
             li.dataset.id = job.id;
 
@@ -1492,13 +1381,7 @@
             li.appendChild(removeEl);
             uiExtraList.appendChild(li);
         });
-        if (hiddenCount > 0) {
-            const li = document.createElement('li');
-            li.className = 'lisa-more-row';
-            li.textContent = `… és még ${hiddenCount} munka`;
-            li.title = `A lista ${CONFIG.PANEL_PREVIEW} elemet mutat, összesen ${extraJobs.length} várakozik.`;
-            uiExtraList.appendChild(li);
-        }
+        if (uiEmpty) uiEmpty.textContent = extraJobs.length ? '' : 'Nincs várakozó munka.';
         if (uiExtraCount) uiExtraCount.textContent = extraJobs.length;
         updateExtraEtas();
         renderPendingInGameQueue();
@@ -1526,7 +1409,7 @@
 
     function togglePause() {
         paused = !paused;
-        document.getElementById('lisa-pause-btn').textContent = paused ? '▶️' : '⏸️';
+        if (uiPauseBtn) uiPauseBtn.textContent = paused ? 'Folytatás' : 'Szünet';
         updateUIStatus(paused ? 'Szüneteltetve' : 'Folytatva');
         if (paused) {
             if (nextJobTimer) {
@@ -1539,7 +1422,7 @@
     function clearExtraQueue() {
         extraJobs = [];
         saveExtraQueueToStorage();
-        updateExtraList();
+        updateUI();
         updateUIStatus('Extra sor törölve.');
     }
     // ============================================================
@@ -1554,7 +1437,7 @@
         // Visszaírás az új kulcsra, különben a régiről minden induláskor
         // újra migrálnánk, és a normalizált alak sosem rögzülne.
         saveHistoryToStorage();
-        injectUI();
+        ensurePanel();
         updateUI();
         updateUIStatus(isLeaderTab
             ? 'Kész.'
@@ -1585,5 +1468,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.5 betöltve.');
+    console.log('[Lisa] Modular v11.6 betöltve.');
 })();
