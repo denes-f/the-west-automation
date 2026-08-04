@@ -22,6 +22,9 @@
         FULL_QUEUE_POLL_MAX: 25000,
         MAX_RETRIES: 5,              // ennyi hiba után a munka a sor végére kerül
         MAX_DEFERRALS: 2,            // ennyi sikertelen kör után eldobjuk
+        MAX_REJECTIONS: 10,          // ennyi SZERVEROLDALI elutasítás után adjuk fel
+        REJECT_BACKOFF_MS: 20000,    // elutasítás után ennyit várunk az újrapróbálással
+        ADD_RESPONSE_TTL: 20000,     // ennél régebbi köteghez már nem párosítunk választ
         IDLE_RESCHEDULE: 5000,       // vészfék: ha egy ág elfelejtene időzítőt állítani
         // Verziófüggetlen kulcsok: a verziószám a tartalomban van, nem a kulcsban,
         // különben minden kiadás elárvasítaná a felhasználó elmentett sorát.
@@ -50,6 +53,7 @@
         FALLBACK_QUEUE_LIMIT: 4,     // csak ha a játék TaskQueue-ja elérhetetlen
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
+        KEEP_AWAKE: true,            // képernyőzár és fülfagyasztás elleni védelem
         JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
         GAME_QUEUE_PREVIEW: 6,       // ennyi várakozó munka látszik a játék sorában
     };
@@ -69,6 +73,7 @@
     let isLeaderTab = true;
     let dialogCloseTimer = null;
     let lastSeenQueueLen = 0;
+    let inFlightBatch = null;        // amit épp átadtunk a játéknak, a válaszig
     let renderedPendingKey = '';
     let pendingObserver = null;
     let observedHost = null;
@@ -134,6 +139,51 @@
     function extractJobName(body) {
         const task = extractTaskFromBody(body);
         return task ? `Job #${task.jobId}` : 'Ismeretlen';
+    }
+
+    // Egy kérés MINDEN munkája, sorrendben. A válasz tasks[] tömbje indexre
+    // képeződik a kérés munkáira, ezért a párosításhoz a teljes lista kell.
+    function extractTasksFromBody(body) {
+        const params = parseBodyParams(body);
+        const byIdx = {};
+        for (const k in params) {
+            const m = k.match(/\[(\d+)\]\[(\w+)\]$/);
+            if (!m) continue;
+            (byIdx[m[1]] = byIdx[m[1]] || {})[m[2]] = params[k];
+        }
+        return Object.keys(byIdx)
+            .sort((a, b) => a - b)
+            .map(i => ({
+                jobId: parseInt(byIdx[i].jobId, 10),
+                x: parseInt(byIdx[i].x, 10) || 0,
+                y: parseInt(byIdx[i].y, 10) || 0,
+                duration: parseInt(byIdx[i].duration, 10) || CONFIG.DEFAULT_DURATION,
+                taskType: byIdx[i].taskType || 'job',
+            }))
+            .filter(t => !isNaN(t.jobId));
+    }
+
+    // A válasz tasks[i] eleme a kérés i. munkájáról szól, és vagy {task:{...}},
+    // vagy {error:true,msg:"..."}. A hibásakat adja vissza a hozzájuk tartozó
+    // munkaobjektummal. Felső szintű hiba esetén az EGÉSZ köteg elbukott.
+    function rejectedFromAddResponse(batch, data) {
+        if (!batch || !batch.length || !data) return [];
+        if (!Array.isArray(data.tasks)) {
+            return data.error ? batch.map(job => ({ job, msg: data.msg || '' })) : [];
+        }
+        const out = [];
+        data.tasks.forEach((entry, i) => {
+            if (batch[i] && entry && entry.error) out.push({ job: batch[i], msg: entry.msg || '' });
+        });
+        return out;
+    }
+
+    // A válasz csak akkor a MI kötegünkről szól, ha a kérés munkái pontosan a
+    // mieink, ugyanabban a sorrendben. Enélkül a felhasználó saját, egyidejű
+    // indítása is a mi listánkat módosítaná.
+    function addResponseMatchesBatch(bodyTasks, batch) {
+        return !!batch && bodyTasks.length === batch.length
+            && bodyTasks.every((t, i) => t.jobId === batch[i].jobId && t.duration === batch[i].duration);
     }
 
     function updateUIStatus(text) {
@@ -516,6 +566,12 @@
     // Egy kötegben adjuk át, ahogy a játék is teszi: így egy kérés megy ki
     // több munkára, nem N darab. A visszatérési érték a ténylegesen elfogadott
     // munkák száma -- a sor hossza szinkron módon nő, tehát azonnal mérhető.
+    // FONTOS: a sorhossz növekedése még NEM bizonyíték. A TaskQueue.add szinkron
+    // push-ol, a szerver viszont utólag elutasíthatja a munkát (szintkövetelmény,
+    // energiahiány), és akkor a játék kiveszi őket a sorból. Ha ilyenkor nem
+    // tennénk vissza őket, a munkák NÉMÁN elvesznének -- élesben pontosan ez
+    // történt 8 munkával. Ezért megjegyezzük, mit adtunk át, és a válasz alapján
+    // a visszautasítottakat visszatesszük a lista elejére.
     function startJobsViaGame(jobs) {
         if (!gameReady() || !jobs.length) return 0;
         const before = gameQueueLength();
@@ -525,7 +581,9 @@
             console.error('[Lisa] TaskQueue.add hiba:', e);
             return 0;
         }
-        return Math.max(0, gameQueueLength() - before);
+        const accepted = Math.max(0, gameQueueLength() - before);
+        inFlightBatch = accepted > 0 ? { jobs: jobs.slice(0, accepted), at: Date.now() } : null;
+        return accepted;
     }
 
     // ============================================================
@@ -827,6 +885,56 @@
         if (e.target.closest('#cancelAllInQueue')) watchCancelAllConfirm();
     }, true);
 
+    // A szerver által visszautasított munkák visszakerülnek a lista ELEJÉRE, az
+    // eredeti sorrendjükben -- a felhasználó sorrendje így sértetlen marad.
+    // Nem dobjuk el őket néhány próbálkozás után: a leggyakoribb ok (nincs elég
+    // energia) magától elmúlik, csak várni kell rá. Ezért lassan próbálkozunk
+    // újra, a szerver üzenetét pedig kiírjuk, hogy látszódjon az OK.
+    function requeueRejected(rejected) {
+        if (!rejected.length) return;
+        const keep = [], dropped = [];
+        rejected.forEach(({ job, msg }) => {
+            job.rejections = (job.rejections || 0) + 1;
+            job.lastRejectMsg = msg;
+            (job.rejections > CONFIG.MAX_REJECTIONS ? dropped : keep).push(job);
+        });
+        if (keep.length) extraJobs.unshift(...keep);
+        dropped.forEach(job => console.error(
+            `[Lisa] Munka feladva ${CONFIG.MAX_REJECTIONS} szerveroldali elutasítás után: ${job.jobName} – ${job.lastRejectMsg}`));
+
+        saveExtraQueueToStorage();
+        updateUI();
+
+        const first = rejected[0];
+        const reason = (first.msg || 'a szerver nem fogadta el').replace(/<[^>]*>/g, '').slice(0, 90);
+        console.warn(`[Lisa] A szerver ${rejected.length} munkát utasított vissza: ${reason}`);
+        updateUIStatus(dropped.length
+            ? `${dropped.length} munka feladva – ${reason}`
+            : `${keep.length} munka visszakerült a sorba – ${reason}`);
+
+        // Lassú újrapróbálkozás: energiahiánynál a gyors pörgetés értelmetlen.
+        if (keep.length && !paused && isLeaderTab) scheduleNextJob(CONFIG.REJECT_BACKOFF_MS);
+    }
+
+    // A játék add-válasza. Csak akkor nyúlunk hozzá a listához, ha a kérés
+    // munkái pontosan az általunk átadott köteg -- egy párhuzamos, felhasználói
+    // indítás válasza nem szólhat bele.
+    function handleAddResponse(responseText, reqBody) {
+        const batch = inFlightBatch;
+        inFlightBatch = null;
+        if (!batch || Date.now() - batch.at > CONFIG.ADD_RESPONSE_TTL) return;
+        if (!addResponseMatchesBatch(extractTasksFromBody(reqBody), batch.jobs)) return;
+
+        let data = null;
+        try { data = JSON.parse(responseText); } catch(e) { return; }
+        const rejected = rejectedFromAddResponse(batch.jobs, data);
+        if (!rejected.length) {
+            batch.jobs.forEach(j => { j.rejections = 0; });
+            return;
+        }
+        requeueRejected(rejected);
+    }
+
     function InterceptedXHR() {
         const xhr = new OriginalXHR();
         const origOpen = xhr.open;
@@ -846,6 +954,10 @@
             xhr.addEventListener('load', function() {
                 if (reqMethod !== 'POST') return;
                 if (!reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) return;
+
+                // Elsőként a saját kötegünk sorsa: a szerver utólag is
+                // visszautasíthatja, amit a játék már betett a sorba.
+                handleAddResponse(xhr.responseText, reqBody);
 
                 // Ide már csak az jut el, amit nem a saját feldolgozónk indított
                 // (annál pendingJobAmount 0, mert nincs elkapott kattintás).
@@ -1112,6 +1224,7 @@
                 id: j.id || generateId(),
                 retries: parseInt(j.retries, 10) || 0,
                 deferrals: parseInt(j.deferrals, 10) || 0,
+                rejections: parseInt(j.rejections, 10) || 0,
                 jobName: j.jobName || `Job #${j.jobId}`,
                 jobId: parseInt(j.jobId, 10),
                 x: parseInt(j.x, 10) || 0,
@@ -1147,6 +1260,86 @@
             .filter(j => j && j.jobId !== undefined)
             .map(j => ({ ...j, id: j.id || generateId(), duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION }))
             .slice(0, CONFIG.MAX_HISTORY);
+    }
+
+    // ============================================================
+    //  13/b. ÉBRENTARTÁS (több órás sorokhoz)
+    // ============================================================
+    // Egy több órás sor csak akkor fut végig, ha a gép ÉS a fül is ébren marad.
+    // Két külön akadály van, két külön megoldással:
+    //
+    //  - A képernyő elalvásával a gép is elalszik, és vele minden időzítő. Ezt a
+    //    Screen Wake Lock tartja vissza. A böngésző csak LÁTHATÓ laptól fogadja
+    //    el, és elrejtéskor magától elengedi -- ezért látszáskor újra kérjük.
+    //  - A háttérben lévő fül időzítőit a Chrome percenkéntire ritkítja, hosszabb
+    //    háttérlét után pedig be is fagyaszthatja a fület. A hangot lejátszó
+    //    fület viszont nem: ezért szól egy hallhatatlanul halk hurok.
+    //
+    // Mindkettő csak akkor aktív, amikor tényleg van mit csinálni -- üres listánál
+    // semmi nem tartja ébren a gépet, és a fülön sem jelenik meg a hangszóró ikon.
+    // A script oldalán ennyi tehető; a gép alvását (caffeinate) és a Chrome
+    // memóriakímélőjét a felhasználónak kell beállítania.
+    let wakeLock = null;
+    let keepAudio = null;
+    let keepAwakeWanted = false;
+
+    function requestWakeLock() {
+        if (wakeLock || !keepAwakeWanted || !isVisible()) return;
+        try {
+            if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') return;
+            navigator.wakeLock.request('screen').then(lock => {
+                if (!keepAwakeWanted) { try { lock.release(); } catch(e) {} return; }
+                wakeLock = lock;
+                lock.addEventListener('release', () => { wakeLock = null; });
+            }).catch(() => { wakeLock = null; });   // rejtett fül, energiatakarékos mód
+        } catch(e) { wakeLock = null; }
+    }
+
+    function releaseWakeLock() {
+        try { if (wakeLock) wakeLock.release(); } catch(e) {}
+        wakeLock = null;
+    }
+
+    // Hallhatatlanul halk, de nem NÉMA hurok: a teljesen néma hangot a böngésző
+    // nem tekinti lejátszásnak, és a fül fagyasztás elleni védettsége is elmarad.
+    function quietLoopUrl() {
+        const rate = 8000, n = rate;             // 1 másodperc, 8 kHz, mono, 16 bit
+        const buf = new ArrayBuffer(44 + n * 2);
+        const view = new DataView(buf);
+        const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+        str(0, 'RIFF');  view.setUint32(4, 36 + n * 2, true);  str(8, 'WAVE');
+        str(12, 'fmt '); view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+        view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+        view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+        str(36, 'data'); view.setUint32(40, n * 2, true);
+        for (let i = 0; i < n; i++) view.setInt16(44 + i * 2, i % 2 ? 1 : -1, true);
+        return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    }
+
+    function startKeepAudio() {
+        if (!keepAwakeWanted) return;
+        if (!keepAudio) {
+            keepAudio = new Audio(quietLoopUrl());
+            keepAudio.loop = true;
+            keepAudio.volume = 0.01;
+        }
+        if (keepAudio.paused) {
+            // Kattintás előtt a böngésző letilthatja a lejátszást; a játékban
+            // úgyis kattint a felhasználó, és akkor a következő kör elindítja.
+            keepAudio.play().catch(() => {});
+        }
+    }
+
+    function stopKeepAudio() {
+        if (keepAudio && !keepAudio.paused) keepAudio.pause();
+    }
+
+    function updateKeepAwake() {
+        const wanted = CONFIG.KEEP_AWAKE && !paused && extraJobs.length > 0;
+        keepAwakeWanted = wanted;
+        if (wanted) { requestWakeLock(); startKeepAudio(); }
+        else { releaseWakeLock(); stopKeepAudio(); }
     }
 
     // ============================================================
@@ -1202,6 +1395,7 @@
         ensureMenuButton();
         updateQueueBadge();
         updateExtraEtas();
+        updateKeepAwake();
         observePendingHost();
         renderPendingInGameQueue();
 
@@ -1234,9 +1428,17 @@
         setInterval(refreshLeadership, CONFIG.LEADER_HEARTBEAT);
 
         // Fülváltásnál azonnal újraértékelünk, nem várunk a szívverésre.
-        document.addEventListener('visibilitychange', refreshLeadership);
+        // A képernyőzárolást a böngésző elrejtéskor elengedi, ezért látszáskor
+        // újra kell kérni -- enélkül az első fülváltás után már nem védene.
+        document.addEventListener('visibilitychange', () => {
+            refreshLeadership();
+            if (isVisible()) requestWakeLock();
+        });
         // Bezáráskor elengedjük a vezetést: a bezárt fül eddig a TTL végéig fogta.
-        window.addEventListener('pagehide', releaseLeadership);
+        window.addEventListener('pagehide', () => { releaseLeadership(); releaseWakeLock(); });
+        // Az automatikus lejátszást a böngésző az első felhasználói mozdulatig
+        // tilthatja; a játékban úgyis kattint a felhasználó.
+        document.addEventListener('click', () => { if (keepAwakeWanted) startKeepAudio(); }, true);
 
         // A storage esemény csak a TÖBBI fülben sül el, tehát mindig idegen
         // változást jelez. Minden fül újratölt -- a vezető is, különben a

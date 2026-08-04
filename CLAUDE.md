@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 108 assertions, no dependencies.
+  name and runs them against stubs. 125 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `108 passed, 0 failed`.
+2. `node test-queue.js` should print `125 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -265,6 +265,18 @@ and "Nem" correctly does nothing.
   FIFO — otherwise a new job would jump into a free slot ahead of jobs already waiting.
 - **`processQueue`** peek → `TaskQueue.add(batch)` → splice only what was accepted. On refusal it
   backs off; after `MAX_RETRIES` a job moves to the back, after `MAX_DEFERRALS` it is dropped loudly.
+- **The add *response* is the real verdict.** The synchronous queue growth only proves the game
+  accepted the jobs, not the server. `startJobsViaGame` remembers the batch (`inFlightBatch`), the
+  XHR interceptor pairs the response's `tasks[i]` with it — matching by jobId+duration so a
+  concurrent user-initiated start can't be mistaken for ours — and puts rejected jobs back at the
+  **front** of the list, in order. They are **not** dropped after a couple of tries: the most
+  common cause (not enough energy) passes by itself, so it retries slowly (`REJECT_BACKOFF_MS`)
+  and only gives up after `MAX_REJECTIONS`, always showing the server's own message.
+- **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
+  display/machine sleeping — re-requested on `visibilitychange`, since the browser releases it when
+  the tab is hidden — plus an inaudible looping WAV, because Chrome does not freeze a tab that is
+  playing audio. A fully silent track would not count as playing, hence amplitude ±1. Neither
+  replaces the OS/browser settings (`caffeinate`, Chrome Memory Saver exclusion).
 - **In-game rows are re-injected by a `MutationObserver`** on `#queuedTasks`, not just by the timer.
   The game rebuilds that container on every queue change and drops our rows with it; waiting for the
   poll made them visibly blink out and back. The observer only re-renders when our separator is

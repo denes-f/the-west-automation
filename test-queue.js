@@ -293,6 +293,7 @@ eq('másnapi vég jelölve', formatEta({ start: base.getTime(), finish: tomorrow
 // ============================================================
 console.log('\n=== Slot-figyelő ===');
 CONFIG.SLOT_FREED_DELAY = 1500;
+const updateKeepAwake = () => {};   // ébrentartás: böngészőfüggő, itt nem mérhető
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -465,6 +466,51 @@ eq('eggyel több: 5 munka + "+2"', previewSplit(7, 6), { shown: 5, hidden: 2 });
 eq('sok munka: 5 munka + "+20"', previewSplit(25, 6), { shown: 5, hidden: 20 });
 eq('a csempe mindig a maradékot mondja',
    (s => s.shown + s.hidden)(previewSplit(25, 6)), 25);
+
+// ============================================================
+//  A szerver utólagos elutasítása nem veszejtheti el a munkát
+// ============================================================
+// Élesben mért eset: a TaskQueue.add szinkron push-ol, a script elfogadottnak
+// veszi őket, majd a szerver visszautasítja (szintkövetelmény), a játék kiveszi
+// a sorból -- és a munkák a listáról már eltűntek. 8 munka veszett így el.
+console.log('\n=== Szerveroldali elutasítás ===');
+eval([extract('parseBodyParams'), extract('extractTasksFromBody'),
+      extract('rejectedFromAddResponse'), extract('addResponseMatchesBatch')].join('\n'));
+global.URLSearchParams = require('url').URLSearchParams;
+
+const body3 = 'tasks[0][jobId]=129&tasks[0][x]=1&tasks[0][y]=2&tasks[0][duration]=15&tasks[0][taskType]=job'
+            + '&tasks[1][jobId]=127&tasks[1][x]=3&tasks[1][y]=4&tasks[1][duration]=600&tasks[1][taskType]=job'
+            + '&tasks[2][jobId]=60&tasks[2][x]=5&tasks[2][y]=6&tasks[2][duration]=3600&tasks[2][taskType]=job';
+const parsed3 = extractTasksFromBody(body3);
+eq('a kérés minden munkája kijön', parsed3.length, 3);
+eq('sorrendhelyesen', parsed3.map(t => t.jobId), [129, 127, 60]);
+eq('az időtartam is megvan', parsed3.map(t => t.duration), [15, 600, 3600]);
+eq('egyetlen munkás kérés is jó', extractTasksFromBody('tasks[0][jobId]=7&tasks[0][duration]=15').length, 1);
+eq('munka nélküli test -> üres', extractTasksFromBody('window=task&action=add').length, 0);
+
+const b3 = [{ jobId: 129, duration: 15 }, { jobId: 127, duration: 600 }, { jobId: 60, duration: 3600 }];
+eq('a saját kötegünk felismerhető', addResponseMatchesBatch(parsed3, b3), true);
+eq('más hosszúságú köteg nem a miénk', addResponseMatchesBatch(parsed3, b3.slice(0, 2)), false);
+eq('más munka nem a miénk',
+   addResponseMatchesBatch(parsed3, [{ jobId: 1, duration: 15 }, b3[1], b3[2]]), false);
+eq('köteg nélkül nincs párosítás', addResponseMatchesBatch(parsed3, null), false);
+
+// Az élesben mért válaszalak: tasks[i] vagy {task:{...}}, vagy {error,msg}
+const okEntry = { task: { queue_id: 1, date_done: 1785828704.77 } };
+eq('csupa siker -> nincs visszautasított',
+   rejectedFromAddResponse(b3, { tasks: [okEntry, okEntry, okEntry] }).length, 0);
+const mixed = rejectedFromAddResponse(b3, {
+    tasks: [okEntry, { error: true, msg: 'Legalább a 53 szintet kell elérned' }, okEntry] });
+eq('a hibás elem indexre párosít', mixed.length, 1);
+eq('a megfelelő munka bukott el', mixed[0].job.jobId, 127);
+eq('a szerver üzenete megmarad', /53 szintet/.test(mixed[0].msg), true);
+eq('felső szintű hiba -> az EGÉSZ köteg elbukott',
+   rejectedFromAddResponse(b3, { error: true, msg: 'Nincs elég energiád' }).length, 3);
+eq('hiba nélküli, tasks nélküli válasz nem bukás',
+   rejectedFromAddResponse(b3, { energy: 97 }).length, 0);
+eq('a válasznál rövidebb köteg nem indexel túl',
+   rejectedFromAddResponse([b3[0]], { tasks: [okEntry, { error: true, msg: 'x' }] }).length, 0);
+eq('üres kötegre üres', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
