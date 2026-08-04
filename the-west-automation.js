@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.2 - Időpontok és gyors újraindulás)
+// @name         The-West Modular Job Queue (Lisa v11.3 - Várakozók a játék sorában)
 // @namespace   http://tampermonkey.net/
-// @version     11.2
+// @version     11.3
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -47,6 +47,8 @@
         FALLBACK_QUEUE_LIMIT: 4,     // csak ha a játék TaskQueue-ja elérhetetlen
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
+        GAME_QUEUE_PREVIEW: 8,       // ennyi várakozó munka látszik a játék sorában
+        PANEL_PREVIEW: 12,           // ennyi látszik a script paneljén
     };
 
     // ============================================================
@@ -64,6 +66,7 @@
     let isLeaderTab = true;
     let dialogCloseTimer = null;
     let lastSeenQueueLen = 0;
+    let renderedPendingKey = '';
 
     let uiPanel, uiExtraList, uiHistoryList, uiStatus, uiExtraCount, uiHistoryCount;
     let uiQueueStatus;
@@ -279,6 +282,155 @@
 
     function formatEta(eta) {
         return `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
+    }
+
+    // ------------------------------------------------------------
+    //  Várakozó munkák a játék sorában (kizárólag megjelenítés)
+    // ------------------------------------------------------------
+    // A #queuedTasks tartalma a játéké, oda nem írunk. A saját elemeink külön
+    // konténerbe kerülnek, közvetlenül alá, a játék osztályneveivel -- így a
+    // megjelenés azonos, de a játék DOM-ját nem módosítjuk.
+    //
+    // A konténer szülőjén (.middle) a játéknak KÖZVETLEN click-kezelője van,
+    // ami a taskAbort / taskHalveway / taskInstantFinish / centermap / icon
+    // osztályokra reagál, és a queueId-t az osztálynévből olvassa ki. A mi
+    // sorainkhoz nem tartozik valódi munka, ezért egyetlen kattintást sem
+    // engedünk feljebb jutni -- enélkül egy kattintás valódi munkát szakítana meg.
+    function pendingIconUrl(job) {
+        try {
+            if (!gameReady()) return null;
+            const probe = new window.TaskJob(job.jobId, job.x, job.y, job.duration);
+            const icon = typeof probe.getIcon === 'function' ? probe.getIcon() : null;
+            return (typeof icon === 'string' && icon) ? icon : null;
+        } catch(e) { return null; }
+    }
+
+    function formatClock(seconds) {
+        const s = Math.max(0, Math.round(seconds || 0));
+        return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60]
+            .map(v => String(v).padStart(2, '0')).join(':');
+    }
+
+    function injectPendingStyles() {
+        if (document.getElementById('lisa-pending-style')) return;
+        const st = document.createElement('style');
+        st.id = 'lisa-pending-style';
+        st.textContent = `
+            .lisa-pending { opacity: 0.68; }
+            .lisa-pending:hover { opacity: 0.95; }
+            .lisa-pending .taskAbort { cursor: pointer; }
+            #queuedTasks .lisa-pending-sep {
+                display: block;
+                clear: both;
+                border-top: 1px dashed #b89a6b;
+                margin: 4px 2px 2px;
+                padding-top: 2px;
+                font: italic 10px 'Georgia','Times New Roman',serif;
+                color: #4a3b28;
+                text-align: center;
+                text-shadow: 0 1px 0 rgba(255,255,255,0.45);
+            }
+            #queuedTasks .lisa-pending-more {
+                display: inline-block;
+                vertical-align: top;
+                font: bold 13px 'Georgia','Times New Roman',serif;
+                color: #4a3b28;
+                padding: 24px 10px;
+                text-shadow: 0 1px 0 rgba(255,255,255,0.45);
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    // A játék .task/.icon szabályai a #queuedTasks-hoz vannak kötve: külön
+    // konténerben a méret és az ikon nem érvényesül. Ezért a sorainkat magába a
+    // #queuedTasks-ba fűzzük, MINDIG a valódi elemek után. A játék a gyerekeket
+    // indexre képezi le, így a végére fűzés a valódi elemek leképezését nem
+    // bántja, a tick pedig nem építi újra a listát (méréssel ellenőrizve).
+    function pendingHost() {
+        const q = document.getElementById('queuedTasks');
+        return (q && q.isConnected) ? q : null;
+    }
+
+    function clearPendingRows(host) {
+        host.querySelectorAll('.lisa-pending, .lisa-pending-sep, .lisa-pending-more')
+            .forEach(el => el.remove());
+    }
+
+    function buildPendingItem(job, eta) {
+        const item = document.createElement('span');
+        item.className = 'task lisa-pending';   // a 'task' hozza a játék stílusát
+        item.dataset.id = job.id;
+
+        const time = document.createElement('div');
+        time.className = 'taskTime';
+        const p = document.createElement('p');
+        p.textContent = formatClock(job.duration);
+        time.appendChild(p);
+
+        const btns = document.createElement('div');
+        btns.className = 'taskBtns';
+        const abort = document.createElement('div');
+        abort.className = 'taskAbort lisa-pending-abort';
+        abort.title = 'Eltávolítás az extra sorból';
+        btns.appendChild(abort);
+
+        const icon = document.createElement('div');
+        icon.className = 'icon';
+        const url = pendingIconUrl(job);
+        if (url) icon.style.backgroundImage = `url("${url}")`;
+
+        item.appendChild(time);
+        item.appendChild(btns);
+        item.appendChild(icon);
+        item.title = eta
+            ? `${job.jobName} — ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
+            : `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`;
+
+        item.addEventListener('click', (e) => {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            if (e.target.closest('.lisa-pending-abort')) removeExtraJobById(job.id);
+        }, true);
+
+        return item;
+    }
+
+    function renderPendingInGameQueue() {
+        injectPendingStyles();
+        const host = pendingHost();
+        if (!host) return;
+
+        if (!extraJobs.length) {
+            if (renderedPendingKey !== '') { clearPendingRows(host); renderedPendingKey = ''; }
+            return;
+        }
+
+        const shown = extraJobs.slice(0, CONFIG.GAME_QUEUE_PREVIEW);
+        const hidden = extraJobs.length - shown.length;
+        // A figyelő 2 mp-enként hív. Csak akkor építünk újra, ha változott a lista,
+        // vagy ha a játék újrarajzolása közben eltűntek a soraink (öngyógyítás).
+        const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}`;
+        if (key === renderedPendingKey && host.querySelector('.lisa-pending-sep')) return;
+        renderedPendingKey = key;
+
+        clearPendingRows(host);
+        const etas = computeEtas(extraJobs);
+
+        const sep = document.createElement('div');
+        sep.className = 'lisa-pending-sep';
+        sep.textContent = `Extra sor — ${extraJobs.length}`;
+        host.appendChild(sep);
+
+        shown.forEach((job, i) => host.appendChild(buildPendingItem(job, etas[i])));
+
+        if (hidden > 0) {
+            const more = document.createElement('span');
+            more.className = 'lisa-pending-more';
+            more.textContent = `+${hidden}`;
+            more.title = `${hidden} további munka a listában`;
+            host.appendChild(more);
+        }
     }
 
     // A játék saját add-ját hívjuk, nem nyers XHR-t. Így a hash, a slotkezelés
@@ -833,6 +985,7 @@
     function watchGameQueue() {
         updateQueueBadge();
         updateExtraEtas();
+        renderPendingInGameQueue();
 
         const len = gameQueueLength();
         const dropped = len < lastSeenQueueLen;
@@ -1095,6 +1248,12 @@
                 margin-left: 6px;
                 border-radius: 3px;
             }
+            .lisa-more-row {
+                justify-content: center;
+                font-style: italic;
+                color: #a99372;
+                font-size: 11px;
+            }
             .lisa-eta {
                 font-size: 10px;
                 color: #a99372;
@@ -1222,7 +1381,9 @@
     function updateExtraList() {
         if (!uiExtraList) return;
         uiExtraList.textContent = '';
-        extraJobs.forEach(job => {
+        const shownJobs = extraJobs.slice(0, CONFIG.PANEL_PREVIEW);
+        const hiddenCount = extraJobs.length - shownJobs.length;
+        shownJobs.forEach(job => {
             const li = document.createElement('li');
             li.dataset.id = job.id;
 
@@ -1245,8 +1406,16 @@
             li.appendChild(removeEl);
             uiExtraList.appendChild(li);
         });
+        if (hiddenCount > 0) {
+            const li = document.createElement('li');
+            li.className = 'lisa-more-row';
+            li.textContent = `… és még ${hiddenCount} munka`;
+            li.title = `A lista ${CONFIG.PANEL_PREVIEW} elemet mutat, összesen ${extraJobs.length} várakozik.`;
+            uiExtraList.appendChild(li);
+        }
         if (uiExtraCount) uiExtraCount.textContent = extraJobs.length;
         updateExtraEtas();
+        renderPendingInGameQueue();
     }
 
     // Csak az időpont-szövegeket írja át, a sorokat nem építi újra: így percenként
@@ -1414,5 +1583,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.2 betöltve.');
+    console.log('[Lisa] Modular v11.3 betöltve.');
 })();

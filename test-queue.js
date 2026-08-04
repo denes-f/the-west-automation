@@ -52,6 +52,7 @@ const updateExtraList = () => {};
 const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
+const renderPendingInGameQueue = () => {};
 const ensureProcessing = () => {};
 const scheduleNextJob = (ms) => { scheduled = ms; nextJobTimer = 1; };
 const generateId = (() => { let n = 0; return () => 'id' + (++n); })();
