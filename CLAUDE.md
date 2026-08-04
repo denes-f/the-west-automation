@@ -35,9 +35,11 @@ treat it as the baseline rather than something to redesign.
   closed, so recovered energy is reflected as it happens.
 - Warns per job when the **motivation** at its predicted start would be ≤ 75%, or when the
   **energy** won't cover its cost — and offers to insert a **sleep** (never unasked, never a paid
-  room), cancelling it as soon as the room's energy level is reached.
+  room), ending it once that sleep's goal is met: the room's level, or just enough for the jobs
+  behind it, whichever the user chose for that sleep.
 - Shows waiting jobs in **two places**: its own game-style window (top right, scrollable) and as
-  extra rows in the game's bottom-right queue widget, under a separator (6 shown, then `+N`).
+  extra rows in the game's bottom-right queue widget, under a separator (5 shown, then a `+N` tile
+  in the sixth slot).
 - Shows predicted start→finish times per job, chaining travel between locations.
 - Clears the waiting list when the user confirms the game's "cancel all".
 
@@ -49,7 +51,9 @@ game-facing fact below was measured in a live browser session. If you need a new
 
 **Never remove a job from `extraJobs` before the game has accepted it.** `processQueue` peeks at
 the head of the list and only splices after `TaskQueue.queue.length` actually grew. This is what
-structurally prevents the "jobs vanished" class of bug — keep it that way.
+structurally prevents the "jobs vanished" class of bug — keep it that way. Note the length check
+alone is *not* sufficient: the server can still reject afterwards, so the add response is the real
+verdict (see "Add response shape"). Both halves are needed.
 
 **Energy is a real cost.** Every started job spends the character's energy. Test with 15-second
 jobs, cancel afterwards (cancelling refunds part of it), and prefer read-only probing. Say what
@@ -57,6 +61,27 @@ you spent.
 
 **Only one game tab.** A second tab holding the leader lock is what made v11.0 look completely
 broken. Close your own tab when finished.
+
+## State of play (end of the v12.8 session)
+
+Everything is committed and pushed on `dev`; `main` is at v12.0 and has not been moved since.
+The user runs the script on two accounts: the `hu27` test character (level 10, max energy 100, in a
+town, nothing else installed) and a **main account** that has the energy bonus (max 150) and the
+*twdb* userscript adding a duel-motivation bar. Several bugs only appeared on the main account —
+when something looks fine on the test character, that is not proof.
+
+Verified **live in the game**: the panel and its window behaviour, the `+N` tile, the injected rows
+and their forced visibility, the travel-rate formula, motivation and energy-cost reads, the energy
+regeneration formula, the forecast bar's placement and appearance (including alongside *twdb*), all
+three dialogs' rendering, and cancelling a running sleep.
+
+Verified **only by unit tests**, never yet exercised end-to-end in a real game: the
+rejected-job requeue path (its trigger was reproduced live, but the recovery was written
+afterwards), and the `'enough'` sleep mode with its live-recalculated goal. Both are worth watching
+the first time they fire for real.
+
+Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
+5-minute re-read makes this self-correcting; see the note under the architecture section).
 
 ## Verified facts about the game
 
@@ -425,6 +450,11 @@ and "Nem" correctly does nothing.
 
 - Code comments and all user-facing strings are **Hungarian**. Commit messages are Hungarian too.
 - Comments explain *why*, especially where a subtle game behaviour forced the design. Keep them.
-- Bump `@name`, `@version` and the boot `console.log` together on every release.
+- Bump `@name`, `@version` and the boot `console.log` together on every release — and the release
+  number plus the assertion count at the top of this file.
 - Run `node test-queue.js` before committing. Add cases for anything measured in-game so it does not
   have to be rediscovered.
+- The test harness pulls functions out of the userscript **by name** (`extract('foo')`), so renaming
+  a function breaks the tests, and a new call to a browser-only function inside an already-extracted
+  one needs a stub near the top of `test-queue.js`. That is the usual cause of a sudden
+  `ReferenceError: … is not defined` when the tests had been passing.
