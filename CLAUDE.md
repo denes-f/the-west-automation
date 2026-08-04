@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 157 assertions, no dependencies.
+  name and runs them against stubs. 165 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.4.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.5.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `157 passed, 0 failed`.
+2. `node test-queue.js` should print `165 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -236,9 +236,19 @@ el.text(energy + ' / ' + maxEnergy)
 ```
 
 `y` is `-13` normally and `-26` with the `regen` premium bonus (which also adds
-`.energy_premium_bonus`). Reusing the game's `status_bar energy_bar` classes and this formula makes
-an injected forecast bar pixel-identical — do **not** copy `hasMousePopup`, that belongs to the
-game's own bar and would attach its tooltip handler.
+`.energy_premium_bonus`).
+
+Two traps when injecting a bar of your own here, both hit in v12.4:
+
+- **Never give it the `energy_bar` class.** The game updates via
+  `$('#ui_character_container > .energy_bar')`, which matches *every* such child — so it silently
+  overwrote our forecast with the real energy on each energy change. Use `status_bar` plus an own
+  class and copy `background-image`/font off the real bar instead. Same reason not to copy
+  `hasMousePopup` (the game adds it to our element anyway).
+- **Never hardcode the vertical position.** Other userscripts add bars here too — the widely used
+  *twdb* script inserts `.twdb_charcont_ext` with a `#duelmot_bar` right below the energy bar and
+  grows the container to 191 px. Position below the **lowest** bar actually present, excluding your
+  own element, or the two overlap (and including your own makes it walk down the screen).
 
 ### Map quick-start arrows
 

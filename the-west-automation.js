@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.4)
+// @name         The-West Modular Job Queue (Lisa v12.5)
 // @namespace   http://tampermonkey.net/
-// @version     12.4
+// @version     12.5
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -482,6 +482,10 @@
     function computeForecast(jobs, etas, opts) {
         const committed = Object.assign({}, opts.priorMotivationCost || {});
         let energyUsed = 0;
+        // Alvás után nem a "mostantól regenerálódó" energiából számolunk tovább,
+        // hanem abból, ameddig az alvás feltölt. A további regenerációt ilyenkor
+        // elhanyagoljuk: így a jóslat inkább pesszimista, mint hazug.
+        let carry = null;
         return jobs.map((job, i) => {
             const start = etas[i] ? etas[i].start : Date.now();
             const cost = opts.costOf(job);
@@ -489,8 +493,21 @@
             const motivation = (typeof base === 'number')
                 ? Math.round(base * 100) - (committed[job.jobId] || 0)
                 : null;
-            const predicted = opts.energyAt(start);
+            const predicted = carry === null ? opts.energyAt(start) : carry;
             const energyBefore = predicted === null ? null : predicted - energyUsed;
+
+            // Az alvás nem fogyaszt, hanem feltölt.
+            if (job.taskType === 'sleep') {
+                const target = opts.sleepTargetOf ? opts.sleepTargetOf(job) : null;
+                carry = target;
+                energyUsed = 0;
+                return {
+                    id: job.id, cost: null, motivation: null,
+                    energyBefore, energyAfter: target,
+                    lowMotivation: false, notEnoughEnergy: false, isSleep: true,
+                };
+            }
+
             const energyAfter = (energyBefore === null || cost === null) ? null : energyBefore - cost;
             if (cost !== null) {
                 energyUsed += cost;
@@ -506,6 +523,12 @@
                 notEnoughEnergy: energyBefore !== null && cost !== null && energyBefore < cost,
             };
         });
+    }
+
+    // Az ELSŐ munka, amire az előrejelzés szerint nem lesz energia. Ez a hely,
+    // ahová az alvás való: addig a lista simán fut, onnantól nem.
+    function forecastShortageIndex(forecast) {
+        return forecast.findIndex(f => f && f.notEnoughEnergy);
     }
 
     // ------------------------------------------------------------
@@ -527,22 +550,54 @@
         return Math.min(width, Math.max(0, Math.ceil(width * (value / max * 100) / 100)));
     }
 
+    // A játék energiasávja. Kifejezetten KIZÁRJUK a sajátunkat: az a selector,
+    // amivel a játék frissít (#ui_character_container > .energy_bar), minden
+    // ilyen osztályú gyereket eltalál.
+    function realEnergyBar() {
+        return document.querySelector('#ui_character_container > .energy_bar:not(#lisa-energy-forecast)');
+    }
+
+    // Hova kerüljön a sávunk. Nem fix 176 px: más scriptek is tehetnek sávot a
+    // karakterdobozba (a twdb például a párbajmotivációt), és akkor egymásra
+    // csúsznánk. A doboz LEGALSÓ sávja alá igazodunk, a sajátunkat kihagyva --
+    // különben minden körben lejjebb vándorolna.
+    function forecastBarTop(real, bar, container) {
+        const top = container.getBoundingClientRect().top;
+        let bottom = real.getBoundingClientRect().bottom - top;
+        container.querySelectorAll('.status_bar, .twdb_charcont_ext, [id*="duelmot"]').forEach(el => {
+            if (el === bar || (bar && bar.contains(el))) return;
+            const r = el.getBoundingClientRect();
+            if (!r.height) return;                      // rejtett elem nem számít
+            bottom = Math.max(bottom, r.bottom - top);
+        });
+        return Math.round(bottom) + 2;
+    }
+
     function ensureEnergyForecastBar() {
-        const real = document.querySelector('#ui_character_container > .energy_bar');
+        const real = realEnergyBar();
         if (!real) return null;
+        const container = real.parentElement;
         let bar = document.getElementById('lisa-energy-forecast');
         if (!bar) {
             bar = document.createElement('div');
             bar.id = 'lisa-energy-forecast';
-            // A játék osztályai hozzák a spritot és a tipográfiát; a
-            // hasMousePopup-ot NEM vesszük át, mert az a játék sávjáé.
-            bar.className = 'status_bar energy_bar';
-            real.parentElement.appendChild(bar);
+            // SZÁNDÉKOSAN nincs rajta energy_bar osztály: azzal a játék saját
+            // updateEnergy-je minden energiaváltozáskor felülírná a jóslatot a
+            // valódi energiával. A sprite-ot a valódi sávról másoljuk át.
+            bar.className = 'status_bar lisa-forecast-bar';
+            container.appendChild(bar);
         }
-        // Ugyanaz a térköz, ahogy az energiasáv követi az életsávot (15 px).
+        const cs = getComputedStyle(real);
         bar.style.position = 'absolute';
-        bar.style.left = getComputedStyle(real).left;
-        bar.style.top = (real.offsetTop + 15) + 'px';
+        bar.style.left = cs.left;
+        bar.style.width = real.offsetWidth + 'px';
+        bar.style.height = real.offsetHeight + 'px';
+        bar.style.backgroundImage = cs.backgroundImage;      // ugyanaz a bars.png
+        bar.style.backgroundRepeat = 'no-repeat';
+        bar.style.font = cs.font;
+        bar.style.color = cs.color;
+        bar.style.textAlign = cs.textAlign;
+        bar.style.top = forecastBarTop(real, bar, container) + 'px';
         bar.style.opacity = '0.72';
         bar.style.cursor = 'help';
         return bar;
@@ -553,6 +608,8 @@
     function updateEnergyForecastBar() {
         const bar = ensureEnergyForecastBar();
         if (!bar) return;
+        const real = realEnergyBar();
+        const width = (real && real.offsetWidth) || ENERGY_BAR_WIDTH;
         const c = window.Character;
         const max = (c && c.maxEnergy) || 100;
         const last = lastForecast.length ? lastForecast[lastForecast.length - 1] : null;
@@ -566,7 +623,7 @@
         bar.style.display = 'block';
         const shown = Math.max(0, Math.min(max, value));
         bar.style.backgroundPosition =
-            `${-ENERGY_BAR_WIDTH + energyBarFill(shown, max, ENERGY_BAR_WIDTH)}px ${energySpriteY()}px`;
+            `${-width + energyBarFill(shown, max, width)}px ${energySpriteY()}px`;
         bar.textContent = `${shown} / ${max}`;
         bar.title = `Várható energia a lista végén (${extraJobs.length} munka után): ${value}`
             + (value < 0 ? `\nEnnyi energia nem lesz meg – ${-value} hiányzik.` : '');
@@ -579,6 +636,7 @@
             costOf: jobEnergyCost,
             motivationOf: jobMotivation,
             energyAt,
+            sleepTargetOf: (job) => sleepTargetEnergy(job.room),
             priorMotivationCost: motivationAlreadyCommitted(),
             motivationWarn: CONFIG.MOTIVATION_WARN,
         });
@@ -718,7 +776,9 @@
         console.log('[Lisa] A hotel alvásgombja a saját sorba kerül.');
     }
 
-    function insertSleepJob() {
+    // Az alvás oda kerül, AHOL az energia elfogy: addig a lista fut tovább,
+    // fölöslegesen nem állítjuk meg a még kifizethető munkákat.
+    function insertSleepJob(atIndex) {
         const town = window.Character.homeTown;
         fetchHotelRooms(town.town_id, (rooms) => {
             const room = rooms && bestFreeRoom(rooms);
@@ -726,23 +786,36 @@
                 updateUIStatus('Nincs ingyenes szoba a hotelben – alvás nem lett beszúrva.');
                 return;
             }
-            extraJobs.unshift(makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y));
+            const pos = Math.max(0, Math.min(extraJobs.length, atIndex || 0));
+            extraJobs.splice(pos, 0, makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y));
             saveExtraQueueToStorage();
             updateUI();
-            updateUIStatus(`Alvás beszúrva a sor elejére (${room.name || room.key}).`);
+            updateUIStatus(pos === 0
+                ? `Alvás beszúrva a sor elejére (${room.name || room.key}).`
+                : `Alvás beszúrva a(z) ${pos + 1}. helyre (${room.name || room.key}).`);
             ensureProcessing();
         });
     }
 
     // Az alvás automatikus, de csak KÉRDÉS után -- a felhasználó így dönt.
     // Ha nemet mond, egy ideig nem kérdezünk újra, hogy ne zaklassuk.
-    function maybeOfferSleep(neededEnergy) {
+    function maybeOfferSleep(neededEnergy, atIndex) {
         if (!CONFIG.AUTO_SLEEP || !canSleep()) return;
         if (sleepOffer || Date.now() < sleepDeclinedUntil) return;
         if (isSleeping()) return;
         if (extraJobs.some(j => j.taskType === 'sleep')) return;
-        sleepOffer = { needed: neededEnergy };
+        sleepOffer = { needed: neededEnergy, at: atIndex || 0 };
         renderSleepOffer();
+    }
+
+    // A felajánlást az ELŐREJELZÉS is kiváltja, nem csak az, hogy a soron
+    // következő munka épp most nem indítható: ha a lista közepén fogyna el az
+    // energia, azt már most érdemes megoldani. Enélkül a panel csak annyit
+    // mondott, hogy "-2", de nem ajánlott rá megoldást.
+    function offerSleepIfForecastRunsOut() {
+        const i = forecastShortageIndex(lastForecast);
+        if (i === -1) return;
+        maybeOfferSleep(lastForecast[i].cost, i);
     }
 
     function dismissSleepOffer(declined) {
@@ -1941,6 +2014,7 @@
         updateQueueBadge();
         updateExtraEtas(refreshForecast());
         updateEnergyForecastBar();
+        offerSleepIfForecastRunsOut();
         updateKeepAwake();
         cancelSleepIfFull();
         observePendingHost();
@@ -2195,11 +2269,17 @@
         box.textContent = '';
         box.style.display = '';
         const text = document.createElement('span');
-        text.textContent = `Kevés az energia (${sleepOffer.needed} kell). Alvás?`;
+        const at = sleepOffer.at || 0;
+        text.textContent = at > 0
+            ? `A(z) ${at + 1}. munkára elfogy az energia. Alvás?`
+            : `Kevés az energia (${sleepOffer.needed} kell). Alvás?`;
+        text.title = 'A jóslat szerint innentől nem lenne indítható a munka.';
         const yes = document.createElement('button');
         yes.textContent = 'Igen';
-        yes.title = 'Alvás beszúrása a sor elejére, a legjobb ingyenes szobába';
-        yes.addEventListener('click', () => { dismissSleepOffer(false); insertSleepJob(); });
+        yes.title = at > 0
+            ? `Alvás beszúrása a(z) ${at + 1}. munka elé, a legjobb ingyenes szobába`
+            : 'Alvás beszúrása a sor elejére, a legjobb ingyenes szobába';
+        yes.addEventListener('click', () => { const i = at; dismissSleepOffer(false); insertSleepJob(i); });
         const no = document.createElement('button');
         no.textContent = 'Nem';
         no.title = `Most nem – ${Math.round(CONFIG.SLEEP_DECLINE_MS / 60000)} percig nem kérdezünk újra`;
@@ -2465,5 +2545,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.4 betöltve.');
+    console.log('[Lisa] Modular v12.5 betöltve.');
 })();

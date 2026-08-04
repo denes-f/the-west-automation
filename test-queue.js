@@ -59,6 +59,7 @@ const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
 const refreshForecast = () => [];          // előrejelzés: élő játékállapot kell hozzá
 const updateEnergyForecastBar = () => {};  // a karakterdoboz sávja szintén
+const offerSleepIfForecastRunsOut = () => {};
 const renderPendingInGameQueue = () => {};
 const observePendingHost = () => {};
 const ensureMenuButton = () => {};
@@ -589,6 +590,35 @@ fc = computeForecast(mkJobs(2), mkEtas(2, 0), {
 eq('ismeretlen költség -> nincs energiajóslás', [fc[0].energyAfter, fc[0].cost], [null, null]);
 eq('ismeretlen motiváció -> nincs jelzés', [fc[0].motivation, fc[0].lowMotivation], [null, false]);
 eq('ismeretlen költségnél nem állítjuk, hogy kevés', fc[0].notEnoughEnergy, false);
+
+// Az alvás nem fogyaszt, hanem FELTÖLT: utána a szoba célszintjéről megy tovább
+// a számolás, különben a lista végi jóslat örökre negatív maradna.
+eval(extract('forecastShortageIndex'));
+const withSleep = [
+    { ...mkJobs(1)[0], id: 'a' },
+    { id: 'zzz', taskType: 'sleep', room: 'luxurious_apartment' },
+    { ...mkJobs(1)[0], id: 'b' },
+    { ...mkJobs(1)[0], id: 'c' },
+];
+fc = computeForecast(withSleep, mkEtas(4, 0), {
+    costOf: (j) => (j.taskType === 'sleep' ? null : 8), motivationOf: () => 1,
+    energyAt: flat(10), sleepTargetOf: () => 100,
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('az első munka még belefér', [fc[0].energyBefore, fc[0].energyAfter], [10, 2]);
+eq('az alvás feltölt a szoba szintjére', [fc[1].isSleep, fc[1].energyAfter], [true, 100]);
+eq('utána onnan megy tovább', [fc[2].energyBefore, fc[2].energyAfter], [100, 92]);
+eq('és a következő is', fc[3].energyAfter, 84);
+eq('alvás után nincs energiahiány', fc.some(f => f.notEnoughEnergy), false);
+eq('az alvásra magára nincs figyelmeztetés', [fc[1].lowMotivation, fc[1].notEnoughEnergy], [false, false]);
+
+// Az alvás oda kerül, AHOL az energia elfogy -- addig a lista simán fut
+fc = computeForecast(mkJobs(4), mkEtas(4, 0), {
+    costOf: () => 4, motivationOf: () => 1, energyAt: flat(10),
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('a harmadik munkánál fogy el', forecastShortageIndex(fc), 2);
+eq('bőséges energiánál nincs hiány', forecastShortageIndex(
+    computeForecast(mkJobs(2), mkEtas(2, 0), { costOf: () => 1, motivationOf: () => 1,
+        energyAt: flat(100), priorMotivationCost: {}, motivationWarn: 75 })), -1);
 
 // ============================================================
 //  Alvás: szobaválasztás és célszint
