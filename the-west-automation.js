@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v10.23 - Élő sorállapot)
+// @name         The-West Modular Job Queue (Lisa v10.24 - UI és tárolás)
 // @namespace   http://tampermonkey.net/
-// @version     10.23
+// @version     10.24
 // @description XHR‑alapú munkaindítás, maradék automatikus sorba, mennyiség max 99, fallback, auto-close dialógus, menü gomb.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -26,12 +26,23 @@
         MAX_DEFERRALS: 2,            // ennyi sikertelen kör után eldobjuk
         REQUEST_TIMEOUT: 20000,
         IDLE_RESCHEDULE: 5000,       // vészfék: ha egy ág elfelejtene időzítőt állítani
-        STORAGE_EXTRA_QUEUE: 'lisa_extra_params_v1020',
-        STORAGE_HISTORY: 'lisa_modular_history_v97',
-        STORAGE_GAME_QUEUE: 'lisa_game_queue_v1',
+        // Verziófüggetlen kulcsok: a verziószám a tartalomban van, nem a kulcsban,
+        // különben minden kiadás elárvasítaná a felhasználó elmentett sorát.
+        STORAGE_EXTRA_QUEUE: 'lisa_extra_queue',
+        STORAGE_HISTORY: 'lisa_history',
+        STORAGE_GAME_QUEUE: 'lisa_game_queue',
+        STORAGE_LEADER: 'lisa_leader_tab',
+        STORAGE_VERSION: 2,
+        LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
+        LEGACY_HISTORY: 'lisa_modular_history_v97',
         TASK_WINDOW_MATCH: 'window=task',
         MIN_SEND_GAP: 2000,          // két egymást követő küldés között
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
+        TIMER_CHUNK: 60000,          // hosszú várakozást ekkora darabokban ébresztünk
+        LEADER_HEARTBEAT: 5000,
+        LEADER_TTL: 15000,           // ennyi néma szívverés után átvehető a feldolgozás
+        MAX_HISTORY: 60,
+        BOOT_MAX_ATTEMPTS: 60,
         PANEL_WIDTH: 320,
         BUTTON_COOLDOWN: 1500,
         MAX_AMOUNT: 99,
@@ -54,6 +65,9 @@
     let pendingQueueLengthBefore = 0;
     let processing = false;
     let nextJobTimer = null;
+    let nextJobDeadline = 0;
+    let isLeaderTab = true;
+    let dialogCloseTimer = null;
 
     // A játék saját munkasorának modellje: [{ dateDone, jobId }], szerver-epoch
     // másodpercben. Minden task-ablak válaszból újraszinkronizáljuk, és az
@@ -76,7 +90,17 @@
     //  3. SEGÉDFÜGGVÉNYEK
     // ============================================================
     const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-    const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
+    const generateId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const TAB_ID = generateId();
+
+    function formatDuration(seconds) {
+        const s = Math.max(0, Math.round(seconds || 0));
+        if (s < 60) return `${s} mp`;
+        if (s < 3600) return `${Math.round(s / 60)} p`;
+        const h = Math.floor(s / 3600);
+        const m = Math.round((s % 3600) / 60);
+        return m ? `${h} ó ${m} p` : `${h} ó`;
+    }
 
     function parseBodyParams(body) {
         try {
@@ -253,17 +277,12 @@
     }
 
     function saveGameQueueToStorage() {
-        try { localStorage.setItem(CONFIG.STORAGE_GAME_QUEUE, JSON.stringify(gameQueue)); } catch(e) {}
+        saveStore(CONFIG.STORAGE_GAME_QUEUE, gameQueue);
     }
 
     function loadGameQueueFromStorage() {
-        try {
-            const raw = localStorage.getItem(CONFIG.STORAGE_GAME_QUEUE);
-            const parsed = raw ? JSON.parse(raw) : null;
-            if (Array.isArray(parsed)) {
-                gameQueue = parsed.filter(t => t && typeof t.dateDone === 'number');
-            }
-        } catch(e) { gameQueue = []; }
+        const data = loadStore(CONFIG.STORAGE_GAME_QUEUE);
+        gameQueue = Array.isArray(data) ? data.filter(t => t && typeof t.dateDone === 'number') : [];
         // A dateDone abszolút szerveridő, ezért újratöltés után is értelmezhető:
         // az F5 óta befejeződött munkák itt esnek ki.
         pruneGameQueue();
@@ -304,7 +323,7 @@
     }
 
     // ============================================================
-    //  5. "TÖBB MUNKA?" DIALÓGUS AUTOMATIKUS BEZÁRÁSA
+    //  6. "TÖBB MUNKA?" DIALÓGUS AUTOMATIKUS BEZÁRÁSA
     // ============================================================
     function closeMoreJobsDialog() {
         const dialogs = document.querySelectorAll('.tw2gui_dialog');
@@ -325,18 +344,21 @@
     }
 
     function scheduleDialogClose() {
+        // Gyors egymás utáni kattintásnál eddig több figyelő pörgött egyszerre.
+        if (dialogCloseTimer) clearInterval(dialogCloseTimer);
         let attempts = 0;
         const maxAttempts = 10;
-        const interval = setInterval(() => {
+        dialogCloseTimer = setInterval(() => {
             if (closeMoreJobsDialog() || attempts >= maxAttempts) {
-                clearInterval(interval);
+                clearInterval(dialogCloseTimer);
+                dialogCloseTimer = null;
             }
             attempts++;
         }, 200);
     }
 
     // ============================================================
-    //  6. JOB ADATOK KINYERÉSE (FALLBACKHEZ)
+    //  7. JOB ADATOK KINYERÉSE (FALLBACKHEZ)
     // ============================================================
     // "45 mp", "15 p", "1 ó", "1 ó 30 p" -> másodperc. Összetett alakot is kezel,
     // és az órát is: enélkül minden hosszú munka 15 percnek látszott.
@@ -380,7 +402,7 @@
     }
 
     // ============================================================
-    //  7. FALLBACK LOGIKA
+    //  8. FALLBACK LOGIKA
     // ============================================================
     function clearFallback() {
         if (pendingFallback) {
@@ -406,7 +428,7 @@
     }
 
     // ============================================================
-    //  8. XHR INTERCEPTOR
+    //  9. XHR INTERCEPTOR
     // ============================================================
     document.addEventListener('click', function(e) {
         const startBtn = e.target.closest('.job_startbutton');
@@ -464,20 +486,22 @@
         }
     }, true);
 
-    window.XMLHttpRequest = function() {
+    function InterceptedXHR() {
         const xhr = new OriginalXHR();
         const origOpen = xhr.open;
         const origSend = xhr.send;
-        let reqUrl = '', reqMethod = '', reqBody = null;
+        let reqUrl = '', reqMethod = '', reqBody = null, loadBound = false;
 
         xhr.open = function(method, url, ...rest) {
-            reqMethod = method.toUpperCase();
-            reqUrl = url;
+            reqMethod = String(method || '').toUpperCase();
+            reqUrl = String(url || '');
             return origOpen.apply(this, [method, url, ...rest]);
         };
 
         xhr.send = function(body) {
             reqBody = body;
+            if (loadBound) return origSend.apply(this, arguments); // újrahasznált xhr: ne kössünk kétszer
+            loadBound = true;
             if (reqMethod === 'POST' && reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) {
                 // A fallbacknak azt kell tudnia, hogy a játék ELINDÍTOTTA a kérést.
                 // Ha csak a válasz beérkezésekor jeleznénk, egy a FALLBACK_TIMEOUT-nál
@@ -553,7 +577,16 @@
             origSend.apply(this, arguments);
         };
         return xhr;
-    };
+    }
+
+    // A prototípust és a statikus konstansokat átvisszük: enélkül az
+    // XMLHttpRequest.DONE undefined lett, és az `x instanceof XMLHttpRequest`
+    // minden példányra false-t adott a játék és más userscriptek szemében.
+    InterceptedXHR.prototype = OriginalXHR.prototype;
+    ['UNSENT', 'OPENED', 'HEADERS_RECEIVED', 'LOADING', 'DONE'].forEach(k => {
+        InterceptedXHR[k] = OriginalXHR[k];
+    });
+    window.XMLHttpRequest = InterceptedXHR;
 
     function addJobToHistory(jobData) {
         const existingIndex = jobHistory.findIndex(j =>
@@ -580,12 +613,13 @@
             jobName: jobData.jobName || extractJobName(jobData.body),
             timestamp: Date.now(),
         });
+        if (jobHistory.length > CONFIG.MAX_HISTORY) jobHistory.length = CONFIG.MAX_HISTORY;
         saveHistoryToStorage();
         if (uiHistoryList) updateUI();
     }
 
     // ============================================================
-    //  9. EXTRA SOR KEZELÉSE
+    //  10. EXTRA SOR KEZELÉSE
     // ============================================================
     // Kötegelt hozzáadás: egyetlen localStorage írás N helyett. 99 munka
     // hozzáadása korábban 99 szinkron stringify+write ciklust jelentett.
@@ -617,13 +651,8 @@
         return n;
     }
 
-    function addExtraJob(params, displayName = null, updateUIAfter = false) {
-        addExtraJobs(params, 1, displayName);
-        if (updateUIAfter && uiExtraList) updateUI();
-    }
-
     // ============================================================
-    //  10. VÁLASZ KIÉRTÉKELÉS
+    //  11. VÁLASZ KIÉRTÉKELÉS
     // ============================================================
     // Minden lehetséges válasz pontosan egy kimenetet kap: 'success', 'queue_full'
     // vagy 'retry'. Nincs átesés: munka soha nem tűnhet el szó nélkül.
@@ -746,7 +775,7 @@
     }
 
     // ============================================================
-    //  11. FELDOLGOZÁS
+    //  12. FELDOLGOZÁS
     // ============================================================
     function ensureProcessing() {
         if (!processing && !paused && extraJobs.length > 0 && !nextJobTimer) {
@@ -756,10 +785,20 @@
 
     function scheduleNextJob(delayMs) {
         if (nextJobTimer) clearTimeout(nextJobTimer);
-        nextJobTimer = setTimeout(() => {
+        nextJobDeadline = Date.now() + Math.max(0, delayMs);
+        armNextJobTimer();
+    }
+
+    // Egy órás setTimeout háttérfülön vagy alvó gépen megbízhatatlan. Abszolút
+    // határidőt tartunk, és legfeljebb TIMER_CHUNK-onként ébredünk ellenőrizni.
+    function armNextJobTimer() {
+        const remaining = nextJobDeadline - Date.now();
+        if (remaining <= 0) {
             nextJobTimer = null;
             processQueue();
-        }, delayMs);
+            return;
+        }
+        nextJobTimer = setTimeout(armNextJobTimer, Math.min(remaining, CONFIG.TIMER_CHUNK));
     }
 
     async function processQueue() {
@@ -773,6 +812,13 @@
             }
             if (extraJobs.length === 0) {
                 updateUIStatus('Nincs több munka az extra sorban.');
+                return;
+            }
+            // Csak egy fül dolgozhatja fel a sort, különben két példány
+            // párhuzamosan küldene ugyanabból a listából.
+            if (!isLeaderTab) {
+                updateUIStatus('Egy másik fül dolgozza fel a sort.');
+                scheduleNextJob(CONFIG.LEADER_HEARTBEAT);
                 return;
             }
             if (!cachedHash) {
@@ -828,34 +874,138 @@
     }
 
     // ============================================================
-    //  12. UI ÉS STORAGE
+    //  13. UI ÉS STORAGE
     // ============================================================
-    function saveExtraQueueToStorage() {
+    // A verziót a tartalomba írjuk, nem a kulcsba, és a régi kulcsokról egyszer
+    // átköltöztetünk – így egy frissítés nem hagyja ott a felhasználó sorát.
+    function saveStore(key, list) {
         try {
-            localStorage.setItem(CONFIG.STORAGE_EXTRA_QUEUE, JSON.stringify(extraJobs.map(j => ({
-                id: j.id, retries: j.retries, deferrals: j.deferrals || 0, jobName: j.jobName,
-                jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
-            }))));
-        } catch(e) {}
+            localStorage.setItem(key, JSON.stringify({ v: CONFIG.STORAGE_VERSION, data: list }));
+        } catch(e) {
+            console.warn(`[Lisa] Nem sikerült menteni (${key}):`, e && e.name);
+        }
     }
-    function loadExtraQueueFromStorage() {
+
+    function loadStore(key, legacyKey) {
         try {
-            const raw = localStorage.getItem(CONFIG.STORAGE_EXTRA_QUEUE);
+            const raw = localStorage.getItem(key);
             if (raw) {
                 const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) extraJobs = parsed.filter(j => j.jobId !== undefined);
-                localStorage.removeItem(CONFIG.STORAGE_EXTRA_QUEUE);
+                if (parsed && Array.isArray(parsed.data)) return parsed.data;
+                if (Array.isArray(parsed)) return parsed; // verziózás előtti formátum
             }
-        } catch(e) {}
+            if (legacyKey) {
+                const legacy = localStorage.getItem(legacyKey);
+                if (legacy) {
+                    const parsed = JSON.parse(legacy);
+                    if (Array.isArray(parsed)) {
+                        console.log(`[Lisa] Átköltöztetve a régi kulcsról: ${legacyKey}`);
+                        return parsed;
+                    }
+                }
+            }
+        } catch(e) {
+            console.warn(`[Lisa] Nem sikerült olvasni (${key}):`, e && e.name);
+        }
+        return null;
+    }
+
+    function sanitizeJobs(list) {
+        return list
+            .filter(j => j && j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10)))
+            .map(j => ({
+                id: j.id || generateId(),
+                retries: parseInt(j.retries, 10) || 0,
+                deferrals: parseInt(j.deferrals, 10) || 0,
+                jobName: j.jobName || `Job #${j.jobId}`,
+                jobId: parseInt(j.jobId, 10),
+                x: parseInt(j.x, 10) || 0,
+                y: parseInt(j.y, 10) || 0,
+                duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION,
+                taskType: j.taskType || 'job',
+            }))
+            .slice(0, CONFIG.MAX_EXTRA_QUEUE);
+    }
+
+    function saveExtraQueueToStorage() {
+        saveStore(CONFIG.STORAGE_EXTRA_QUEUE, extraJobs.map(j => ({
+            id: j.id, retries: j.retries, deferrals: j.deferrals || 0, jobName: j.jobName,
+            jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
+        })));
+    }
+
+    function loadExtraQueueFromStorage() {
+        const data = loadStore(CONFIG.STORAGE_EXTRA_QUEUE, CONFIG.LEGACY_EXTRA_QUEUE);
+        if (data) extraJobs = sanitizeJobs(data);
+        // Korábban itt removeItem állt, ezért egy azonnali újratöltés elvesztette
+        // a sort. Most visszaírunk, hogy a tárolt állapot mindig érvényes legyen.
+        saveExtraQueueToStorage();
     }
     function saveHistoryToStorage() {
-        try { localStorage.setItem(CONFIG.STORAGE_HISTORY, JSON.stringify(jobHistory)); } catch(e) {}
+        saveStore(CONFIG.STORAGE_HISTORY, jobHistory);
     }
+
     function loadHistoryFromStorage() {
+        const data = loadStore(CONFIG.STORAGE_HISTORY, CONFIG.LEGACY_HISTORY);
+        if (!data) return;
+        jobHistory = data
+            .filter(j => j && j.jobId !== undefined)
+            .map(j => ({ ...j, id: j.id || generateId(), duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION }))
+            .slice(0, CONFIG.MAX_HISTORY);
+    }
+
+    // ============================================================
+    //  14. TÖBB FÜL: EGYETLEN FELDOLGOZÓ
+    // ============================================================
+    // Két nyitott játékfül eddig ugyanabból a listából küldött párhuzamosan.
+    // A vezető fül szívverést ír a localStorage-ba; a többi passzívan követi.
+    function refreshLeadership() {
+        const wasLeader = isLeaderTab;
         try {
-            const raw = localStorage.getItem(CONFIG.STORAGE_HISTORY);
-            if (raw) { const parsed = JSON.parse(raw); if (Array.isArray(parsed)) jobHistory = parsed; }
-        } catch(e) {}
+            const raw = localStorage.getItem(CONFIG.STORAGE_LEADER);
+            const cur = raw ? JSON.parse(raw) : null;
+            const now = Date.now();
+            if (!cur || !cur.id || cur.id === TAB_ID || (now - cur.ts) > CONFIG.LEADER_TTL) {
+                localStorage.setItem(CONFIG.STORAGE_LEADER, JSON.stringify({ id: TAB_ID, ts: now }));
+                isLeaderTab = true;
+            } else {
+                isLeaderTab = false;
+            }
+        } catch(e) {
+            isLeaderTab = true; // nincs használható storage: egyedül vagyunk
+        }
+
+        if (isLeaderTab && !wasLeader) {
+            console.log('[Lisa] Ez a fül vette át a feldolgozást.');
+            ensureProcessing();
+        } else if (!isLeaderTab && wasLeader) {
+            console.log('[Lisa] Egy másik fül vette át a feldolgozást.');
+        }
+    }
+
+    function initTabSync() {
+        refreshLeadership();
+        setInterval(refreshLeadership, CONFIG.LEADER_HEARTBEAT);
+
+        // A storage esemény csak a TÖBBI fülben sül el, tehát mindig idegen
+        // változást jelez. Minden fül újratölt -- a vezető is, különben a
+        // passzív fülben hozzáadott munkát a következő mentése felülírná.
+        window.addEventListener('storage', (e) => {
+            if (!e.key) return;
+            if (e.key === CONFIG.STORAGE_EXTRA_QUEUE) {
+                const data = loadStore(CONFIG.STORAGE_EXTRA_QUEUE);
+                if (data) {
+                    extraJobs = sanitizeJobs(data);
+                    updateExtraList();
+                    ensureProcessing();
+                }
+            } else if (e.key === CONFIG.STORAGE_HISTORY) {
+                loadHistoryFromStorage();
+                updateHistoryList();
+            } else if (e.key === CONFIG.STORAGE_GAME_QUEUE) {
+                loadGameQueueFromStorage();
+            }
+        });
     }
 
     // --- Menüsor gomb kezelése ---
@@ -1172,27 +1322,81 @@
     }
 
     function updateUI() { updateExtraList(); updateHistoryList(); }
+
+    function removeExtraJobById(id) {
+        const idx = extraJobs.findIndex(j => j.id === id);
+        if (idx === -1) return;
+        extraJobs.splice(idx, 1);
+        saveExtraQueueToStorage();
+        updateExtraList();
+    }
+
+    // A listákat azonosító szerint kötjük, nem tömbindex szerint: a feldolgozó
+    // bármikor levehet egy munkát a sor elejéről a kirajzolás és a kattintás
+    // között, és akkor az index már mást jelölne.
     function updateExtraList() {
         if (!uiExtraList) return;
-        uiExtraList.innerHTML = '';
-        extraJobs.forEach((job, idx) => {
+        uiExtraList.textContent = '';
+        extraJobs.forEach(job => {
             const li = document.createElement('li');
-            li.innerHTML = `<span class="lisa-job-name" title="${job.jobName} (ID:${job.jobId}, x:${job.x}, y:${job.y})">${job.jobName} <small>(ID:${job.jobId})</small></span><span class="remove" data-index="${idx}">✕</span>`;
-            li.querySelector('.remove').addEventListener('click', () => {
-                extraJobs.splice(idx, 1);
-                saveExtraQueueToStorage();
-                updateExtraList();
-            });
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'lisa-job-name';
+            nameEl.textContent = `${job.jobName} (ID:${job.jobId})`;
+            nameEl.title = `${job.jobName} — ID:${job.jobId}, x:${job.x}, y:${job.y}, ${formatDuration(job.duration)}`;
+
+            const removeEl = document.createElement('span');
+            removeEl.className = 'remove';
+            removeEl.textContent = '✕';
+            removeEl.title = 'Eltávolítás';
+            removeEl.addEventListener('click', () => removeExtraJobById(job.id));
+
+            li.appendChild(nameEl);
+            li.appendChild(removeEl);
             uiExtraList.appendChild(li);
         });
         if (uiExtraCount) uiExtraCount.textContent = extraJobs.length;
     }
+
     function updateHistoryList() {
         if (!uiHistoryList) return;
-        uiHistoryList.innerHTML = '';
-        jobHistory.forEach((job, idx) => {
+
+        // Kijelölés és darabszám megőrzése: egy háttérben rögzített munka
+        // eddig újrarajzolással eltüntette a felhasználó félkész kiválasztását.
+        const checked = new Set(
+            Array.from(uiHistoryList.querySelectorAll('.hist-check')).filter(c => c.checked).map(c => c.dataset.id)
+        );
+        const counts = {};
+        uiHistoryList.querySelectorAll('.lisa-count-input').forEach(i => { counts[i.dataset.id] = i.value; });
+
+        uiHistoryList.textContent = '';
+        jobHistory.forEach(job => {
             const li = document.createElement('li');
-            li.innerHTML = `<span class="lisa-job-name"><input type="checkbox" class="hist-check" data-index="${idx}">${job.jobName} <small>(ID:${job.jobId}, ${job.duration}s)</small></span><span><input type="number" class="lisa-count-input" value="1" min="1" max="99" data-index="${idx}"></span>`;
+
+            const label = document.createElement('label');
+            label.className = 'lisa-job-name';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.className = 'hist-check';
+            cb.dataset.id = job.id;
+            cb.checked = checked.has(job.id);
+            const text = document.createElement('span');
+            text.textContent = ` ${job.jobName} (ID:${job.jobId}, ${formatDuration(job.duration)})`;
+            label.appendChild(cb);
+            label.appendChild(text);
+
+            const countWrap = document.createElement('span');
+            const num = document.createElement('input');
+            num.type = 'number';
+            num.className = 'lisa-count-input';
+            num.min = String(CONFIG.MIN_AMOUNT);
+            num.max = String(CONFIG.MAX_AMOUNT);
+            num.value = counts[job.id] || '1';
+            num.dataset.id = job.id;
+            countWrap.appendChild(num);
+
+            li.appendChild(label);
+            li.appendChild(countWrap);
             uiHistoryList.appendChild(li);
         });
         if (uiHistoryCount) uiHistoryCount.textContent = jobHistory.length;
@@ -1224,52 +1428,70 @@
     }
 
     function addSelectedToExtra() {
-        if (addingFromHistory) return;
-        if (!cachedHash) {
-            alert('Lisa: Nincs érvényes hash!');
+        if (addingFromHistory || !uiHistoryList) return;
+
+        const checks = Array.from(uiHistoryList.querySelectorAll('.hist-check')).filter(c => c.checked);
+        if (checks.length === 0) {
+            updateUIStatus('Válassz ki legalább egy munkát!');
             return;
         }
         addingFromHistory = true;
         addButton.disabled = true;
         setTimeout(() => { addingFromHistory = false; addButton.disabled = false; }, CONFIG.BUTTON_COOLDOWN);
 
-        const checks = document.querySelectorAll('.hist-check:checked');
-        if (checks.length === 0) {
-            alert('Válassz ki legalább egy munkát!');
-            return;
-        }
-        const jobsToAdd = [];
+        // Sorbaállításhoz nem kell hash, csak küldéshez – a processQueue úgyis
+        // megvárja, amíg lesz. Egy hiányzó hash miatt eddig nem lehetett tervezni.
+        let total = 0;
         checks.forEach(cb => {
-            const idx = parseInt(cb.getAttribute('data-index'), 10);
-            const count = parseInt(document.querySelector(`.lisa-count-input[data-index="${idx}"]`)?.value) || 1;
-            if (idx >= 0 && idx < jobHistory.length) {
-                const j = jobHistory[idx];
-                for (let i = 0; i < count; i++) jobsToAdd.push({ jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType, jobName: j.jobName });
-            }
+            const job = jobHistory.find(j => j.id === cb.dataset.id);
+            if (!job) return;
+            const input = uiHistoryList.querySelector(`.lisa-count-input[data-id="${cb.dataset.id}"]`);
+            const raw = parseInt(input && input.value, 10) || CONFIG.MIN_AMOUNT;
+            const count = Math.min(Math.max(raw, CONFIG.MIN_AMOUNT), CONFIG.MAX_AMOUNT);
+            total += addExtraJobs(job, count, job.jobName);
         });
-        jobsToAdd.forEach(job => addExtraJob(job, job.jobName, false));
+
         updateUI();
-        updateUIStatus(`${checks.length} típusú munka hozzáadva.`);
-        ensureProcessing();
+        if (total > 0) {
+            updateUIStatus(`${total} munka az extra sorba (${extraJobs.length} várakozik).`);
+            ensureProcessing();
+        } else {
+            updateUIStatus('Nem került új munka a sorba (a sor megtelt?).');
+        }
     }
 
     // ============================================================
     // BOOT
     // ============================================================
+    function boot() {
+        // A vezetőt még a feldolgozás előtt eldöntjük, hogy egy második fül
+        // ne kezdjen el rögtön küldeni.
+        initTabSync();
+        loadExtraQueueFromStorage();
+        loadHistoryFromStorage();
+        // A sor állapota túléli az újratöltést: a date_done abszolút szerveridő,
+        // így F5 után is tudjuk, hány slot foglalt és meddig.
+        loadGameQueueFromStorage();
+        injectUI();
+        updateUI();
+        updateUIStatus(isLeaderTab
+            ? 'Kész. Indíts egy munkát a hash megszerzéséhez.'
+            : 'Kész (passzív fül – egy másik fül dolgozza fel a sort).');
+        initAmountPatch();
+        if (extraJobs.length > 0) ensureProcessing();
+    }
+
     function onDOMReady() {
+        let attempts = 0;
         const checkDOM = setInterval(() => {
+            attempts++;
             if (document.querySelector('#ui_workcontainer') || document.querySelector('#ui_bottomright')) {
                 clearInterval(checkDOM);
-                loadExtraQueueFromStorage();
-                loadHistoryFromStorage();
-                // A sor állapota túléli az újratöltést: a date_done abszolút szerveridő,
-                // így F5 után is tudjuk, hány slot foglalt és meddig.
-                loadGameQueueFromStorage();
-                injectUI();
-                updateUI();
-                updateUIStatus('Kész. Indíts egy munkát a hash megszerzéséhez.');
-                initAmountPatch();
-                if (extraJobs.length > 0) ensureProcessing();
+                boot();
+            } else if (attempts >= CONFIG.BOOT_MAX_ATTEMPTS) {
+                // Enélkül a poll a lap élettartamáig futott, ha sosem jött elő a felület.
+                clearInterval(checkDOM);
+                console.warn('[Lisa] A játék felülete nem jelent meg, a script nem indul el.');
             }
         }, 1000);
     }
@@ -1277,5 +1499,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v10.20 (menü gomb, világosabb barna) betöltve.');
+    console.log('[Lisa] Modular v10.24 betöltve.');
 })();
