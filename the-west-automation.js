@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.2)
+// @name         The-West Modular Job Queue (Lisa v12.3)
 // @namespace   http://tampermonkey.net/
-// @version     12.2
+// @version     12.3
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -58,6 +58,7 @@
         MOTIVATION_WARN: 75,         // ekkora (vagy kisebb) motivációnál figyelmeztetünk
         JOB_INFO_TTL: 300000,        // ennyi ideig hisszük el a motivációt/energiaköltséget
         AUTO_SLEEP: true,            // energiahiánynál felajánljuk az alvást
+        QUEUE_MANUAL_SLEEP: true,    // a hotelben indított alvás is a saját sorba megy
         SLEEP_DECLINE_MS: 1800000,   // "Nem" után ennyi ideig nem kérdezünk újra
         SLEEP_REGEN_ESTIMATE: 0.125, // csak a KIJELZETT alvásidő becsléséhez (mért érték)
         JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
@@ -591,6 +592,66 @@
         return Math.ceil((target - c.energy) / perHour * 3600);
     }
 
+    // Egy alvásbejegyzés a listába. A kézzel indított alvás a lista VÉGÉRE megy,
+    // mint bármelyik munka; az energiahiány miatt felajánlott a lista ELEJÉRE,
+    // mert épp az a dolga, hogy a soron következő munkát tegye indíthatóvá.
+    function makeSleepEntry(townId, room, roomName, x, y) {
+        return {
+            id: generateId(), retries: 0, deferrals: 0, rejections: 0,
+            taskType: 'sleep',
+            townId, room,
+            jobName: `Alvás – ${roomName || room}`,
+            jobId: 0,
+            x: x || 0, y: y || 0,
+            duration: estimateSleepSeconds(room),
+        };
+    }
+
+    // A hotel ablak indítógombja a HotelWindow.start-ot hívja (a játék kódjából
+    // kiolvasva), ezért ezt az egy függvényt vesszük át -- ez nyelvfüggetlen és
+    // pontosabb, mint a gomb DOM-ból való kitalálása. Így a kézzel indított alvás
+    // ugyanúgy a saját sorunkba kerül, mint bármelyik munka, és nem előzi meg a
+    // már várakozó munkákat.
+    function patchHotelStart() {
+        const hw = window.HotelWindow;
+        if (!hw || hw.__lisaPatched || typeof hw.start !== 'function') return;
+        const orig = hw.start;
+        hw.start = function(room) {
+            if (!room || !CONFIG.QUEUE_MANUAL_SLEEP) return orig.apply(this, arguments);
+            try {
+                const townId = hw.townid;
+                const rooms = hotelRooms && hotelRooms.townId === townId ? hotelRooms.rooms : null;
+                const info = rooms && rooms[room];
+                const pos = (window.Character && Character.homeTown && Character.homeTown.town_id === townId)
+                    ? Character.homeTown : currentPosition() || { x: 0, y: 0 };
+                const entry = makeSleepEntry(townId, room, info && info.name, pos.x, pos.y);
+                extraJobs.push(entry);
+                saveExtraQueueToStorage();
+                updateUI();
+                updateUIStatus(`Alvás sorba állítva (${extraJobs.length} várakozik).`);
+                ensureProcessing();
+
+                // A szoba adatai kellenek a megszakításhoz is (meddig tölt fel),
+                // nem csak a névhez. Ha még nincsenek meg, most kérjük le.
+                if (!info) {
+                    fetchHotelRooms(townId, (rooms) => {
+                        const r = rooms && rooms[room];
+                        if (!r) return;
+                        entry.jobName = `Alvás – ${r.name || room}`;
+                        entry.duration = estimateSleepSeconds(room);
+                        saveExtraQueueToStorage();
+                        updateUI();
+                    });
+                }
+            } catch(e) {
+                console.error('[Lisa] Az alvás sorba állítása nem sikerült, a játék indítja:', e);
+                return orig.apply(this, arguments);
+            }
+        };
+        hw.__lisaPatched = true;
+        console.log('[Lisa] A hotel alvásgombja a saját sorba kerül.');
+    }
+
     function insertSleepJob() {
         const town = window.Character.homeTown;
         fetchHotelRooms(town.town_id, (rooms) => {
@@ -599,16 +660,7 @@
                 updateUIStatus('Nincs ingyenes szoba a hotelben – alvás nem lett beszúrva.');
                 return;
             }
-            extraJobs.unshift({
-                id: generateId(), retries: 0, deferrals: 0, rejections: 0,
-                taskType: 'sleep',
-                townId: town.town_id,
-                room: room.key,
-                jobName: `Alvás – ${room.name || room.key}`,
-                jobId: 0,
-                x: town.x, y: town.y,
-                duration: estimateSleepSeconds(room.key),
-            });
+            extraJobs.unshift(makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y));
             saveExtraQueueToStorage();
             updateUI();
             updateUIStatus(`Alvás beszúrva a sor elejére (${room.name || room.key}).`);
@@ -633,11 +685,22 @@
         renderSleepOffer();
     }
 
+    // Van-e egyáltalán miért felébredni?
+    function hasWorkWaiting() {
+        if (extraJobs.some(j => j.taskType !== 'sleep')) return true;
+        return gameReady() && window.TaskQueue.queue.some(t => t && t.type !== 'sleep');
+    }
+
     // Futó alvás megszakítása, ha az energia elérte, amit ez a szoba adhat.
     // A játék cancelje a sorpozíciót várja, és a válaszban visszaküldi a valódi
     // energiát (sleep.onCancel), tehát utána azonnal pontos az állapotunk.
+    //
+    // Csak akkor ébresztünk, ha VAN mit dolgozni: alvás közben a karaktert nem
+    // lehet párbajra hívni, tehát munka híján az alvás a jobb állapot, még tele
+    // energiával is. Enélkül a script minden alvást azonnal megszakítana.
     function cancelSleepIfFull() {
         if (!gameReady() || !isLeaderTab) return;
+        if (!hasWorkWaiting()) return;
         const pos = window.TaskQueue.queue.findIndex(t => t && t.type === 'sleep');
         if (pos === -1) return;
         const task = window.TaskQueue.queue[pos];
@@ -1808,6 +1871,7 @@
     // mégis elutasítaná az indítást, nem kezdünk el kétmásodpercenként próbálkozni.
     function watchGameQueue() {
         ensureMenuButton();
+        patchHotelStart();      // a hotel ablak később is betöltődhet
         updateQueueBadge();
         updateExtraEtas();
         updateKeepAwake();
@@ -2087,9 +2151,36 @@
             : 'Kész.');
     }
 
+    // A minimalizálás a wman-ben az ablak main div-jének ELREJTÉSE (fadeOut) plusz
+    // egy bejegyzés a wman.minimizedIds-ben. Ilyenkor a bringToTop() önmagában
+    // semmit nem csinál -- a panel "nem nyílik ki" a menügombra sem. A játék
+    // erre a wman.reopen-t használja: az visszafadeolja és törli a minimalizált
+    // állapotot is.
     function showLisaPanel() {
         const win = ensurePanel();
-        try { if (win) win.bringToTop(); } catch(e) {}
+        if (!win) return;
+        try {
+            if (typeof wman.isMinimized === 'function' && wman.isMinimized(CONFIG.WINDOW_ID)
+                && typeof wman.reopen === 'function') {
+                wman.reopen(CONFIG.WINDOW_ID);
+            } else {
+                win.bringToTop();
+            }
+        } catch(e) {
+            console.warn('[Lisa] A panel előhozása nem sikerült:', e);
+        }
+
+        // Végső háló: ha bármi mástól maradt rejtve vagy csúszott a képernyőn
+        // kívülre (mentett megjelenés, átméretezett ablak), tegyük használhatóvá.
+        const el = document.querySelector('.' + CONFIG.WINDOW_ID);
+        if (!el) return;
+        if (getComputedStyle(el).display === 'none') el.style.display = 'block';
+        const r = el.getBoundingClientRect();
+        const offScreen = r.right < 40 || r.bottom < 40
+            || r.left > window.innerWidth - 40 || r.top > window.innerHeight - 40;
+        // A felhasználó által odahúzott helyet tiszteletben tartjuk; csak akkor
+        // rakjuk vissza, ha egyébként elérhetetlen lenne.
+        if (offScreen) applyPanelGeometry(win);
     }
 
     // Visszanyitó gomb a menüsorban, a fogaskerék alatt -- a wman ✕-e teljesen
@@ -2300,5 +2391,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.2 betöltve.');
+    console.log('[Lisa] Modular v12.3 betöltve.');
 })();

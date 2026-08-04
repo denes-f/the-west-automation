@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 153 assertions, no dependencies.
+  name and runs them against stubs. 157 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.2.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.3.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `153 passed, 0 failed`.
+2. `node test-queue.js` should print `157 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -154,8 +154,20 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
 - `sleep.onCancel(extra)` applies `extra.energy` — cancelling a sleep syncs the real energy back,
   so "cancel when full and move on" is supported by the game itself.
 - `Character.homeTown` → `{town_id, x, y, town_name, alliance_id}`; `town_id` is **0** when the
-  character has joined no town. The test account (`monkey`) has **no town**, so the sleep path
-  cannot be exercised there — it needs an account that is a member of a town.
+  character has joined no town.
+- `Ajax.remoteCallMode("building_hotel", "get_data", {town_id})` → `rooms[key] = {level, costs,
+  energy, health, name, available, free}`. **`energy` is the level sleeping there fills up to**
+  (measured: cubby 64 → luxurious_apartment 100), and everything is `free: true` in the character's
+  own town. Never auto-pick a room that isn't free — that spends the user's money.
+- A running sleep is a queue entry with `type: 'sleep'`, `getDuration()` **28800** (8 h, always),
+  and `data = {town_name, room, townId, date_start, date_done, x, y}`. Note the coordinates live in
+  `data`, **not** in `post` (`post` is only `{taskType: 'sleep'}`).
+- **Sleeping while asleep the character cannot be challenged to a duel.** So a full-energy sleep is
+  not waste — never cancel one unless there is actual work waiting (`hasWorkWaiting`).
+- `HotelWindow.start(room)` is the global the hotel window's start button calls, using
+  `HotelWindow.townid` (null until the window is opened). Wrapping that one function is how a
+  manual sleep is routed into our own queue — locale-independent, and far safer than guessing the
+  button out of the DOM.
 
 ### Travel time
 
@@ -246,6 +258,18 @@ smears the dark edge into a wide band) but it isn't worth it: the panel scrolls 
 The frame has dark edge decorations on **both sides** that intrude into the content pane (the right
 strip reaches ~21 px in). Inset the content (`margin: 0 20px 0 2px`) so the remove ✕ doesn't sit on
 them.
+
+**Minimizing is not a state flag, it is a hidden element.** `wman.minimize(uid)` does
+`$(win.getMainDiv()).fadeOut(400)` and records the window in `wman.minimizedIds` — so a minimized
+window is `display:none`, and **`bringToTop()` does nothing for it**. This shipped as a real bug in
+v12.2: once the panel had been minimized, neither reopening nor the EQ menu button brought it back,
+because both only called `bringToTop()`. The restore path the game itself uses is
+**`wman.reopen(uid)`** — it fades the window back in *and* deletes the `minimizedIds` entry.
+`wman.isMinimized(uid)` reads that map. Verified live: minimize → `display:none`, `bringToTop()` →
+still `none`, `reopen()` → `block` with the content pane intact.
+
+Note also that `wman.open(uid, …)` on an **existing** window destroys and recreates it
+(`saveAppearance()` + `destroy()`), so never call it just to bring a window forward.
 
 `wman.close(uid)` **destroys** the window — `getById` then returns nothing and reopening yields an
 **empty** content pane. So the panel must be rebuilt on reopen, and there must be a way back:

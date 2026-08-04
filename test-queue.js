@@ -300,6 +300,7 @@ console.log('\n=== Slot-figyelő ===');
 CONFIG.SLOT_FREED_DELAY = 1500;
 const updateKeepAwake = () => {};     // ébrentartás: böngészőfüggő, itt nem mérhető
 const cancelSleepIfFull = () => {};   // az alvás megszakítása élő játékállapotot igényel
+const patchHotelStart = () => {};     // a hotel ablak csak a játékban létezik
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -619,6 +620,23 @@ const stored = sanitizeJobs([
 eq('az alvás túléli a mentést', stored.length, 2);
 eq('a város és a szoba megmarad', [stored[0].townId, stored[0].room], [4206, 'luxurious_apartment']);
 eq('a hiányos alvásbejegyzések kiesnek', stored[1].jobId, 129);
+
+// Alvás közben a karaktert nem lehet párbajra hívni, ezért munka híján NEM
+// ébresztünk -- még tele energiával sem. Csak akkor, ha van mit dolgozni.
+eval(extract('hasWorkWaiting'));
+const setState = (extra, queue) => {
+    extraJobs = extra;
+    window.TaskQueue = { queue, limit: { normal: 4, premium: 9 } };
+};
+setState([], [{ type: 'sleep' }]);
+eq('üres sor + alvás -> hagyjuk aludni', hasWorkWaiting(), false);
+setState([{ taskType: 'sleep' }], [{ type: 'sleep' }]);
+eq('csak egy másik alvás vár -> nem ébresztünk', hasWorkWaiting(), false);
+setState(mkJobs(1), [{ type: 'sleep' }]);
+eq('várakozó munka -> ébresztünk', hasWorkWaiting(), true);
+setState([], [{ type: 'sleep' }, { type: 'job' }]);
+eq('a játék sorában álló munka is számít', hasWorkWaiting(), true);
+extraJobs = [];
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
