@@ -6,16 +6,19 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 93 assertions, no dependencies.
+  name and runs them against stubs. 108 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.0.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.1.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
 
+0. The test account for `hu27` is in `local-notes.md` (**gitignored** — the repo has a GitHub
+   remote, so no credentials in tracked files). The browser session is usually still signed in,
+   so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
 2. `node test-queue.js` should print `93 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
@@ -79,6 +82,20 @@ game client unaware — the job runs but never appears in the bottom-right queue
 not the whole queue. Errors are `{"error":true,"msg":"…"}`. A bare `msg` with no `error` is **not**
 a success — assuming it was is what ate three jobs.
 
+**`tasks[]` is per-task and mixed**: the i-th element answers the i-th task of the request, and is
+either `{"task":{…}}` or `{"error":true,"msg":"…"}`. Measured rejection (job requiring level 53
+started at level 9):
+
+```json
+{"tasks":[{"error":true,"msg":"Legalább a 53 szintet kell elérned…"}],"energy":97.2,…}
+```
+
+**This is a live data-loss hazard.** `TaskQueue.add` pushes **synchronously**, so `queue.length`
+grows and the script counts the jobs as accepted — but a few seconds later the server rejects them,
+the game removes them from the queue, and the jobs are already gone from `extraJobs`. Verified:
+8 seeded jobs, all silently lost, with the panel reporting "all started". The synchronous
+length check alone is **not** proof of acceptance; only the response is.
+
 ### Durations
 
 `JobList.getDurations()` → `{short:{duration:15,requirement:1}, middle:{duration:600,requirement:10},
@@ -92,13 +109,60 @@ through `getDurations()`. The amount selector (`.job-amount-num`) is **outside**
 
 Bar duration text is compact — `15mp`, `10p`, `1ó` — but prefer `data-base`; text parsing is fallback only.
 
+### Motivation and energy cost per job (read-only, no energy spent)
+
+One call answers both, for a given job at a given place:
+
+```js
+Ajax.remoteCallMode("job", "job", {jobId, x, y}, json => …)
+```
+
+- `json.motivation` — **0…1**, so ×100 for percent. The job window itself does
+  `parseInt(json.motivation * 100)`. Measured 1 → 0.9 after ~10 completed 15 s jobs of that job.
+- `json.durations[]` — one entry **per unlocked duration**, each `{duration, cost, money, xp, luck,
+  items}`. **`cost` is the energy cost** (1 for the 15 s bar at level 9; the 5 / 12 of the 10 min and
+  1 h bars only appear once those are unlocked). This is the authoritative source — don't hardcode.
+- Motivation drops by the job's energy cost when the job **completes**; energy is deducted when the
+  job **enters the game's queue** and refunded if it is cancelled before completing.
+- `EventHandler.signal('jobmotivation_change')` fires when motivation changes.
+
+### Energy regeneration — exact formula from the game
+
+`Game.tick4Character` computes, verbatim:
+
+```js
+energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - energyDate) / 3600))
+```
+
+- `Character.energy`, `Character.maxEnergy` (100; 150 with the bonus), `Character.energyRegen`
+  (measured **0.03**), `Character.energyDate` (server time in **seconds**, the anchor of the above),
+  `Game.getServerTime()` → seconds.
+- So the rate is `maxEnergy * energyRegen` per hour = **3/h at 100 max**, and it scales by itself
+  with a 150 max — never hardcode 2 or 3.
+- `Character.levelEnergyFillup` is `true`: **levelling up refills energy completely**, which will
+  make any forecast jump. Confirmed live (96 → 97 mid-test).
+
+### Sleeping
+
+- `TaskQueue.add(new TaskSleep(townId, room))` — same path as jobs; this is exactly what the
+  hotel window's start button does (`HotelWindow.start`).
+- `room` ∈ `['cubby','bedroom','hotel_room','apartment','luxurious_apartment']` (ordered worst→best,
+  the index picks the icon).
+- `sleep.onCancel(extra)` applies `extra.energy` — cancelling a sleep syncs the real energy back,
+  so "cancel when full and move on" is supported by the game itself.
+- `Character.homeTown` → `{town_id, x, y, town_name, alliance_id}`; `town_id` is **0** when the
+  character has joined no town. The test account (`monkey`) has **no town**, so the sleep path
+  cannot be exercised there — it needs an account that is a member of a town.
+
 ### Travel time
 
 - `Character.calcWayTo(x, y)` → seconds, **from the character's current position only**.
-- Travel is **exactly linear in Euclidean distance** (measured 0.017647 s/unit across seven offsets,
-  identical in all directions; Manhattan ruled out). For point-to-point, derive the rate at runtime:
-  `calcWayTo(here.x + 1000, here.y) / 1000`. That picks up horse and speed buffs automatically —
-  don't hardcode the constant.
+- The implementation was read out of the bundle and is **exactly**:
+  `GameMap.calcWayTime(from, to) = hypot(dx, dy) * Game.travelSpeed * Character.speed`.
+  Both functions are **pure** — no DOM writes, no state changes, safe to call in a loop.
+- So the seconds-per-unit rate is simply `Game.travelSpeed * Character.speed`; read it directly
+  rather than probing (`calcWayTo(here.x + 1000, here.y) / 1000` is kept only as a fallback).
+  Either way the horse and speed buffs are included — don't hardcode the constant.
 - `Character.getPosition()` → `{x, y}`.
 - The game folds travel **into** a queued row's displayed time (5 s travel + 15 s job → `00:00:20`).
   A separate travel row with the footprints icon exists only on the *currently running* task.
@@ -112,6 +176,17 @@ Bar duration text is compact — `15mp`, `10p`, `1ó` — but prefer `data-base`
 - `#queuedTasks` holds `<span class="task task-queuePos-N">` with `.taskTime > p`, `.taskBtns >
   (.taskHalveway, .taskAbort)`, `.icon` (background-image). Items are `inline-block` 112×67,
   wrapping 2 per row.
+- The game also injects a **premium advert tile** of its own into that container
+  (`getPremiumTask()`, appended when `showPremiumTask(queuePos)`) — a `span.task.hasMousePopup`
+  with no text. Expect it when counting children; it is not one of ours.
+- The **running** task (`#currentTask`) always carries a travel row: `.icon_taskway` +
+  `.value` (title `Menetidő`), showing `00:00:00` once the character has arrived. It shows a
+  **time**, never a distance — the game has no miles unit anywhere (see below).
+- There is **no "mi" (miles) string in the game bundle at all** — searched the whole
+  `cache/tw2game.hu_HU.js` (2.4 MB) for the token in every quoting/concatenation form, plus all
+  CSS `content:` rules. Every distance the game displays is converted to a **duration** first
+  (`getDistance2Town` = `calcWayTime(...).formatDuration()`), and `Number.prototype.formatDuration`
+  renders `hh:mm:ss`. So a `1.000mi` on screen comes from neither the game nor this script.
 - **`.middle` has a direct click handler** reacting to `taskAbort` / `taskHalveway` /
   `taskInstantFinish` / `centermap` / `icon` and parsing the queueId out of the class name.
   Injected rows reusing those classes **must** `stopImmediatePropagation()`, or clicking them

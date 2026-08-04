@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.0)
+// @name         The-West Modular Job Queue (Lisa v12.1)
 // @namespace   http://tampermonkey.net/
-// @version     12.0
+// @version     12.1
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -214,6 +214,16 @@
     // szorzó nélkül.
     function secondsPerDistanceUnit() {
         try {
+            // A játék képlete kiolvasva (GameMap.calcWayTime):
+            //   idő = euklideszi táv * Game.travelSpeed * Character.speed
+            // Vagyis a másodperc/egység arány KÖZVETLENÜL is megvan, próbahívás nélkül --
+            // és a ló meg a sebesség-buffok a Character.speed-ben már benne vannak.
+            const g = window.Game, ch = window.Character;
+            if (g && ch && typeof g.travelSpeed === 'number' && typeof ch.speed === 'number') {
+                const rate = g.travelSpeed * ch.speed;
+                if (isFinite(rate) && rate > 0) return rate;
+            }
+            // Tartalék: ha a játék belső mezői egyszer átneveződnének, mérünk.
             const c = window.Character;
             if (!c || typeof c.calcWayTo !== 'function') return null;
             const p = typeof c.getPosition === 'function' ? c.getPosition() : c.position;
@@ -1586,5 +1596,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.0 betöltve.');
+    console.log('[Lisa] Modular v12.1 betöltve.');
 })();
