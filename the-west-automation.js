@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v10.22 - FIFO sorrend)
+// @name         The-West Modular Job Queue (Lisa v10.23 - Élő sorállapot)
 // @namespace   http://tampermonkey.net/
-// @version     10.22
+// @version     10.23
 // @description XHR‑alapú munkaindítás, maradék automatikus sorba, mennyiség max 99, fallback, auto-close dialógus, menü gomb.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -28,6 +28,10 @@
         IDLE_RESCHEDULE: 5000,       // vészfék: ha egy ág elfelejtene időzítőt állítani
         STORAGE_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         STORAGE_HISTORY: 'lisa_modular_history_v97',
+        STORAGE_GAME_QUEUE: 'lisa_game_queue_v1',
+        TASK_WINDOW_MATCH: 'window=task',
+        MIN_SEND_GAP: 2000,          // két egymást követő küldés között
+        MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
         PANEL_WIDTH: 320,
         BUTTON_COOLDOWN: 1500,
         MAX_AMOUNT: 99,
@@ -50,7 +54,12 @@
     let pendingQueueLengthBefore = 0;
     let processing = false;
     let nextJobTimer = null;
-    let currentQueueLength = 0;
+
+    // A játék saját munkasorának modellje: [{ dateDone, jobId }], szerver-epoch
+    // másodpercben. Minden task-ablak válaszból újraszinkronizáljuk, és az
+    // óra alapján magától fogy -- így nem áll el a valóságtól, és túléli az F5-öt.
+    let gameQueue = [];
+    let serverClockOffsetMs = 0;
 
     let pendingFallback = null;
     let jobRequestSent = false;
@@ -141,7 +150,10 @@
             if (headers) {
                 Object.keys(headers).forEach(key => xhr.setRequestHeader(key, headers[key]));
             }
-            xhr.onload = () => resolve({ status: xhr.status, responseText: xhr.responseText });
+            xhr.onload = () => {
+                try { noteServerDate(xhr.getResponseHeader('Date')); } catch(e) {}
+                resolve({ status: xhr.status, responseText: xhr.responseText });
+            };
             xhr.onerror = () => reject(new Error('Hálózati hiba'));
             xhr.ontimeout = () => reject(new Error('Időtúllépés'));
             xhr.onabort = () => reject(new Error('Megszakított kérés'));
@@ -162,7 +174,103 @@
     }
 
     // ============================================================
-    //  4. MENNYISÉGVÁLASZTÓ FELOLDÁSA
+    //  4. A JÁTÉK MUNKASORÁNAK MODELLJE
+    // ============================================================
+    // A date_done szerveridő, a Date.now() kliensidő. Az eltérést a válaszok
+    // Date fejlécéből tanuljuk, különben egy elállított óra minden ütemezést eltol.
+    function serverNow() { return Date.now() + serverClockOffsetMs; }
+
+    function noteServerDate(dateHeader) {
+        if (!dateHeader) return;
+        const t = Date.parse(dateHeader);
+        if (isNaN(t)) return;
+        const offset = t - Date.now();
+        if (Math.abs(offset - serverClockOffsetMs) > 5000) {
+            console.log(`[Lisa] Szerver-kliens óraeltérés: ${Math.round(offset / 1000)} mp`);
+        }
+        serverClockOffsetMs = offset;
+    }
+
+    // A lejárt munkák maguktól kikerülnek a modellből: ez váltja ki azt, hogy
+    // korábban a számláló csak nőtt, sosem csökkent.
+    function pruneGameQueue() {
+        const nowSec = serverNow() / 1000;
+        const before = gameQueue.length;
+        gameQueue = gameQueue.filter(t => t.dateDone > nowSec);
+        if (gameQueue.length !== before) {
+            saveGameQueueToStorage();
+            console.log(`[Lisa] ${before - gameQueue.length} munka befejeződött (sor: ${gameQueue.length}/${CONFIG.QUEUE_SIZE})`);
+        }
+        return gameQueue;
+    }
+
+    function getQueueLength() { return pruneGameQueue().length; }
+    function isQueueFull() { return getQueueLength() >= CONFIG.QUEUE_SIZE; }
+
+    // A következő szabad slot ideje = a legkorábban befejeződő munka.
+    // Korábban a findKeyInObject az első megtalált date_done-t adta vissza,
+    // ami kulcssorrendtől függött, nem feltétlenül a legkorábbi volt.
+    function getNextFreeAt() {
+        const times = pruneGameQueue().map(t => t.dateDone).filter(t => t > 0);
+        return times.length ? Math.min(...times) : null;
+    }
+
+    function waitUntilFreeSlotMs() {
+        const freeAt = getNextFreeAt();
+        if (!freeAt) return rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX);
+        const wait = Math.max(0, freeAt * 1000 - serverNow()) + CONFIG.SAFETY_MARGIN_MS;
+        return Math.min(wait, CONFIG.MAX_WAIT_MS);
+    }
+
+    // A szerver által küldött tasklista mindig felülírja a helyi becslést.
+    function syncGameQueueFromResponse(resp) {
+        if (!resp || !resp.tasks || typeof resp.tasks !== 'object') return false;
+        const list = Array.isArray(resp.tasks) ? resp.tasks : Object.values(resp.tasks);
+        const nowSec = serverNow() / 1000;
+
+        gameQueue = list.filter(t => t && typeof t === 'object').map(t => {
+            const raw = parseFloat(t.date_done);
+            return {
+                dateDone: (!isNaN(raw) && raw > 0) ? raw : nowSec + CONFIG.DEFAULT_DURATION,
+                jobId: t.jobId || t.job_id || null,
+            };
+        });
+        if (gameQueue.length > CONFIG.QUEUE_SIZE) CONFIG.QUEUE_SIZE = gameQueue.length;
+        saveGameQueueToStorage();
+        console.log(`[Lisa] Sor szinkronizálva a szerverről: ${gameQueue.length}/${CONFIG.QUEUE_SIZE}`);
+        return true;
+    }
+
+    // Ha a válasz nem tartalmazott tasklistát, becslünk: a munka a sor végén fut le.
+    function noteQueuedLocally(job, dateDone) {
+        const nowSec = serverNow() / 1000;
+        const lastDone = gameQueue.reduce((max, t) => Math.max(max, t.dateDone), nowSec);
+        gameQueue.push({
+            dateDone: (dateDone && dateDone > 0) ? dateDone : lastDone + (job.duration || CONFIG.DEFAULT_DURATION),
+            jobId: job.jobId,
+        });
+        saveGameQueueToStorage();
+    }
+
+    function saveGameQueueToStorage() {
+        try { localStorage.setItem(CONFIG.STORAGE_GAME_QUEUE, JSON.stringify(gameQueue)); } catch(e) {}
+    }
+
+    function loadGameQueueFromStorage() {
+        try {
+            const raw = localStorage.getItem(CONFIG.STORAGE_GAME_QUEUE);
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (Array.isArray(parsed)) {
+                gameQueue = parsed.filter(t => t && typeof t.dateDone === 'number');
+            }
+        } catch(e) { gameQueue = []; }
+        // A dateDone abszolút szerveridő, ezért újratöltés után is értelmezhető:
+        // az F5 óta befejeződött munkák itt esnek ki.
+        pruneGameQueue();
+    }
+
+    // ============================================================
+    //  5. MENNYISÉGVÁLASZTÓ FELOLDÁSA
     // ============================================================
     function initAmountPatch() {
         document.addEventListener('click', function(e) {
@@ -336,11 +444,11 @@
         scheduleDialogClose();
         pendingJobName = jobName;
         pendingJobAmount = amount;
-        pendingQueueLengthBefore = currentQueueLength;
+        pendingQueueLengthBefore = getQueueLength();
         console.log(`[Lisa] Munka: ${pendingJobName}, mennyiség: ${pendingJobAmount}, sor előtte: ${pendingQueueLengthBefore}`);
 
         clearFallback();
-        if (currentQueueLength >= CONFIG.QUEUE_SIZE) {
+        if (isQueueFull()) {
             const jobData = parseJobWindow(jobWindow);
             if (jobData) {
                 pendingFallback = {
@@ -379,6 +487,8 @@
             xhr.addEventListener('load', function() {
                 if (reqMethod !== 'POST') return;
 
+                try { noteServerDate(xhr.getResponseHeader('Date')); } catch(e) {}
+
                 const h = extractHashFromURL(reqUrl);
                 if (h) {
                     if (!cachedHash || cachedHash !== h) {
@@ -389,21 +499,20 @@
                     }
                 }
 
+                if (!reqUrl.includes(CONFIG.TASK_WINDOW_MATCH)) return;
+
+                // Bármelyik task-ablak válasza hozhat friss tasklistát: indítás,
+                // megszakítás, ablaknyitás. Mind hiteles forrás, mind szinkronizál.
+                const verdict = classifyAddResponse(xhr.status, xhr.responseText);
+                const queueLengthBefore = pendingQueueLengthBefore;
+                const synced = syncGameQueueFromResponse(verdict.resp);
+                const queueLengthAfter = synced ? gameQueue.length : null;
+
                 if (reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) {
                     clearFallback();
 
-                    const verdict = classifyAddResponse(xhr.status, xhr.responseText);
-                    const resp = verdict.resp;
                     const task = extractTaskFromBody(reqBody);
                     const jobName = pendingJobName || (task ? `Job #${task.jobId}` : 'Ismeretlen');
-
-                    let queueLengthAfter = null;
-                    if (resp && resp.tasks && typeof resp.tasks === 'object') {
-                        queueLengthAfter = Array.isArray(resp.tasks) ? resp.tasks.length : Object.keys(resp.tasks).length;
-                        currentQueueLength = queueLengthAfter;
-                        if (queueLengthAfter > CONFIG.QUEUE_SIZE) CONFIG.QUEUE_SIZE = queueLengthAfter;
-                        console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
-                    }
 
                     if (task && (verdict.outcome === 'success' || verdict.outcome === 'queue_full')) {
                         addJobToHistory({ ...task, jobName });
@@ -419,12 +528,12 @@
                         if (verdict.outcome !== 'success') {
                             added = 0; // a szerver elutasította: a teljes köteg a miénk
                         } else if (queueLengthAfter !== null) {
-                            added = Math.max(0, queueLengthAfter - pendingQueueLengthBefore);
+                            added = Math.max(0, queueLengthAfter - queueLengthBefore);
                         } else {
-                            added = Math.min(pendingJobAmount, Math.max(0, CONFIG.QUEUE_SIZE - pendingQueueLengthBefore));
+                            added = Math.min(pendingJobAmount, Math.max(0, CONFIG.QUEUE_SIZE - queueLengthBefore));
                         }
                         const remaining = Math.max(0, pendingJobAmount - added);
-                        console.log(`[Lisa] Manuális: kért ${pendingJobAmount}, sor ${pendingQueueLengthBefore} -> ${queueLengthAfter}, hozzáadva ${added}, maradék ${remaining}`);
+                        console.log(`[Lisa] Manuális: kért ${pendingJobAmount}, sor ${queueLengthBefore} -> ${queueLengthAfter}, hozzáadva ${added}, maradék ${remaining}`);
 
                         if (remaining > 0) {
                             const queued = addExtraJobs(task, remaining, jobName);
@@ -583,29 +692,29 @@
         if (verdict.outcome === 'success') {
             job.retries = 0;
             console.log(`[Lisa] Sikeresen elküldve: ${job.jobName}`);
-            const resp = verdict.resp;
-            if (resp && resp.tasks && typeof resp.tasks === 'object') {
-                currentQueueLength = Array.isArray(resp.tasks) ? resp.tasks.length : Object.keys(resp.tasks).length;
-            } else {
-                currentQueueLength++;
-            }
-            console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
+            if (!syncGameQueueFromResponse(verdict.resp)) noteQueuedLocally(job, verdict.dateDone);
 
-            if (verdict.dateDone) {
-                const waitMs = Math.max(0, (verdict.dateDone * 1000) - Date.now()) + CONFIG.SAFETY_MARGIN_MS;
-                updateUIStatus(`Következő próba: ~${Math.round(waitMs / 1000)} mp múlva`);
-                scheduleNextJob(waitMs);
+            // Ha maradt szabad slot, nincs értelme a befejezésre várni -- korábban
+            // a script akkor is végigvárta a date_done-t, ha üresen állt a sor fele.
+            if (!isQueueFull()) {
+                updateUIStatus(`Elküldve: ${job.jobName} (sor: ${getQueueLength()}/${CONFIG.QUEUE_SIZE}, még ${extraJobs.length})`);
+                scheduleNextJob(rand(CONFIG.MIN_SEND_GAP, CONFIG.MIN_SEND_GAP + 2000));
             } else {
-                scheduleNextJob(15000);
+                const waitMs = waitUntilFreeSlotMs();
+                updateUIStatus(`Sor tele – következő slot ~${Math.round(waitMs / 1000)} mp múlva`);
+                scheduleNextJob(waitMs);
             }
             return;
         }
 
         if (verdict.outcome === 'queue_full') {
             // Várható állapot, nem hiba: nem számít bele az újrapróbálkozásokba.
+            // Ha a szerver küldött tasklistát, abból tudjuk, mikor szabadul fel slot.
             requeueJob(job, false);
-            updateUIStatus('Sor tele – várakozás...');
-            scheduleNextJob(rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX));
+            syncGameQueueFromResponse(verdict.resp);
+            const waitMs = waitUntilFreeSlotMs();
+            updateUIStatus(`Sor tele – várakozás ~${Math.round(waitMs / 1000)} mp`);
+            scheduleNextJob(waitMs);
             return;
         }
 
@@ -671,6 +780,13 @@
                 scheduleNextJob(10000);
                 return;
             }
+            // Ha tudjuk, hogy tele a sor, meg se próbáljuk: felesleges kérés lenne.
+            if (isQueueFull()) {
+                const waitMs = waitUntilFreeSlotMs();
+                updateUIStatus(`Sor tele (${getQueueLength()}/${CONFIG.QUEUE_SIZE}) – ~${Math.round(waitMs / 1000)} mp`);
+                scheduleNextJob(waitMs);
+                return;
+            }
 
             const job = extraJobs.shift();
             saveExtraQueueToStorage();
@@ -679,7 +795,7 @@
             updateUIStatus(`Indítás: ${job.jobName} (még ${extraJobs.length} a sorban)`);
             console.log(`[Lisa] Munka indítása: ${job.jobName} (ID:${job.jobId})`);
 
-            const slotIndex = currentQueueLength % CONFIG.QUEUE_SIZE;
+            const slotIndex = getQueueLength() % CONFIG.QUEUE_SIZE;
             const bodyParams = new URLSearchParams();
             bodyParams.set(`tasks[${slotIndex}][jobId]`, job.jobId);
             bodyParams.set(`tasks[${slotIndex}][x]`, job.x);
@@ -1146,7 +1262,9 @@
                 clearInterval(checkDOM);
                 loadExtraQueueFromStorage();
                 loadHistoryFromStorage();
-                currentQueueLength = 0;
+                // A sor állapota túléli az újratöltést: a date_done abszolút szerveridő,
+                // így F5 után is tudjuk, hány slot foglalt és meddig.
+                loadGameQueueFromStorage();
                 injectUI();
                 updateUI();
                 updateUIStatus('Kész. Indíts egy munkát a hash megszerzéséhez.');
