@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v10.20 - Menü gomb, világosabb háttér)
+// @name         The-West Modular Job Queue (Lisa v10.21 - Megbízható hibakezelés)
 // @namespace   http://tampermonkey.net/
-// @version     10.20
+// @version     10.21
 // @description XHR‑alapú munkaindítás, maradék automatikus sorba, mennyiség max 99, fallback, auto-close dialógus, menü gomb.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -20,7 +20,12 @@
         SAFETY_MARGIN_MS: 3000,
         FULL_QUEUE_POLL_MIN: 15000,
         FULL_QUEUE_POLL_MAX: 25000,
-        ERROR_RETRY_DELAY: 20000,
+        ERROR_RETRY_BASE: 20000,     // exponenciális backoff kiindulópontja
+        ERROR_RETRY_MAX: 300000,     // egy újrapróba sem vár ennél többet
+        MAX_RETRIES: 5,              // ennyi hiba után a munka a sor végére kerül
+        MAX_DEFERRALS: 2,            // ennyi sikertelen kör után eldobjuk
+        REQUEST_TIMEOUT: 20000,
+        IDLE_RESCHEDULE: 5000,       // vészfék: ha egy ág elfelejtene időzítőt állítani
         STORAGE_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         STORAGE_HISTORY: 'lisa_modular_history_v97',
         PANEL_WIDTH: 320,
@@ -103,12 +108,14 @@
         return new Promise((resolve, reject) => {
             const xhr = new OriginalXHR();
             xhr.open(method, url, true);
+            xhr.timeout = CONFIG.REQUEST_TIMEOUT;
             if (headers) {
                 Object.keys(headers).forEach(key => xhr.setRequestHeader(key, headers[key]));
             }
             xhr.onload = () => resolve({ status: xhr.status, responseText: xhr.responseText });
-            xhr.onerror = () => reject(new Error('Network error'));
-            xhr.ontimeout = () => reject(new Error('Timeout'));
+            xhr.onerror = () => reject(new Error('Hálózati hiba'));
+            xhr.ontimeout = () => reject(new Error('Időtúllépés'));
+            xhr.onabort = () => reject(new Error('Megszakított kérés'));
             xhr.send(body);
         });
     }
@@ -466,7 +473,130 @@
     }
 
     // ============================================================
-    //  10. FELDOLGOZÁS
+    //  10. VÁLASZ KIÉRTÉKELÉS
+    // ============================================================
+    // Minden lehetséges válasz pontosan egy kimenetet kap: 'success', 'queue_full'
+    // vagy 'retry'. Nincs átesés: munka soha nem tűnhet el szó nélkül.
+    function classifyAddResponse(status, responseText) {
+        if (status === 0) return { outcome: 'retry', reason: 'Nincs válasz (hálózat?)' };
+        if (status === 401 || status === 403) {
+            return { outcome: 'retry', reason: `Munkamenet lejárt (HTTP ${status})`, invalidateHash: true };
+        }
+        if (status >= 400) return { outcome: 'retry', reason: `HTTP ${status}` };
+
+        let resp = null;
+        try { resp = JSON.parse(responseText); } catch(e) {}
+
+        if (resp === null || typeof resp !== 'object') {
+            // Régi, nem JSON válaszformátum – ha van benne date_done, sikeres.
+            if (/date_done/i.test(responseText)) {
+                const m = responseText.match(/"date_done":\s*(\d+\.?\d*)/i);
+                return { outcome: 'success', dateDone: m ? parseFloat(m[1]) : null };
+            }
+            // Kijelentkezés, karbantartás, hibaoldal: HTML jön JSON helyett.
+            if (/<html|<!doctype|<body/i.test(responseText)) {
+                return { outcome: 'retry', reason: 'HTML válasz (kijelentkezés / karbantartás?)', invalidateHash: true };
+            }
+            return { outcome: 'retry', reason: 'Értelmezhetetlen válasz' };
+        }
+
+        if (resp.error) {
+            const msg = (typeof resp.error === 'string' && resp.error) || resp.msg || 'Ismeretlen szerverhiba';
+            if (/megtelt|tele van|queue full|task limit|too many tasks/i.test(msg)) {
+                return { outcome: 'queue_full', reason: msg, resp };
+            }
+            if (/hash|session|munkamenet|bejelentkez/i.test(msg)) {
+                return { outcome: 'retry', reason: msg, invalidateHash: true, resp };
+            }
+            return { outcome: 'retry', reason: msg, resp };
+        }
+
+        const dateDone = findKeyInObject(resp, 'date_done');
+        if (dateDone || resp.tasks || resp.msg) {
+            return { outcome: 'success', dateDone: dateDone || null, resp };
+        }
+        return { outcome: 'retry', reason: 'Ismeretlen válaszformátum', resp };
+    }
+
+    function requeueJob(job, toBack) {
+        if (toBack) extraJobs.push(job);
+        else extraJobs.unshift(job);
+        saveExtraQueueToStorage();
+        updateExtraList();
+    }
+
+    function retryDelayFor(job) {
+        const base = Math.min(CONFIG.ERROR_RETRY_BASE * Math.pow(2, Math.max(0, job.retries - 1)), CONFIG.ERROR_RETRY_MAX);
+        return rand(base, base + Math.round(base * 0.3));
+    }
+
+    // Egyetlen belépési pont a küldés utáni állapotkezelésre. Minden ága
+    // vagy ütemez egy következő próbát, vagy tudatosan eldobja a munkát.
+    function applyVerdict(job, verdict) {
+        if (verdict.invalidateHash && cachedHash) {
+            console.warn('[Lisa] Hash érvénytelenítve:', verdict.reason);
+            cachedHash = null;
+            updateHashStatus();
+        }
+
+        if (verdict.outcome === 'success') {
+            job.retries = 0;
+            console.log(`[Lisa] Sikeresen elküldve: ${job.jobName}`);
+            const resp = verdict.resp;
+            if (resp && resp.tasks && typeof resp.tasks === 'object') {
+                currentQueueLength = Array.isArray(resp.tasks) ? resp.tasks.length : Object.keys(resp.tasks).length;
+            } else {
+                currentQueueLength++;
+            }
+            console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
+
+            if (verdict.dateDone) {
+                const waitMs = Math.max(0, (verdict.dateDone * 1000) - Date.now()) + CONFIG.SAFETY_MARGIN_MS;
+                updateUIStatus(`Következő próba: ~${Math.round(waitMs / 1000)} mp múlva`);
+                scheduleNextJob(waitMs);
+            } else {
+                scheduleNextJob(15000);
+            }
+            return;
+        }
+
+        if (verdict.outcome === 'queue_full') {
+            // Várható állapot, nem hiba: nem számít bele az újrapróbálkozásokba.
+            requeueJob(job, false);
+            updateUIStatus('Sor tele – várakozás...');
+            scheduleNextJob(rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX));
+            return;
+        }
+
+        job.retries = (job.retries || 0) + 1;
+        console.warn(`[Lisa] Sikertelen: ${job.jobName} (${job.retries}. próba) – ${verdict.reason}`);
+
+        if (job.retries <= CONFIG.MAX_RETRIES) {
+            requeueJob(job, false);
+            const delay = retryDelayFor(job);
+            updateUIStatus(`Hiba: ${verdict.reason} – újra ${Math.round(delay / 1000)} mp múlva (${job.retries}/${CONFIG.MAX_RETRIES})`);
+            scheduleNextJob(delay);
+            return;
+        }
+
+        // Kifogytunk az újrapróbákból: ne blokkolja a sor többi elemét.
+        job.retries = 0;
+        job.deferrals = (job.deferrals || 0) + 1;
+        if (job.deferrals > CONFIG.MAX_DEFERRALS) {
+            console.error(`[Lisa] Munka eldobva ${job.deferrals} sikertelen kör után: ${job.jobName} – ${verdict.reason}`);
+            updateUIStatus(`Feladva: ${job.jobName} (${verdict.reason})`);
+            saveExtraQueueToStorage();
+            updateExtraList();
+            scheduleNextJob(2000);
+            return;
+        }
+        requeueJob(job, true);
+        updateUIStatus(`${job.jobName} a sor végére került (${verdict.reason})`);
+        scheduleNextJob(rand(3000, 6000));
+    }
+
+    // ============================================================
+    //  11. FELDOLGOZÁS
     // ============================================================
     function ensureProcessing() {
         if (!processing && !paused && extraJobs.length > 0 && !nextJobTimer) {
@@ -516,6 +646,7 @@
             bodyParams.set(`tasks[${slotIndex}][duration]`, job.duration);
             bodyParams.set(`tasks[${slotIndex}][taskType]`, job.taskType);
 
+            let verdict;
             try {
                 const fullUrl = `/game.php?window=task&action=add&h=${cachedHash}`;
                 const headers = shuffleHeaders({
@@ -523,91 +654,29 @@
                     'X-Requested-With': 'XMLHttpRequest',
                 });
 
-                const { responseText } = await sendXHR(fullUrl, 'POST', bodyParams.toString(), headers);
-
-                let isError = false, errorMsg = '', isQueueFullError = false, success = false, dateDone = null;
-                let resp = null;
-                try {
-                    resp = JSON.parse(responseText);
-                } catch(e) {
-                    if (/date_done/i.test(responseText)) {
-                        success = true;
-                        dateDone = parseFloat(responseText.match(/"date_done":(\d+\.?\d*)/i)?.[1]) || null;
-                    }
-                }
-
-                if (resp) {
-                    if (resp.error) {
-                        errorMsg = resp.error;
-                        isError = true;
-                        if (/megtelt|queue full|task limit/i.test(errorMsg)) isQueueFullError = true;
-                    } else {
-                        const foundDateDone = findKeyInObject(resp, 'date_done');
-                        if (foundDateDone) {
-                            success = true;
-                            dateDone = foundDateDone;
-                            if (resp.tasks) {
-                                if (Array.isArray(resp.tasks)) currentQueueLength = resp.tasks.length;
-                                else if (typeof resp.tasks === 'object') currentQueueLength = Object.keys(resp.tasks).length;
-                                else currentQueueLength = currentQueueLength + 1;
-                            } else currentQueueLength = currentQueueLength + 1;
-                            console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
-                        } else if (resp.msg && !resp.error) {
-                            success = true;
-                            currentQueueLength = currentQueueLength + 1;
-                        } else {
-                            isError = true;
-                            errorMsg = 'Ismeretlen válaszformátum.';
-                        }
-                    }
-                }
-
-                if (success) {
-                    console.log(`[Lisa] Sikeresen elküldve: ${job.jobName}`);
-                    if (dateDone) {
-                        const waitMs = Math.max(0, (dateDone * 1000) - Date.now()) + CONFIG.SAFETY_MARGIN_MS;
-                        updateUIStatus(`Következő próba: ~${Math.round(waitMs/1000)} mp múlva`);
-                        scheduleNextJob(waitMs);
-                    } else {
-                        scheduleNextJob(15000);
-                    }
-                    return;
-                }
-
-                if (isError) {
-                    console.warn(`[Lisa] Sikertelen: ${job.jobName}, hiba: ${errorMsg}`);
-                    extraJobs.unshift(job);
-                    saveExtraQueueToStorage();
-                    updateUI();
-                    if (isQueueFullError) {
-                        updateUIStatus('Sor tele – várakozás...');
-                        scheduleNextJob(rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX));
-                    } else {
-                        job.retries++;
-                        updateUIStatus(`Hiba – újrapróbálkozás (${job.retries}. próba)`);
-                        scheduleNextJob(rand(CONFIG.ERROR_RETRY_DELAY, CONFIG.ERROR_RETRY_DELAY + 10000));
-                    }
-                }
+                const { status, responseText } = await sendXHR(fullUrl, 'POST', bodyParams.toString(), headers);
+                verdict = classifyAddResponse(status, responseText);
             } catch (err) {
-                console.error(`[Lisa] Hálózati hiba (${job.jobName}):`, err);
-                extraJobs.unshift(job);
-                saveExtraQueueToStorage();
-                updateUI();
-                scheduleNextJob(rand(CONFIG.ERROR_RETRY_DELAY, CONFIG.ERROR_RETRY_DELAY + 10000));
+                console.error(`[Lisa] Kérés meghiúsult (${job.jobName}):`, err);
+                verdict = { outcome: 'retry', reason: (err && err.message) || 'Hálózati hiba' };
             }
+
+            applyVerdict(job, verdict);
         } finally {
             processing = false;
-            if (extraJobs.length > 0 && !nextJobTimer) ensureProcessing();
+            // Vészfék: normál működésben az applyVerdict már ütemezett. Ha valamiért
+            // mégsem, itt lassan indulunk újra – nem 500 ms-os pörgéssel.
+            if (!paused && extraJobs.length > 0 && !nextJobTimer) scheduleNextJob(CONFIG.IDLE_RESCHEDULE);
         }
     }
 
     // ============================================================
-    //  11. UI ÉS STORAGE
+    //  12. UI ÉS STORAGE
     // ============================================================
     function saveExtraQueueToStorage() {
         try {
             localStorage.setItem(CONFIG.STORAGE_EXTRA_QUEUE, JSON.stringify(extraJobs.map(j => ({
-                id: j.id, retries: j.retries, jobName: j.jobName,
+                id: j.id, retries: j.retries, deferrals: j.deferrals || 0, jobName: j.jobName,
                 jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
             }))));
         } catch(e) {}
