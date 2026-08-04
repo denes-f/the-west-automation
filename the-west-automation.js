@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.7)
+// @name         The-West Modular Job Queue (Lisa v12.8)
 // @namespace   http://tampermonkey.net/
-// @version     12.7
+// @version     12.8
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -32,6 +32,7 @@
         STORAGE_EXTRA_QUEUE: 'lisa_extra_queue',
         STORAGE_HISTORY: 'lisa_history',
         STORAGE_LEADER: 'lisa_leader_tab',
+        STORAGE_SLEEP_MODE: 'lisa_sleep_mode',
         STORAGE_VERSION: 2,
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         LEGACY_HISTORY: 'lisa_modular_history_v97',
@@ -322,8 +323,7 @@
                 // energia feltöltődött -- a láncot a VÁRHATÓ ébredéshez kötjük,
                 // különben minden utána jövő munka nyolc órával későbbre csúszna.
                 if (e && e.type === 'sleep' && typeof done === 'number') {
-                    const wake = now + msUntilEnergyAtRate(
-                        sleepTargetEnergy(e.data && e.data.room), sleepPerHour(e));
+                    const wake = now + msUntilEnergyAtRate(sleepGoalForTask(e), sleepPerHour(e));
                     done = Math.min(done, wake);
                 }
                 if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
@@ -340,6 +340,16 @@
         };
     }
 
+    // Az alvás hossza nem rögzített: ahhoz igazodik, ameddig aludni akarunk.
+    // Ezért nem a mentett duration-t használjuk, hanem élőben számoljuk -- így a
+    // becslés a panelben, a játék sorában és a láncban is együtt mozog a
+    // döntéssel és az időközben hozzáadott munkákkal.
+    function jobDurationSeconds(job, index) {
+        if (!job) return 0;
+        if (job.taskType !== 'sleep') return job.duration || 0;
+        return estimateSleepSeconds(job.room, job.sleepMode, (index || 0) + 1);
+    }
+
     // [{ id, start, finish, travelMs }] az extraJobs sorrendjében.
     function computeEtas(jobs) {
         const perUnit = secondsPerDistanceUnit();
@@ -347,13 +357,13 @@
         let at = anchor.at;
         let pos = anchor.pos;
 
-        return jobs.map(job => {
+        return jobs.map((job, idx) => {
             let travelMs = 0;
             if (perUnit !== null && pos && typeof job.x === 'number') {
                 travelMs = Math.hypot(job.x - pos.x, job.y - pos.y) * perUnit * 1000;
             }
             const start = at + travelMs;
-            const finish = start + (job.duration || 0) * 1000;
+            const finish = start + jobDurationSeconds(job, idx) * 1000;
             at = finish;
             if (typeof job.x === 'number') pos = { x: job.x, y: job.y };
             return { id: job.id, start, finish, travelMs, estimated: perUnit !== null };
@@ -525,7 +535,7 @@
 
             // Az alvás nem fogyaszt, hanem feltölt.
             if (job.taskType === 'sleep') {
-                const target = opts.sleepTargetOf ? opts.sleepTargetOf(job) : null;
+                const target = opts.sleepTargetOf ? opts.sleepTargetOf(job, i) : null;
                 carry = target;
                 energyUsed = 0;
                 return {
@@ -676,7 +686,7 @@
         for (const t of window.TaskQueue.queue) {
             if (t && t.type === 'sleep') {
                 ensureSleepRoomData(t);
-                carry = sleepTargetEnergy(t.data && t.data.room);
+                carry = sleepGoalForTask(t);
             }
         }
         return carry;
@@ -697,7 +707,7 @@
             costOf: jobEnergyCost,
             motivationOf: jobMotivation,
             energyAt,
-            sleepTargetOf: (job) => sleepTargetEnergy(job.room),
+            sleepTargetOf: (job, i) => sleepGoalForEntry(job, i),
             priorMotivationCost: motivationAlreadyCommitted(),
             motivationWarn: CONFIG.MOTIVATION_WARN,
         });
@@ -717,6 +727,37 @@
     let hotelRooms = null;          // { townId, rooms, at }
     let sleepOffer = null;          // épp kint lévő kérdés
     let sleepDeclinedUntil = 0;
+    // A FUTÓ alvásra vonatkozó döntés, a munka azonosítójához kötve. Azért
+    // tárolt, mert egy újratöltés nem kérdezheti meg újra ugyanazt.
+    let runningSleepDecision = null;   // { queueId, mode }
+    let pendingSleepMode = null;       // amit épp most indítottunk a listánkból
+    let sleepModeAsked = false;        // épp kint van a kérdés a futó alvásról
+
+    function loadSleepDecision() {
+        try {
+            const raw = localStorage.getItem(CONFIG.STORAGE_SLEEP_MODE);
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (parsed && parsed.queueId) runningSleepDecision = parsed;
+        } catch(e) {}
+    }
+
+    function saveSleepDecision(queueId, mode) {
+        runningSleepDecision = { queueId, mode };
+        try {
+            localStorage.setItem(CONFIG.STORAGE_SLEEP_MODE, JSON.stringify(runningSleepDecision));
+        } catch(e) {}
+    }
+
+    // Egy futó alvás módja. Ha nincs róla döntés, a BIZTONSÁGOS alapértelmezés a
+    // teljes alvás: az alvó karaktert nem lehet párbajra hívni.
+    function runningSleepMode(task) {
+        if (!task) return 'full';
+        if (pendingSleepMode && !runningSleepDecision) return pendingSleepMode;
+        if (runningSleepDecision && runningSleepDecision.queueId === task.queueId) {
+            return runningSleepDecision.mode;
+        }
+        return 'full';
+    }
 
     function canSleep() {
         try {
@@ -764,14 +805,52 @@
         return r && typeof r.energy === 'number' ? Math.min(max, r.energy) : max;
     }
 
+    // Mennyi energia kell a sor HÁTRALÉVŐ munkáihoz, a megadott helytől kezdve.
+    // A közben visszatöltődő energiát szándékosan nem számoljuk bele: így inkább
+    // egy hajszállal tovább alszunk, mint hogy egy munka előtt fogyjunk ki.
+    // A következő alvásig számolunk -- azon túl úgyis lesz újabb feltöltés.
+    function energyNeededFrom(index) {
+        let sum = 0;
+        for (let i = Math.max(0, index); i < extraJobs.length; i++) {
+            const job = extraJobs[i];
+            if (job.taskType === 'sleep') break;
+            const cost = jobEnergyCost(job);
+            if (cost === null) return null;      // ismeretlen költség: nem tippelünk
+            sum += cost;
+        }
+        return sum;
+    }
+
+    // Meddig aludjunk? Vagy ameddig a szoba tölt ('full'), vagy csak addig,
+    // amíg a mögötte álló munkákra elég ('enough'). Az utóbbi mindig ÉLŐBEN
+    // számolódik, így ha alvás közben új munka kerül a sorba, a cél magától
+    // feljebb megy.
+    function sleepGoalEnergy(mode, roomKey, fromIndex) {
+        const roomTarget = sleepTargetEnergy(roomKey);
+        if (mode !== 'enough') return roomTarget;
+        const needed = energyNeededFrom(fromIndex);
+        if (needed === null) return roomTarget;  // amíg nem tudjuk, aludjunk tele
+        return Math.min(roomTarget, needed);     // a szoba szintje a plafon
+    }
+
+    // A sorban álló alvásbejegyzés célszintje: utána a lista többi munkája jön.
+    function sleepGoalForEntry(entry, index) {
+        return sleepGoalEnergy(entry.sleepMode, entry.room, (index || 0) + 1);
+    }
+
+    // A játékban FUTÓ alvás célszintje: utána a teljes extra listánk következik.
+    function sleepGoalForTask(task) {
+        const room = task && task.data && task.data.room;
+        return sleepGoalEnergy(runningSleepMode(task), room, 0);
+    }
+
     // Csak becslés a kijelzéshez: az alvás alatti regenerációt előre nem tudjuk
-    // (a szerver állítja be induláskor), ezért a mért értékkel számolunk. Az
-    // alvás úgyis addig tart, amíg fel nem töltődik -- akkor megszakítjuk.
-    function estimateSleepSeconds(roomKey) {
+    // (a szerver állítja be induláskor), ezért a mért értékkel számolunk.
+    function estimateSleepSeconds(roomKey, mode, fromIndex) {
         const c = window.Character;
         if (!c || typeof c.energy !== 'number') return 3600;
         const max = c.maxEnergy || 100;
-        const target = sleepTargetEnergy(roomKey);
+        const target = sleepGoalEnergy(mode, roomKey, fromIndex);
         const perHour = max * CONFIG.SLEEP_REGEN_ESTIMATE;
         if (perHour <= 0 || c.energy >= target) return 60;
         return Math.ceil((target - c.energy) / perHour * 3600);
@@ -780,15 +859,17 @@
     // Egy alvásbejegyzés a listába. A kézzel indított alvás a lista VÉGÉRE megy,
     // mint bármelyik munka; az energiahiány miatt felajánlott a lista ELEJÉRE,
     // mert épp az a dolga, hogy a soron következő munkát tegye indíthatóvá.
-    function makeSleepEntry(townId, room, roomName, x, y) {
+    function makeSleepEntry(townId, room, roomName, x, y, mode) {
+        const sleepMode = mode === 'enough' ? 'enough' : 'full';
         return {
             id: generateId(), retries: 0, deferrals: 0, rejections: 0,
             taskType: 'sleep',
-            townId, room,
-            jobName: `Alvás – ${roomName || room}`,
+            townId, room, sleepMode,
+            jobName: `Alvás – ${roomName || room}${sleepMode === 'enough' ? ' (amennyi kell)' : ''}`,
             jobId: 0,
             x: x || 0, y: y || 0,
-            duration: estimateSleepSeconds(room),
+            // Csak kiinduló érték: a tényleges hosszt élőben számoljuk.
+            duration: estimateSleepSeconds(room, sleepMode, 0),
         };
     }
 
@@ -839,7 +920,7 @@
 
     // Az alvás oda kerül, AHOL az energia elfogy: addig a lista fut tovább,
     // fölöslegesen nem állítjuk meg a még kifizethető munkákat.
-    function insertSleepJob(atIndex) {
+    function insertSleepJob(atIndex, mode) {
         const town = window.Character.homeTown;
         fetchHotelRooms(town.town_id, (rooms) => {
             const room = rooms && bestFreeRoom(rooms);
@@ -848,7 +929,7 @@
                 return;
             }
             const pos = Math.max(0, Math.min(extraJobs.length, atIndex || 0));
-            extraJobs.splice(pos, 0, makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y));
+            extraJobs.splice(pos, 0, makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y, mode));
             saveExtraQueueToStorage();
             updateUI();
             updateUIStatus(pos === 0
@@ -886,12 +967,21 @@
                   + 'Beszúrjak egy alvást a sor elejére?';
 
             let answered = false;
+            // Három válasz: aludjunk tele, aludjunk csak a hátralévő munkákra
+            // elegendő szintig, vagy semmi. A döntés CSAK erre az egy alvásra
+            // vonatkozik, és a bejegyzésben utazik tovább.
             const dlg = new west.gui.Dialog('Alvás beszúrása?', msg, west.gui.Dialog.SYS_QUESTION)
-                .addButton('yes', () => {
+                .addButton('Teljes alvás', () => {
                     answered = true;
                     const i = at;
                     dismissSleepOffer(false);
-                    insertSleepJob(i);
+                    insertSleepJob(i, 'full');
+                })
+                .addButton('Csak amennyi kell', () => {
+                    answered = true;
+                    const i = at;
+                    dismissSleepOffer(false);
+                    insertSleepJob(i, 'enough');
                 })
                 .addButton('no', () => {
                     answered = true;
@@ -935,6 +1025,63 @@
         renderSleepOffer();
     }
 
+    // Ha a karakter MÁR alszik (akár a felhasználó, akár a script indította), és
+    // közben munka kerül a listára, meg kell kérdezni, mi legyen az alvással:
+    // menjen végig, vagy szakadjon meg, amint a munkákra elég energia gyűlt.
+    // Alvásonként egyszer kérdezünk, a válasz a munka azonosítójához kötve marad.
+    function askRunningSleepMode() {
+        if (!CONFIG.AUTO_SLEEP || sleepModeAsked) return;
+        if (!gameReady() || !isLeaderTab) return;
+        const task = window.TaskQueue.queue.find(t => t && t.type === 'sleep');
+        if (!task || !task.queueId) return;
+        if (!hasWorkWaiting()) return;                       // nincs miért ébredni
+        if (runningSleepDecision && runningSleepDecision.queueId === task.queueId) return;
+        // A saját listánkból indított alvás döntése már megvan: vegyük át.
+        if (pendingSleepMode) {
+            saveSleepDecision(task.queueId, pendingSleepMode);
+            pendingSleepMode = null;
+            return;
+        }
+        if (!window.west || !west.gui || typeof west.gui.Dialog !== 'function') {
+            saveSleepDecision(task.queueId, 'full');         // kérdezni sem tudunk
+            return;
+        }
+
+        sleepModeAsked = true;
+        const needed = energyNeededFrom(0);
+        const roomTarget = sleepTargetEnergy(task.data && task.data.room);
+        const msg = `Alszol, és ${extraJobs.length} munka vár a sorban`
+            + (needed === null ? '. ' : ` (${needed} energia kell hozzájuk). `)
+            + `Menjen végig az alvás (${roomTarget} energiáig), vagy szakítsam meg, amint elég energia gyűlt?`;
+        let answered = false;
+        const finish = (mode) => {
+            answered = true;
+            sleepModeAsked = false;
+            saveSleepDecision(task.queueId, mode);
+            updateUI();
+        };
+        try {
+            const dlg = new west.gui.Dialog('Mi legyen az alvással?', msg, west.gui.Dialog.SYS_QUESTION)
+                .addButton('Végig alszom', () => finish('full'))
+                .addButton('Amint elég', () => finish('enough'))
+                .show();
+            // A ✕ itt is válasz nélkül zárna: a biztonságos alapértelmezés a
+            // teljes alvás, mert alvás közben nem lehet párbajra hívni.
+            const main = typeof dlg.getMainDiv === 'function' ? dlg.getMainDiv() : null;
+            const el = main && main.jquery ? main[0] : main;
+            if (el) {
+                const timer = setInterval(() => {
+                    if (el.isConnected) return;
+                    clearInterval(timer);
+                    if (!answered) finish('full');
+                }, 1000);
+            }
+        } catch(e) {
+            sleepModeAsked = false;
+            saveSleepDecision(task.queueId, 'full');
+        }
+    }
+
     // Van-e egyáltalán miért felébredni?
     function hasWorkWaiting() {
         if (extraJobs.some(j => j.taskType !== 'sleep')) return true;
@@ -957,7 +1104,10 @@
         // Csak a MÁR FUTÓ alvást szakítjuk meg, a sorban állót nem.
         if (task.queuePos !== 0) return;
         const room = task.data && task.data.room;
-        const target = sleepTargetEnergy(room);
+        // A cél lehet a szoba szintje ('full'), vagy csak annyi, amennyi a
+        // várakozó munkákhoz kell ('enough') -- ez utóbbi élőben újraszámolódik,
+        // tehát alvás közben hozzáadott munka feljebb tolja.
+        const target = sleepGoalForTask(task);
         const c = window.Character;
         if (!c || typeof c.energy !== 'number' || c.energy < target) return;
         try {
@@ -1133,7 +1283,7 @@
         const time = document.createElement('div');
         time.className = 'taskTime';
         const p = document.createElement('p');
-        p.textContent = formatClock(travelSec + (job.duration || 0));
+        p.textContent = formatClock(travelSec + jobDurationSeconds(job, extraJobs.indexOf(job)));
         time.appendChild(p);
 
         const btns = document.createElement('div');
@@ -1863,6 +2013,10 @@
             if (accepted > 0) {
                 const started = extraJobs.splice(0, accepted);
                 started.forEach(j => { j.retries = 0; });
+                // Az alvás módja utazzon tovább a most induló munkára: így nem
+                // kérdezzük meg újra azt, amiről a felhasználó épp döntött.
+                const startedSleep = started.find(j => j.taskType === 'sleep');
+                if (startedSleep) pendingSleepMode = startedSleep.sleepMode || 'full';
                 saveExtraQueueToStorage();
                 updateUI();
                 console.log(`[Lisa] Elfogadva ${accepted} munka (sor: ${gameQueueLength()}/${gameQueueLimit()})`);
@@ -1972,6 +2126,7 @@
                 if (base.taskType === 'sleep') {
                     base.townId = parseInt(j.townId, 10);
                     base.room = j.room;
+                    base.sleepMode = j.sleepMode === 'enough' ? 'enough' : 'full';
                 }
                 return base;
             })
@@ -2142,6 +2297,7 @@
         updateEnergyForecastBar();
         offerSleepIfForecastRunsOut();
         updateKeepAwake();
+        askRunningSleepMode();
         cancelSleepIfFull();
         observePendingHost();
         renderPendingInGameQueue();
@@ -2400,18 +2556,22 @@
             ? `A(z) ${at + 1}. munkára elfogy az energia. Alvás?`
             : `Kevés az energia (${sleepOffer.needed} kell). Alvás?`;
         text.title = 'A jóslat szerint innentől nem lenne indítható a munka.';
+        const where = at > 0 ? `a(z) ${at + 1}. munka elé` : 'a sor elejére';
         const yes = document.createElement('button');
-        yes.textContent = 'Igen';
-        yes.title = at > 0
-            ? `Alvás beszúrása a(z) ${at + 1}. munka elé, a legjobb ingyenes szobába`
-            : 'Alvás beszúrása a sor elejére, a legjobb ingyenes szobába';
-        yes.addEventListener('click', () => { const i = at; dismissSleepOffer(false); insertSleepJob(i); });
+        yes.textContent = 'Teljes';
+        yes.title = `Alvás beszúrása ${where}, a szoba teljes szintjéig`;
+        yes.addEventListener('click', () => { const i = at; dismissSleepOffer(false); insertSleepJob(i, 'full'); });
+        const enough = document.createElement('button');
+        enough.textContent = 'Amennyi kell';
+        enough.title = `Alvás beszúrása ${where}, de csak amíg a hátralévő munkákhoz elég energia gyűlik`;
+        enough.addEventListener('click', () => { const i = at; dismissSleepOffer(false); insertSleepJob(i, 'enough'); });
         const no = document.createElement('button');
         no.textContent = 'Nem';
         no.title = `Most nem – ${Math.round(CONFIG.SLEEP_DECLINE_MS / 60000)} percig nem kérdezünk újra`;
         no.addEventListener('click', () => dismissSleepOffer(true));
         box.appendChild(text);
         box.appendChild(yes);
+        box.appendChild(enough);
         box.appendChild(no);
     }
 
@@ -2636,6 +2796,7 @@
         initTabSync();
         loadExtraQueueFromStorage();
         loadHistoryFromStorage();
+        loadSleepDecision();
         // Visszaírás az új kulcsra, különben a régiről minden induláskor
         // újra migrálnánk, és a normalizált alak sosem rögzülne.
         saveHistoryToStorage();
@@ -2671,5 +2832,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.7 betöltve.');
+    console.log('[Lisa] Modular v12.8 betöltve.');
 })();

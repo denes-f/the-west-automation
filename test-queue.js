@@ -238,8 +238,12 @@ global.Character = {
     calcWayTo: (x, y) => Math.hypot(x - charPos.x, y - charPos.y) * SEC_PER_UNIT,
 };
 window.Character = global.Character;
-eval(['secondsPerDistanceUnit','currentPosition','queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta']
-     .map(extract).join('\n'));
+// Az alvás hossza élőben számolódik; a munkáké a mentett érték.
+const estimateSleepSeconds = () => 3600;
+const sleepGoalForTask = () => 100;
+const sleepPerHour = () => 0;
+eval(['secondsPerDistanceUnit','currentPosition','queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta',
+      'jobDurationSeconds','msUntilEnergyAtRate'].map(extract).join('\n'));
 
 eq('mp/egység a calcWayTo-ból származik', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
 
@@ -303,6 +307,7 @@ console.log('\n=== Slot-figyelő ===');
 CONFIG.SLOT_FREED_DELAY = 1500;
 const updateKeepAwake = () => {};     // ébrentartás: böngészőfüggő, itt nem mérhető
 const cancelSleepIfFull = () => {};   // az alvás megszakítása élő játékállapotot igényel
+const askRunningSleepMode = () => {}; // párbeszédablak kell hozzá
 const patchHotelStart = () => {};     // a hotel ablak csak a játékban létezik
 eval(extract('watchGameQueue'));
 
@@ -642,7 +647,7 @@ eq('bőséges energiánál nincs hiány', forecastShortageIndex(
 // A még el NEM kezdődött alvás hosszát nem szabad az ébren mért ütemmel
 // becsülni: a főkarakteren így egy 8 órás alvás "sosem ért véget", és a mögötte
 // álló munkák nyolc órával későbbre csúsztak.
-eval(extract('msUntilEnergyAtRate'));
+// (a függvényt már fentebb, az időpontszámításnál kiemeltük)
 window.Character = { energy: 8, maxEnergy: 150 };
 const hours = (ms) => Math.round(ms / 3600000 * 10) / 10;
 eq('ébren 5/óra: 8-ról 150-re ~28,4 óra', hours(msUntilEnergyAtRate(150, 5)), 28.4);
@@ -651,6 +656,50 @@ eq('a maximum fölé nem várakozunk', msUntilEnergyAtRate(999, 5), msUntilEnerg
 eq('elért szintre nem várunk', msUntilEnergyAtRate(8, 5), 0);
 eq('nulla ütemnél nem pörgünk', msUntilEnergyAtRate(150, 0), CONFIG.MAX_WAIT_MS);
 delete window.Character;
+
+// ============================================================
+//  Alvás: meddig aludjunk?
+// ============================================================
+// Két üzemmód, alvásonként külön: 'full' a szoba szintjéig, 'enough' csak addig,
+// amíg a MÖGÖTTE álló munkákhoz elég energia gyűlik. Az 'enough' élőben
+// számolódik, tehát alvás közben hozzáadott munka feljebb tolja a célt.
+console.log('\n=== Meddig aludjunk ===');
+let costTable = {};
+jobEnergyCost = (job) => (job.taskType === 'sleep' ? null
+    : (costTable[job.jobId] !== undefined ? costTable[job.jobId] : 5));
+const sleepTargetEnergy = () => 150;      // luxusapartman, 150-es maximum
+eval([extract('energyNeededFrom'), extract('sleepGoalEnergy'), extract('sleepGoalForEntry')].join('\n'));
+
+extraJobs = mkJobs(3);                                     // 3 munka, egyenként 5
+eq('a hátralévő munkák összköltsége', energyNeededFrom(0), 15);
+eq('a második helytől kevesebb kell', energyNeededFrom(1), 10);
+eq('a lista végén már semmi', energyNeededFrom(3), 0);
+eq('teljes alvásnál a szoba szintje a cél', sleepGoalEnergy('full', 'x', 0), 150);
+eq('"amennyi kell" csak a munkákhoz elegendő', sleepGoalEnergy('enough', 'x', 0), 15);
+eq('a szoba szintje a plafon', sleepGoalEnergy('enough', 'x', 0) <= 150, true);
+
+// Több munka a sorban -> magasabb cél (élő újraszámolás alvás közben)
+extraJobs = mkJobs(40);
+eq('sok munkánál a szoba szintje korlátoz', sleepGoalEnergy('enough', 'x', 0), 150);
+
+// Ismeretlen költségnél nem tippelünk: aludjunk tele
+extraJobs = mkJobs(2);
+costTable = { 100: undefined };
+jobEnergyCost = (job) => (job.jobId === 100 ? null : 5);
+eq('ismeretlen költség -> nincs becslés', energyNeededFrom(0), null);
+eq('ismeretlen költség -> teljes alvás', sleepGoalEnergy('enough', 'x', 0), 150);
+jobEnergyCost = (job) => (job.taskType === 'sleep' ? null : 5);
+
+// A soron következő alvásig számolunk: a következő alvás úgyis újratölt
+extraJobs = [mkJobs(1)[0], mkJobs(1)[0], { taskType: 'sleep', room: 'x' }, mkJobs(1)[0]];
+eq('a következő alvásig összegzünk', energyNeededFrom(0), 10);
+
+// A bejegyzés célszintje a MÖGÖTTE állókból jön (ezért index+1)
+extraJobs = [{ taskType: 'sleep', room: 'x', sleepMode: 'enough' }, mkJobs(1)[0], mkJobs(1)[0]];
+eq('az alvás a mögötte állókra gyűjt', sleepGoalForEntry(extraJobs[0], 0), 10);
+extraJobs[0].sleepMode = 'full';
+eq('teljes módban a szoba szintjéig', sleepGoalForEntry(extraJobs[0], 0), 150);
+extraJobs = [];
 
 // ============================================================
 //  Alvás: szobaválasztás és célszint

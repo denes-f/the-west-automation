@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 175 assertions, no dependencies.
+  name and runs them against stubs. 187 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.7.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.8.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `175 passed, 0 failed`.
+2. `node test-queue.js` should print `187 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -159,9 +159,12 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
 - `Character.homeTown` → `{town_id, x, y, town_name, alliance_id}`; `town_id` is **0** when the
   character has joined no town.
 - `Ajax.remoteCallMode("building_hotel", "get_data", {town_id})` → `rooms[key] = {level, costs,
-  energy, health, name, available, free}`. **`energy` is the level sleeping there fills up to**
-  (measured: cubby 64 → luxurious_apartment 100), and everything is `free: true` in the character's
-  own town. Never auto-pick a room that isn't free — that spends the user's money.
+  energy, health, name, available, free}`. **`energy` is the level sleeping there fills up to**,
+  and everything is `free: true` in the character's own town. Never auto-pick a room that isn't
+  free — that spends the user's money.
+  The level is **a fixed fraction of the character's maximum**: measured 64 / 72 / 80 / 88 / 100 at
+  max 100, and 96 / 108 / 120 / 132 / 150 at max 150 — the same 0.64 / 0.72 / 0.8 / 0.88 / 1.0
+  ratios. The API already returns the absolute value for that character, so read it, don't scale.
 - A running sleep is a queue entry with `type: 'sleep'`, `getDuration()` **28800** (8 h, always),
   and `data = {town_name, room, townId, date_start, date_done, x, y}`. Note the coordinates live in
   `data`, **not** in `post` (`post` is only `{taskType: 'sleep'}`).
@@ -384,7 +387,18 @@ and "Nem" correctly does nothing.
   the energy the sleep is meant to build); **nothing is fed into the queue while sleeping**, for the
   same reason; and only a **free** room is ever chosen automatically, never one that costs the
   user's money. It is offered, never inserted unasked, and `cancelSleepIfFull` ends it via
-  `TaskQueue.cancel(queuePos)` once energy reaches what that room can give.
+  `TaskQueue.cancel(queuePos)` once energy reaches the sleep's **goal**.
+- **How long to sleep is a per-sleep decision**, `sleepMode`: `'full'` fills to the room's level,
+  `'enough'` stops as soon as the jobs *behind* that sleep are covered (`energyNeededFrom`, summed
+  to the next sleep, ignoring regeneration during those jobs — deliberately conservative). The
+  goal is recomputed **live**, so queueing more jobs mid-sleep raises it by itself; it feeds the
+  cancel check, the ETA clamp, the forecast carry and the displayed sleep duration alike, which is
+  why a sleep entry's length is computed by `jobDurationSeconds` rather than read off the stored
+  `duration`. Unknown job costs fall back to `'full'` — never guess and wake up short.
+  For a sleep already running, the choice is asked once per `queueId` and persisted
+  (`STORAGE_SLEEP_MODE`), so a reload doesn't re-ask; a sleep the script started carries the
+  decision over via `pendingSleepMode`. **Dismissing either dialog means `'full'`** — the safe
+  default, since a sleeping character cannot be duelled.
   `queueTailAnchor` also clamps a running sleep's 8-hour `date_done` to the predicted wake-up,
   otherwise every following ETA would be pushed eight hours out.
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
