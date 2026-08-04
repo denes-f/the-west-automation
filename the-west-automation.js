@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.3 - Várakozók a játék sorában)
+// @name         The-West Modular Job Queue (Lisa v11.4 - Utazási idő és időtartamsávok)
 // @namespace   http://tampermonkey.net/
-// @version     11.3
+// @version     11.4
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -48,7 +48,7 @@
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
         GAME_QUEUE_PREVIEW: 8,       // ennyi várakozó munka látszik a játék sorában
-        PANEL_PREVIEW: 12,           // ennyi látszik a script paneljén
+        PANEL_PREVIEW: 8,            // ennyi látszik a script paneljén (a játékbelivel egyezően)
     };
 
     // ============================================================
@@ -362,14 +362,24 @@
         item.className = 'task lisa-pending';   // a 'task' hozza a játék stílusát
         item.dataset.id = job.id;
 
+        // A játék a sorban álló munkáknál az utazást NEM külön sorban mutatja
+        // (az csak a futó munkánál van), hanem beleszámolja az időbe: egy 5 mp
+        // úttal induló 15 mp-es munka 00:00:20-ként jelenik meg. Ugyanígy teszünk,
+        // így ahol nincs helyváltás, ott magától csak a munkaidő látszik.
+        const travelSec = eta ? Math.round(eta.travelMs / 1000) : 0;
         const time = document.createElement('div');
         time.className = 'taskTime';
         const p = document.createElement('p');
-        p.textContent = formatClock(job.duration);
+        p.textContent = formatClock(travelSec + (job.duration || 0));
         time.appendChild(p);
 
         const btns = document.createElement('div');
         btns.className = 'taskBtns';
+        // Az út felezése még el nem indult munkára nem értelmezhető: a valódi
+        // elemekkel azonos elrendezésért kirakjuk, de inaktív állapotban.
+        const halve = document.createElement('div');
+        halve.className = 'notAvailable taskHalveway';
+        btns.appendChild(halve);
         const abort = document.createElement('div');
         abort.className = 'taskAbort lisa-pending-abort';
         abort.title = 'Eltávolítás az extra sorból';
@@ -384,7 +394,9 @@
         item.appendChild(btns);
         item.appendChild(icon);
         item.title = eta
-            ? `${job.jobName} — ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
+            ? (travelSec > 0
+                ? `${job.jobName} — út: ${formatDuration(travelSec)} + munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
+                : `${job.jobName} — munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`)
             : `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`;
 
         item.addEventListener('click', (e) => {
@@ -545,7 +557,26 @@
         return matched && total > 0 ? total : null;
     }
 
-    function parseJobWindow(windowEl) {
+    // A munkaablakban HÁROM időtartamsáv van (short/middle/long), és mindegyik
+    // SAJÁT indítógombot tartalmaz. Alacsony szinten csak a 15 mp-es van
+    // feloldva, ezért ott bármelyik kiolvasás jó eredményt ad -- 10. és 20.
+    // szinttől viszont mindhárom aktív, és a "első nem letiltott sáv" mindig a
+    // 15 mp-eset adná vissza, függetlenül attól, melyik gombra kattintottak.
+    // Ezért az időtartam abból a sávból jön, amelyikben a MEGNYOMOTT gomb van.
+    function durationFromBar(bar) {
+        if (!bar) return null;
+        // A data-base kulcsai (short/middle/long) pontosan egyeznek a
+        // JobList.getDurations() kulcsaival, így nem kell szöveget értelmezni.
+        try {
+            const base = bar.dataset && bar.dataset.base;
+            const all = (window.JobList && typeof JobList.getDurations === 'function') ? JobList.getDurations() : null;
+            if (base && all && all[base] && all[base].duration > 0) return all[base].duration;
+        } catch(e) {}
+        const el = bar.querySelector('.job_value_duration');
+        return el ? parseDurationText(el.textContent) : null;
+    }
+
+    function parseJobWindow(windowEl, startBtn) {
         const classList = windowEl.className;
         const match = classList.match(/job-(\d+)-(\d+)-(\d+)/);
         if (!match) return null;
@@ -553,9 +584,9 @@
         const y = parseInt(match[2], 10);
         const jobId = parseInt(match[3], 10);
 
-        const activeBar = windowEl.querySelector('.job_durationbar:not(.disabled)');
-        const durationEl = activeBar ? activeBar.querySelector('.job_value_duration') : null;
-        let duration = durationEl ? parseDurationText(durationEl.textContent) : null;
+        const clickedBar = startBtn ? startBtn.closest('.job_durationbar') : null;
+        let duration = durationFromBar(clickedBar)
+            || durationFromBar(windowEl.querySelector('.job_durationbar:not(.disabled)'));
 
         if (!duration) {
             // A szerver által korábban visszaigazolt érték megbízhatóbb, mint egy vak default.
@@ -581,7 +612,7 @@
         const amountElem = jobWindow.querySelector('.job-amount-num');
         const amount = amountElem ? (parseInt(amountElem.textContent.trim(), 10) || 1) : 1;
 
-        const jobData = gameReady() ? parseJobWindow(jobWindow) : null;
+        const jobData = gameReady() ? parseJobWindow(jobWindow, startBtn) : null;
         if (!jobData) {
             // Nem tudjuk kiolvasni a munka adatait: maradjon a játéké a kattintás,
             // a maradékot a válasz után, az élő sorhosszból számoljuk ki.
@@ -1583,5 +1614,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.3 betöltve.');
+    console.log('[Lisa] Modular v11.4 betöltve.');
 })();

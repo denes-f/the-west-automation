@@ -321,6 +321,69 @@ watchCase({ len: 3, lastSeen: 4, waiting: 2 });
 eq('ismételt hívás új csökkenés nélkül csendes', (scheduled = null, watchGameQueue(), scheduled), null);
 paused = false; isLeaderTab = true; processing = false;
 
+
+// ============================================================
+//  Időtartam a MEGNYOMOTT sávból (magas szintű fiókok)
+// ============================================================
+console.log('\n=== Időtartamsávok ===');
+global.JobList = { getDurations: () => ({ short:{duration:15,requirement:1},
+                                          middle:{duration:600,requirement:10},
+                                          long:{duration:3600,requirement:20} }) };
+window.JobList = global.JobList;
+jobHistory = [];
+eval([extract('durationFromBar'), extract('parseJobWindow')].join('\n'));
+
+// Minimális DOM-utánzat: csak amit a parseJobWindow használ
+function mkBar(base, disabled, durText) {
+    const bar = { dataset: { base }, disabled,
+        querySelector: sel => (sel === '.job_value_duration' && durText) ? { textContent: durText } : null };
+    bar.closestTarget = bar;
+    return bar;
+}
+function mkWindow(bars, className) {
+    return { className, querySelector: sel => sel === '.job_durationbar:not(.disabled)'
+        ? (bars.find(b => !b.disabled) || null) : null };
+}
+const mkBtn = bar => ({ closest: sel => sel === '.job_durationbar' ? bar : null });
+const CLS = 'tw2gui_window job-43879-17869-7';
+
+const barsHigh = [mkBar('short', false, '15mp'), mkBar('middle', false, '10p'), mkBar('long', false, '1ó')];
+const winHigh = mkWindow(barsHigh, CLS);
+eq('short gomb -> 15 mp', parseJobWindow(winHigh, mkBtn(barsHigh[0])).duration, 15);
+eq('middle gomb -> 600 mp', parseJobWindow(winHigh, mkBtn(barsHigh[1])).duration, 600);
+eq('long gomb -> 3600 mp', parseJobWindow(winHigh, mkBtn(barsHigh[2])).duration, 3600);
+eq('koordináták a class-ból', (j => [j.jobId, j.x, j.y])(parseJobWindow(winHigh, mkBtn(barsHigh[2]))), [7, 43879, 17869]);
+
+// Alacsony szint: csak a short aktív, a többi letiltott gomb nélkül
+const barsLow = [mkBar('short', false, '15mp'), mkBar('middle', true), mkBar('long', true)];
+eq('alacsony szint -> 15 mp', parseJobWindow(mkWindow(barsLow, CLS), mkBtn(barsLow[0])).duration, 15);
+
+// Ismeretlen data-base esetén a szöveg a tartalék
+const oddBar = mkBar(undefined, false, '10p');
+eq('data-base nélkül a szövegből', parseJobWindow(mkWindow([oddBar], CLS), mkBtn(oddBar)).duration, 600);
+
+// Se base, se szöveg -> előzmény, majd default
+const blank = mkBar(undefined, false, null);
+jobHistory = [{ jobId: 7, duration: 1234 }];
+eq('előzményből pótolva', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, 1234);
+jobHistory = [];
+eq('végső tartalék a default', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, CONFIG.DEFAULT_DURATION);
+
+// Gomb nélkül (nem elkapott kattintás) az első aktív sávra esik vissza
+eq('gomb nélkül az első aktív sáv', parseJobWindow(winHigh, null).duration, 15);
+eq('nem munkaablak -> null', parseJobWindow(mkWindow(barsHigh, 'tw2gui_window valami'), null), null);
+
+// ============================================================
+//  A játék sorában az utazás beleszámít az időbe
+// ============================================================
+console.log('\n=== Utazás a sorelem idejében ===');
+eval(extract('formatClock'));
+eq('0 mp út -> csak a munkaidő', formatClock(0 + 15), '00:00:15');
+eq('5 mp út + 15 mp munka', formatClock(5 + 15), '00:00:20');
+eq('29 mp út + 15 mp munka', formatClock(29 + 15), '00:00:44');
+eq('10 perces munka', formatClock(0 + 600), '00:10:00');
+eq('1 órás munka úttal', formatClock(120 + 3600), '01:02:00');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 })();
