@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 165 assertions, no dependencies.
+  name and runs them against stubs. 175 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.6.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.7.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `165 passed, 0 failed`.
+2. `node test-queue.js` should print `175 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -218,7 +218,12 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   after the real ones so the game's index mapping is untouched.
 - `#queuedTasks` is `display:none` when nothing is queued beyond the running task, and
   `#ui_workcontainer` is `display:none` when the queue is empty — injected rows are then invisible.
-  Accepted limitation; forcing it visible would fight the game's own show/hide.
+  This used to be an accepted limitation, but since the script stops feeding the game's queue while
+  the character sleeps, "one running task and nothing behind it" became the *normal* state and the
+  waiting list vanished from the widget. `setPendingHostVisible` now forces `#queuedTasks` visible
+  while we have rows and hands control back (inline style cleared) when we don't — an empty
+  container has no children and so takes no space. **`#ui_workcontainer` is deliberately left
+  alone**: forcing that one would draw the game's empty queue frame.
 - The queue background is **light parchment**, so overlay text must be dark (`#4a3b28`), not cream.
 
 ### The character's status bars
@@ -354,8 +359,22 @@ and "Nem" correctly does nothing.
   `MOTIVATION_WARN` (75) or when the energy at that point won't cover its cost — shown as `⚠` on the
   panel row, on the injected in-game tile, and summarised on the separator. When a value isn't known
   yet, nothing is guessed and nothing is flagged.
-  **Known simplification:** motivation regeneration over time is not modelled (it was not measured),
-  so a long queue's warnings are pessimistic rather than optimistic — the safe direction.
+  **Known simplification:** motivation regeneration is not modelled (it was not measured; it is
+  believed to reset daily, time of day unknown). This needs no correction for *current* values —
+  the motivation is re-read from the server every `JOB_INFO_TTL` (5 min), so a reset is picked up
+  by itself; only the projection across a queue that spans the reset stays pessimistic, which is
+  the safe direction. Measuring the reset would take a day-long observation.
+- **A sleep in the *game's* queue must seed the forecast.** Energy is otherwise extrapolated from
+  the current regen rate, which across an 8-hour sleep is badly wrong: measured live on a main
+  account, 8 energy was projected to 48 instead of 150, because the awake rate (5/h) was dragged
+  across the whole sleep. `initialEnergyCarry` seeds the chain with the room's fill-up level.
+  The equivalent case for a sleep in *our* list was already handled.
+- **Do not estimate a not-yet-started sleep with the awake regen rate.** The game raises
+  `energyRegen` only once the character has actually arrived and started sleeping
+  (`task.isArrived(serverTime)` — `queuePos === 0` is not enough, the character may still be
+  travelling). With the awake rate, filling to max looks like ~28 h, so the 8-hour cap never binds
+  and every following job's ETA slips by eight hours. Use the measured sleeping rate until it
+  really starts, then the live value.
 - **The energy pre-check** in `processQueue` refuses to hand over a job the character can't afford
   and waits exactly as long as the regen needs, instead of letting the server reject it. This is the
   proper fix for "energy ran out"; the rejection recovery above is the safety net behind it.

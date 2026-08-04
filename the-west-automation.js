@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.6)
+// @name         The-West Modular Job Queue (Lisa v12.7)
 // @namespace   http://tampermonkey.net/
-// @version     12.6
+// @version     12.7
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -322,7 +322,8 @@
                 // energia feltöltődött -- a láncot a VÁRHATÓ ébredéshez kötjük,
                 // különben minden utána jövő munka nyolc órával későbbre csúszna.
                 if (e && e.type === 'sleep' && typeof done === 'number') {
-                    const wake = now + msUntilEnergy(sleepTargetEnergy(e.data && e.data.room));
+                    const wake = now + msUntilEnergyAtRate(
+                        sleepTargetEnergy(e.data && e.data.room), sleepPerHour(e));
                     done = Math.min(done, wake);
                 }
                 if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
@@ -402,17 +403,43 @@
 
     // Mennyi idő, amíg az energia elér egy szintet. A játék képletét fordítjuk
     // meg, tehát ugyanaz a regeneráció (és alvás alatt ugyanúgy a megemelt) érték.
-    function msUntilEnergy(target) {
+    function msUntilEnergyAtRate(target, perHour) {
         const c = window.Character;
         if (!c || typeof c.energy !== 'number') return CONFIG.MIN_SEND_GAP;
         const max = c.maxEnergy || 100;
         // A maximum fölé sosem jutunk: egy ilyen célra várni örökös várakozás lenne.
         target = Math.min(target, max);
         if (c.energy >= target) return 0;
-        const regen = typeof c.energyRegen === 'number' ? c.energyRegen : 0;
-        const perHour = max * regen;
         if (perHour <= 0) return CONFIG.MAX_WAIT_MS;      // nem regenerálódik: ne pörögjünk
         return Math.ceil((target - c.energy) / perHour * 3600) * 1000;
+    }
+
+    function energyPerHour() {
+        const c = window.Character;
+        if (!c) return 0;
+        return (c.maxEnergy || 100) * (typeof c.energyRegen === 'number' ? c.energyRegen : 0);
+    }
+
+    function msUntilEnergy(target) {
+        return msUntilEnergyAtRate(target, energyPerHour());
+    }
+
+    // Alvás alatt a játék megemeli az energyRegen-t, de CSAK amikor az alvás
+    // tényleg elkezdődött (a karakter odaért). Egy még el nem kezdődött alvás
+    // hosszát ezért nem szabad az ébren mért ütemmel becsülni -- úgy egy 8 órás
+    // alvás "sosem ér véget", és minden utána jövő munka nyolc órával későbbre
+    // csúszik. Amíg nem alszunk, a mért alvási ütemmel számolunk.
+    function sleepingNow(task) {
+        try {
+            return !!task && task.queuePos === 0
+                && typeof task.isArrived === 'function' && task.isArrived(serverNowSec());
+        } catch(e) { return false; }
+    }
+
+    function sleepPerHour(task) {
+        const c = window.Character;
+        const max = (c && c.maxEnergy) || 100;
+        return sleepingNow(task) ? energyPerHour() : max * CONFIG.SLEEP_REGEN_ESTIMATE;
     }
 
     function jobEnergyCost(job) {
@@ -485,7 +512,7 @@
         // Alvás után nem a "mostantól regenerálódó" energiából számolunk tovább,
         // hanem abból, ameddig az alvás feltölt. A további regenerációt ilyenkor
         // elhanyagoljuk: így a jóslat inkább pesszimista, mint hazug.
-        let carry = null;
+        let carry = (typeof opts.initialCarry === 'number') ? opts.initialCarry : null;
         return jobs.map((job, i) => {
             const start = etas[i] ? etas[i].start : Date.now();
             const cost = opts.costOf(job);
@@ -638,8 +665,35 @@
             : 'inset 0 0 0 1px rgba(0,0,0,0.65)';
     }
 
+    // Ha a JÁTÉK sorában alvás van, a mi munkáink utána indulnak -- addigra az
+    // energia a szoba szintjére töltődik, nem a mostani ütemben kúszik felfelé.
+    // Enélkül egy 8 órás alvás alatt az "ébren" ütemmel számoltunk: 8 energiából
+    // 48 lett 150 helyett, és a lista végi jóslat is ekkora hibát vitt tovább.
+    // (A saját sorunkba tett alvással ez már korábban is jól működött.)
+    function initialEnergyCarry() {
+        if (!gameReady()) return null;
+        let carry = null;
+        for (const t of window.TaskQueue.queue) {
+            if (t && t.type === 'sleep') {
+                ensureSleepRoomData(t);
+                carry = sleepTargetEnergy(t.data && t.data.room);
+            }
+        }
+        return carry;
+    }
+
+    // A futó alváshoz tartozó hotel adatai kellenek: enélkül a célszint a
+    // maximumra tippel, pedig egy gyengébb szoba csak részlegesen tölt fel.
+    function ensureSleepRoomData(task) {
+        const townId = task && task.data && task.data.townId;
+        if (!townId) return;
+        if (hotelRooms && hotelRooms.townId === townId) return;
+        fetchHotelRooms(townId, () => {});
+    }
+
     function forecastForExtraQueue(jobs, etas) {
         return computeForecast(jobs, etas, {
+            initialCarry: initialEnergyCarry(),
             costOf: jobEnergyCost,
             motivationOf: jobMotivation,
             energyAt,
@@ -1035,6 +1089,16 @@
             .forEach(el => el.remove());
     }
 
+    // A játék elrejti a #queuedTasks-ot, ha a FUTÓ feladaton kívül nincs más a
+    // sorban -- és ilyenkor a mi várakozó soraink is eltűnnek vele. Ez korábban
+    // ritka volt, de amióta alvás alatt nem töltjük a játék sorát, ez a tipikus
+    // állapot: egyetlen futó alvás, mögötte a mi listánk. Ha van mit mutatnunk,
+    // felülírjuk. Üresen visszaadjuk a vezérlést a játéknak -- egy üres, gyerek
+    // nélküli konténer nem foglal helyet, tehát nem is látszik.
+    function setPendingHostVisible(host, visible) {
+        host.style.display = visible ? 'block' : '';
+    }
+
     // A játék minden sorváltozáskor újraépíti a #queuedTasks tartalmát, és ilyenkor
     // a mi sorainkat is eldobja. A kétmásodperces figyelőre hagyva ez látható
     // villanás: a várakozók eltűnnek, majd visszajönnek. Ezért azonnal, ugyanabban
@@ -1134,9 +1198,14 @@
         if (!host) return;
 
         if (!extraJobs.length) {
-            if (renderedPendingKey !== '') { clearPendingRows(host); renderedPendingKey = ''; }
+            if (renderedPendingKey !== '') {
+                clearPendingRows(host);
+                setPendingHostVisible(host, false);
+                renderedPendingKey = '';
+            }
             return;
         }
+        setPendingHostVisible(host, true);
 
         const split = previewSplit(extraJobs.length, CONFIG.GAME_QUEUE_PREVIEW);
         const shown = extraJobs.slice(0, split.shown);
@@ -2602,5 +2671,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.6 betöltve.');
+    console.log('[Lisa] Modular v12.7 betöltve.');
 })();

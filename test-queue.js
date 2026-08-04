@@ -611,6 +611,25 @@ eq('és a következő is', fc[3].energyAfter, 84);
 eq('alvás után nincs energiahiány', fc.some(f => f.notEnoughEnergy), false);
 eq('az alvásra magára nincs figyelmeztetés', [fc[1].lowMotivation, fc[1].notEnoughEnergy], [false, false]);
 
+// Ha a JÁTÉK sorában van az alvás (kézzel indítva), a mi munkáink utána
+// indulnak: az energia addigra a szoba szintjére töltődik. Élesben ez hiányzott
+// -- 8 energiából 48-at jósoltunk 150 helyett, mert az ébren mért ütemet
+// húztuk végig a nyolcórás alváson.
+fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
+    initialCarry: 150,                       // a futó alvás a maximumig tölt
+    costOf: () => 1, motivationOf: () => 1,
+    energyAt: flat(48),                      // amit a puszta regeneráció mondana
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('az alvás utáni szintről indulunk', fc[0].energyBefore, 150);
+eq('nem a regenerációból jósolt értékről', fc[0].energyBefore === 48, false);
+eq('utána normálisan fogy', [fc[1].energyBefore, fc[2].energyBefore], [149, 148]);
+eq('gyengébb szoba csak részlegesen tölt', computeForecast(mkJobs(1), mkEtas(1, 0), {
+    initialCarry: 64, costOf: () => 1, motivationOf: () => 1, energyAt: flat(5),
+    priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 64);
+eq('alvás nélkül marad a regenerációs jóslat', computeForecast(mkJobs(1), mkEtas(1, 0), {
+    initialCarry: null, costOf: () => 1, motivationOf: () => 1, energyAt: flat(48),
+    priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 48);
+
 // Az alvás oda kerül, AHOL az energia elfogy -- addig a lista simán fut
 fc = computeForecast(mkJobs(4), mkEtas(4, 0), {
     costOf: () => 4, motivationOf: () => 1, energyAt: flat(10),
@@ -619,6 +638,19 @@ eq('a harmadik munkánál fogy el', forecastShortageIndex(fc), 2);
 eq('bőséges energiánál nincs hiány', forecastShortageIndex(
     computeForecast(mkJobs(2), mkEtas(2, 0), { costOf: () => 1, motivationOf: () => 1,
         energyAt: flat(100), priorMotivationCost: {}, motivationWarn: 75 })), -1);
+
+// A még el NEM kezdődött alvás hosszát nem szabad az ébren mért ütemmel
+// becsülni: a főkarakteren így egy 8 órás alvás "sosem ért véget", és a mögötte
+// álló munkák nyolc órával későbbre csúsztak.
+eval(extract('msUntilEnergyAtRate'));
+window.Character = { energy: 8, maxEnergy: 150 };
+const hours = (ms) => Math.round(ms / 3600000 * 10) / 10;
+eq('ébren 5/óra: 8-ról 150-re ~28,4 óra', hours(msUntilEnergyAtRate(150, 5)), 28.4);
+eq('alvás 18,75/óra: ~7,6 óra', hours(msUntilEnergyAtRate(150, 18.75)), 7.6);
+eq('a maximum fölé nem várakozunk', msUntilEnergyAtRate(999, 5), msUntilEnergyAtRate(150, 5));
+eq('elért szintre nem várunk', msUntilEnergyAtRate(8, 5), 0);
+eq('nulla ütemnél nem pörgünk', msUntilEnergyAtRate(150, 0), CONFIG.MAX_WAIT_MS);
+delete window.Character;
 
 // ============================================================
 //  Alvás: szobaválasztás és célszint
