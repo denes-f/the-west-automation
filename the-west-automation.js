@@ -48,7 +48,8 @@
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_TIMEOUT: 1500,
-        QUEUE_SIZE: 4,               // a játék saját munkasorának mérete
+        QUEUE_SIZE: 4,               // a játék saját munkasorának mérete (felfelé tanul)
+        MAX_QUEUE_SIZE: 10,          // ennél hosszabb "sort" nem hiszünk el
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
     };
@@ -246,20 +247,30 @@
         return Math.min(wait, CONFIG.MAX_WAIT_MS);
     }
 
-    // A szerver által küldött tasklista mindig felülírja a helyi becslést.
+    // A szerver által küldött tasklista mindig felülírja a helyi becslést -- de
+    // csak akkor, ha tényleg a munkasor. Bármelyik task-ablak válaszát nézzük,
+    // és egy másfajta 'tasks' mező (pl. elérhető munkák listája) elrontaná a
+    // modellt. A sorban álló munkáknak mindig van date_done-juk; ez a szűrő.
     function syncGameQueueFromResponse(resp) {
         if (!resp || !resp.tasks || typeof resp.tasks !== 'object') return false;
-        const list = Array.isArray(resp.tasks) ? resp.tasks : Object.values(resp.tasks);
-        const nowSec = serverNow() / 1000;
+        const list = (Array.isArray(resp.tasks) ? resp.tasks : Object.values(resp.tasks))
+            .filter(t => t && typeof t === 'object');
 
-        gameQueue = list.filter(t => t && typeof t === 'object').map(t => {
-            const raw = parseFloat(t.date_done);
-            return {
-                dateDone: (!isNaN(raw) && raw > 0) ? raw : nowSec + CONFIG.DEFAULT_DURATION,
-                jobId: t.jobId || t.job_id || null,
-            };
-        });
-        if (gameQueue.length > CONFIG.QUEUE_SIZE) CONFIG.QUEUE_SIZE = gameQueue.length;
+        const parsed = list.map(t => ({ dateDone: parseFloat(t.date_done), jobId: t.jobId || t.job_id || null }));
+        if (parsed.some(t => isNaN(t.dateDone) || t.dateDone <= 0)) {
+            console.warn('[Lisa] A válasz tasks mezője nem a munkasor (nincs date_done), figyelmen kívül hagyva.');
+            return false;
+        }
+        if (parsed.length > CONFIG.MAX_QUEUE_SIZE) {
+            console.warn(`[Lisa] Valószerűtlen sorhossz (${parsed.length}), figyelmen kívül hagyva.`);
+            return false;
+        }
+
+        gameQueue = parsed;
+        if (gameQueue.length > CONFIG.QUEUE_SIZE) {
+            CONFIG.QUEUE_SIZE = gameQueue.length;
+            console.log(`[Lisa] Sorméret felfelé pontosítva: ${CONFIG.QUEUE_SIZE}`);
+        }
         saveGameQueueToStorage();
         console.log(`[Lisa] Sor szinkronizálva a szerverről: ${gameQueue.length}/${CONFIG.QUEUE_SIZE}`);
         return true;
