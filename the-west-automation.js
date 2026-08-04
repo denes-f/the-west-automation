@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.1 - A látható fül dolgozik)
+// @name         The-West Modular Job Queue (Lisa v11.2 - Időpontok és gyors újraindulás)
 // @namespace   http://tampermonkey.net/
-// @version     11.1
-// @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, mennyiség max 99.
+// @version     11.2
+// @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
 // @grant       none
@@ -32,6 +32,8 @@
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         LEGACY_HISTORY: 'lisa_modular_history_v97',
         MIN_SEND_GAP: 2000,          // két egymást követő küldés között
+        WATCH_INTERVAL: 2000,        // ilyen sűrűn nézzük a játék sorát és az időpontokat
+        SLOT_FREED_DELAY: 1500,      // felszabadult slot után ennyivel indítjuk a következőt
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
         TIMER_CHUNK: 60000,          // hosszú várakozást ekkora darabokban ébresztünk
         LEADER_HEARTBEAT: 5000,
@@ -61,6 +63,7 @@
     let nextJobDeadline = 0;
     let isLeaderTab = true;
     let dialogCloseTimer = null;
+    let lastSeenQueueLen = 0;
 
     let uiPanel, uiExtraList, uiHistoryList, uiStatus, uiExtraCount, uiHistoryCount;
     let uiQueueStatus;
@@ -189,6 +192,93 @@
         if (!freeAt) return rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX);
         const wait = Math.max(0, freeAt - Date.now()) + CONFIG.SAFETY_MARGIN_MS;
         return Math.min(Math.max(wait, CONFIG.MIN_SEND_GAP), CONFIG.MAX_WAIT_MS);
+    }
+
+    // ------------------------------------------------------------
+    //  Várható kezdés / befejezés
+    // ------------------------------------------------------------
+    // A Character.calcWayTo(x, y) az AKTUÁLIS pozícióból adja meg az odajutás
+    // idejét másodpercben, de a láncoláshoz tetszőleges két pont közti idő kell.
+    // Mérésekkel ellenőrizve: az idő pontosan lineáris az euklideszi távolsággal
+    // (a másodperc/egység arány minden irányban és távolságon azonos volt), ezért
+    // az arányt futásidőben kiolvassuk egy ismert eltolással. Így a ló, a sebesség-
+    // buffok és a jövőbeli egyensúlyozás is automatikusan érvényesül, beégetett
+    // szorzó nélkül.
+    function secondsPerDistanceUnit() {
+        try {
+            const c = window.Character;
+            if (!c || typeof c.calcWayTo !== 'function') return null;
+            const p = typeof c.getPosition === 'function' ? c.getPosition() : c.position;
+            if (!p || typeof p.x !== 'number') return null;
+            const probe = c.calcWayTo(p.x + 1000, p.y);
+            if (typeof probe !== 'number' || !isFinite(probe) || probe <= 0) return null;
+            return probe / 1000;
+        } catch(e) { return null; }
+    }
+
+    function currentPosition() {
+        try {
+            const c = window.Character;
+            const p = c && (typeof c.getPosition === 'function' ? c.getPosition() : c.position);
+            return (p && typeof p.x === 'number') ? { x: p.x, y: p.y } : null;
+        } catch(e) { return null; }
+    }
+
+    // A játék sora szekvenciális: az extra munkák a jelenleg LEGKÉSŐBB végző után
+    // futnak, nem az első szabad slotnál. A lánc innen indul, onnan, ahol az a
+    // munka véget ér -- ezért kell a helyszíne is, az odautazás miatt.
+    function queueTailAnchor() {
+        const now = Date.now();
+        let tail = null;
+        if (gameReady()) {
+            for (const e of window.TaskQueue.queue) {
+                const done = e && e.data && e.data.date_done;
+                if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
+                    tail = { at: done, pos: (e.post && typeof e.post.x === 'number') ? { x: e.post.x, y: e.post.y } : null };
+                }
+            }
+        }
+        return {
+            at: tail ? Math.max(now, tail.at) : now,
+            pos: (tail && tail.pos) || currentPosition(),
+        };
+    }
+
+    // [{ id, start, finish, travelMs }] az extraJobs sorrendjében.
+    function computeEtas(jobs) {
+        const perUnit = secondsPerDistanceUnit();
+        const anchor = queueTailAnchor();
+        let at = anchor.at;
+        let pos = anchor.pos;
+
+        return jobs.map(job => {
+            let travelMs = 0;
+            if (perUnit !== null && pos && typeof job.x === 'number') {
+                travelMs = Math.hypot(job.x - pos.x, job.y - pos.y) * perUnit * 1000;
+            }
+            const start = at + travelMs;
+            const finish = start + (job.duration || 0) * 1000;
+            at = finish;
+            if (typeof job.x === 'number') pos = { x: job.x, y: job.y };
+            return { id: job.id, start, finish, travelMs, estimated: perUnit !== null };
+        });
+    }
+
+    function clockHM(ms) {
+        const d = new Date(ms);
+        return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+
+    // Több napra előre nyúló sornál a puszta óra:perc félrevezető lenne.
+    function dayOffset(ms) {
+        const a = new Date(); a.setHours(0, 0, 0, 0);
+        const b = new Date(ms); b.setHours(0, 0, 0, 0);
+        const days = Math.round((b - a) / 86400000);
+        return days > 0 ? `+${days}` : '';
+    }
+
+    function formatEta(eta) {
+        return `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
     }
 
     // A játék saját add-ját hívjuk, nem nyers XHR-t. Így a hash, a slotkezelés
@@ -735,6 +825,29 @@
         if (isLeaderTab) ensureProcessing();
     }
 
+    // A játék sora kívülről is rövidülhet: lejár egy munka, vagy a felhasználó
+    // megszakít egyet. Ilyenkor nem várjuk ki a korábban beütemezett -- akár
+    // percekben mért -- várakozást, hanem pár másodpercen belül indítjuk a
+    // következőt. Kizárólag a sorhossz CSÖKKENÉSÉRE lépünk, így ha a játék
+    // mégis elutasítaná az indítást, nem kezdünk el kétmásodpercenként próbálkozni.
+    function watchGameQueue() {
+        updateQueueBadge();
+        updateExtraEtas();
+
+        const len = gameQueueLength();
+        const dropped = len < lastSeenQueueLen;
+        lastSeenQueueLen = len;
+
+        if (!dropped || paused || !isLeaderTab || processing) return;
+        if (extraJobs.length === 0 || freeSlots() <= 0) return;
+
+        const soon = Date.now() + CONFIG.SLOT_FREED_DELAY;
+        if (!nextJobTimer || nextJobDeadline > soon) {
+            console.log(`[Lisa] Slot szabadult (${len}/${gameQueueLimit()}), indítás hamarosan.`);
+            scheduleNextJob(CONFIG.SLOT_FREED_DELAY);
+        }
+    }
+
     function releaseLeadership() {
         try {
             const raw = localStorage.getItem(CONFIG.STORAGE_LEADER);
@@ -982,6 +1095,13 @@
                 margin-left: 6px;
                 border-radius: 3px;
             }
+            .lisa-eta {
+                font-size: 10px;
+                color: #a99372;
+                white-space: nowrap;
+                margin-left: 4px;
+                font-variant-numeric: tabular-nums;
+            }
             .lisa-job-name {
                 flex-grow: 1;
                 margin-right: 10px;
@@ -1104,11 +1224,15 @@
         uiExtraList.textContent = '';
         extraJobs.forEach(job => {
             const li = document.createElement('li');
+            li.dataset.id = job.id;
 
             const nameEl = document.createElement('span');
             nameEl.className = 'lisa-job-name';
-            nameEl.textContent = `${job.jobName} (ID:${job.jobId})`;
+            nameEl.textContent = job.jobName;
             nameEl.title = `${job.jobName} — ID:${job.jobId}, x:${job.x}, y:${job.y}, ${formatDuration(job.duration)}`;
+
+            const etaEl = document.createElement('span');
+            etaEl.className = 'lisa-eta';
 
             const removeEl = document.createElement('span');
             removeEl.className = 'remove';
@@ -1117,10 +1241,32 @@
             removeEl.addEventListener('click', () => removeExtraJobById(job.id));
 
             li.appendChild(nameEl);
+            li.appendChild(etaEl);
             li.appendChild(removeEl);
             uiExtraList.appendChild(li);
         });
         if (uiExtraCount) uiExtraCount.textContent = extraJobs.length;
+        updateExtraEtas();
+    }
+
+    // Csak az időpont-szövegeket írja át, a sorokat nem építi újra: így percenként
+    // sokszor frissülhet anélkül, hogy a listát folyamatosan újrarajzolnánk.
+    function updateExtraEtas() {
+        if (!uiExtraList) return;
+        const etas = computeEtas(extraJobs);
+        etas.forEach((eta, i) => {
+            const li = uiExtraList.children[i];
+            if (!li || li.dataset.id !== eta.id) return;
+            const el = li.querySelector('.lisa-eta');
+            if (!el) return;
+            el.textContent = formatEta(eta);
+            const job = extraJobs[i];
+            el.title = eta.travelMs >= 1000
+                ? `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — út: ${formatDuration(eta.travelMs / 1000)}, munka: ${formatDuration(job.duration)}`
+                : `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — munka: ${formatDuration(job.duration)}`;
+            // Becslés jelzése, ha az utazási idő nem volt kiszámítható.
+            el.style.opacity = eta.estimated ? '1' : '0.55';
+        });
     }
 
     function updateHistoryList() {
@@ -1244,8 +1390,9 @@
             : 'Passzív fül – egy másik, látható fül dolgozza fel a sort.');
         initAmountPatch();
         // A játék sora kívülről is változik (munka lejár, a felhasználó megszakít),
-        // ezért a jelzőt periodikusan frissítjük.
-        setInterval(updateQueueBadge, 2000);
+        // ezért rendszeresen ránézünk.
+        lastSeenQueueLen = gameQueueLength();
+        setInterval(watchGameQueue, CONFIG.WATCH_INTERVAL);
         if (extraJobs.length > 0) ensureProcessing();
     }
 
@@ -1267,5 +1414,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.1 betöltve.');
+    console.log('[Lisa] Modular v11.2 betöltve.');
 })();

@@ -51,6 +51,7 @@ const updateUI = () => {};
 const updateExtraList = () => {};
 const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
+const updateExtraEtas = () => {};
 const ensureProcessing = () => {};
 const scheduleNextJob = (ms) => { scheduled = ms; nextJobTimer = 1; };
 const generateId = (() => { let n = 0; return () => 'id' + (++n); })();
@@ -211,6 +212,113 @@ setLeader({ id: 'masik', ts: Date.now(), visible: true });
 releaseLeadership();
 eq('másét nem törli', getLeader().id, 'masik');
 
+
+
+// ============================================================
+//  Várható kezdés/befejezés láncolása
+// ============================================================
+console.log('\n=== Időpontbecslés ===');
+// A játékban mérve: az idő pontosan lineáris az euklideszi távolsággal,
+// 0.017647 mp/egység. A calcWayTo az AKTUÁLIS pozícióból számol.
+const SEC_PER_UNIT = 0.017647;
+let charPos = { x: 0, y: 0 };
+global.Character = {
+    getPosition: () => charPos,
+    calcWayTo: (x, y) => Math.hypot(x - charPos.x, y - charPos.y) * SEC_PER_UNIT,
+};
+window.Character = global.Character;
+eval(['secondsPerDistanceUnit','currentPosition','queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta']
+     .map(extract).join('\n'));
+
+eq('mp/egység a calcWayTo-ból származik', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
+
+// Üres játéksor: a lánc mostantól és a karakter pozíciójától indul
+window.TaskQueue = { queue: [], limit: { normal: 4, premium: 9 } };
+charPos = { x: 0, y: 0 };
+const t0 = Date.now();
+let etas = computeEtas([
+    { id: 'a', x: 1000, y: 0, duration: 60 },     // 17.647 mp út, 60 mp munka
+    { id: 'b', x: 1000, y: 0, duration: 30 },     // ugyanott: 0 út
+]);
+eq('1. munka utazási ideje', Math.round(etas[0].travelMs / 1000), 18);
+eq('1. munka hossza', Math.round((etas[0].finish - etas[0].start) / 1000), 60);
+eq('2. munka az 1. után indul (nincs út)', Math.round((etas[1].start - etas[0].finish) / 1000), 0);
+eq('2. munka hossza', Math.round((etas[1].finish - etas[1].start) / 1000), 30);
+
+// A távolság az ELŐZŐ munkától számít, nem a karaktertől
+etas = computeEtas([
+    { id: 'a', x: 1000, y: 0, duration: 0 },
+    { id: 'b', x: 3000, y: 0, duration: 0 },      // 2000 egység az előzőtől
+]);
+eq('a 2. utazása az előző helyszínétől', Math.round(etas[1].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
+
+// Nem üres játéksor: a lánc a LEGKÉSŐBB végző munka után és onnan indul
+const future = Date.now() + 600000;
+window.TaskQueue.queue = [
+    { data: { date_done: Date.now() + 60000 }, post: { x: 500, y: 0 } },
+    { data: { date_done: future },             post: { x: 2000, y: 0 } },   // ez a "farok"
+    { data: { date_done: Date.now() + 120000 }, post: { x: 900, y: 0 } },
+];
+etas = computeEtas([{ id: 'a', x: 2000, y: 0, duration: 120 }]);
+eq('a lánc a legkésőbbi végénél kezdődik', Math.round((etas[0].start - future) / 1000), 0);
+etas = computeEtas([{ id: 'a', x: 4000, y: 0, duration: 0 }]);
+eq('utazás a farok helyszínéről', Math.round(etas[0].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
+
+// Lejárt sor: a múltbeli date_done nem tolja vissza a becslést
+window.TaskQueue.queue = [{ data: { date_done: Date.now() - 999999 }, post: { x: 0, y: 0 } }];
+etas = computeEtas([{ id: 'a', x: 0, y: 0, duration: 60 }]);
+eq('múltbeli befejezés nem húz vissza', etas[0].start >= Date.now() - 1000, true);
+
+// calcWayTo nélkül is ad becslést, csak utazás nélkül
+const savedChar = global.Character;
+global.Character = undefined; window.Character = undefined;
+window.TaskQueue.queue = [];
+etas = computeEtas([{ id: 'a', x: 9999, y: 9999, duration: 60 }]);
+eq('calcWayTo nélkül nincs utazás', etas[0].travelMs, 0);
+eq('és jelezzük, hogy nem teljes a becslés', etas[0].estimated, false);
+global.Character = savedChar; window.Character = savedChar;
+
+// Formázás
+const base = new Date(); base.setHours(9, 5, 0, 0);
+eq('rövid óra:perc alak', formatEta({ start: base.getTime(), finish: base.getTime() + 3600000 }), '09:05→10:05');
+const tomorrow = base.getTime() + 26 * 3600000;
+eq('másnapi vég jelölve', formatEta({ start: base.getTime(), finish: tomorrow }).endsWith('+1'), true);
+
+
+// ============================================================
+//  Külső megszakításra gyors reagálás
+// ============================================================
+console.log('\n=== Slot-figyelő ===');
+CONFIG.SLOT_FREED_DELAY = 1500;
+eval(extract('watchGameQueue'));
+
+function watchCase(o) {
+    window.TaskQueue = { queue: new Array(o.len).fill(0).map(() => ({ data: { date_done: Date.now() + 60000 } })),
+                         limit: { normal: 4, premium: 9 } };
+    lastSeenQueueLen = o.lastSeen;
+    extraJobs = o.waiting ? mkJobs(o.waiting) : [];
+    paused = !!o.paused; isLeaderTab = o.leader !== false; processing = !!o.processing;
+    nextJobTimer = o.pendingTimer ? 1 : null;
+    nextJobDeadline = o.deadlineInMs ? Date.now() + o.deadlineInMs : 0;
+    scheduled = null;
+    watchGameQueue();
+    return scheduled;
+}
+
+eq('sor rövidült -> hamarosan indít', watchCase({ len: 3, lastSeen: 4, waiting: 2 }), 1500);
+eq('változatlan sor -> nem piszkál', watchCase({ len: 4, lastSeen: 4, waiting: 2 }), null);
+eq('növekvő sor -> nem piszkál', watchCase({ len: 4, lastSeen: 3, waiting: 2 }), null);
+eq('nincs várakozó munka -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 0 }), null);
+eq('tele a sor -> nem indít', watchCase({ len: 4, lastSeen: 5, waiting: 2 }), null);
+eq('szüneteltetve -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, paused: true }), null);
+eq('passzív fül -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, leader: false }), null);
+eq('épp fut egy kör -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, processing: true }), null);
+eq('hosszú várakozást megelőz', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 300000 }), 1500);
+eq('közelebbi időzítőt nem tol el', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 500 }), null);
+// Elutasítás után ne kezdjen kétmásodpercenként próbálkozni: második hívás már nem indít
+watchCase({ len: 3, lastSeen: 4, waiting: 2 });
+eq('ismételt hívás új csökkenés nélkül csendes', (scheduled = null, watchGameQueue(), scheduled), null);
+paused = false; isLeaderTab = true; processing = false;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
