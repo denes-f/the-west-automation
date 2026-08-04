@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.5)
+// @name         The-West Modular Job Queue (Lisa v12.6)
 // @namespace   http://tampermonkey.net/
-// @version     12.5
+// @version     12.6
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -598,7 +598,12 @@
         bar.style.color = cs.color;
         bar.style.textAlign = cs.textAlign;
         bar.style.top = forecastBarTop(real, bar, container) + 'px';
-        bar.style.opacity = '0.72';
+        // A sprite üres része ÁTLÁTSZÓ: háttér nélkül a sáv alacsony energiánál
+        // gyakorlatilag eltűnt a térkép fölött. A játék sávjai a keretben ülnek,
+        // ezért ott ez nem látszik -- a miénk a kereten kívülre lóg, kell a vályú.
+        bar.style.backgroundColor = 'rgba(20,14,8,0.55)';
+        bar.style.boxShadow = 'inset 0 0 0 1px rgba(0,0,0,0.65)';
+        bar.style.opacity = '0.85';
         bar.style.cursor = 'help';
         return bar;
     }
@@ -628,7 +633,9 @@
         bar.title = `Várható energia a lista végén (${extraJobs.length} munka után): ${value}`
             + (value < 0 ? `\nEnnyi energia nem lesz meg – ${-value} hiányzik.` : '');
         // Ha a lista elfogyasztaná az összes energiát, az szembetűnő legyen.
-        bar.style.boxShadow = value <= 0 ? 'inset 0 0 0 1px #a03020' : '';
+        bar.style.boxShadow = value <= 0
+            ? 'inset 0 0 0 1px #a03020'
+            : 'inset 0 0 0 1px rgba(0,0,0,0.65)';
     }
 
     function forecastForExtraQueue(jobs, etas) {
@@ -806,6 +813,56 @@
         if (extraJobs.some(j => j.taskType === 'sleep')) return;
         sleepOffer = { needed: neededEnergy, at: atIndex || 0 };
         renderSleepOffer();
+        showSleepDialog(sleepOffer);
+    }
+
+    // A panelbe írt kérdést könnyű nem észrevenni, ezért a játék SAJÁT
+    // párbeszédablakát is felhozzuk: az középen jelenik meg, a játék kinézetével.
+    // A szöveg sima szöveg -- a Dialog escape-eli a HTML-t, a <br /> szó szerint
+    // jelenne meg (élesben ellenőrizve).
+    function showSleepDialog(offer) {
+        if (!offer || offer.dialogShown) return false;
+        try {
+            if (!window.west || !west.gui || typeof west.gui.Dialog !== 'function') return false;
+            const at = offer.at || 0;
+            const msg = at > 0
+                ? `A(z) ${at + 1}. munkára elfogy az energia (${offer.needed} kellene). `
+                  + 'Beszúrjak elé egy alvást a legjobb ingyenes szobába?'
+                : `Nincs elég energia a következő munkához (${offer.needed} kellene). `
+                  + 'Beszúrjak egy alvást a sor elejére?';
+
+            let answered = false;
+            const dlg = new west.gui.Dialog('Alvás beszúrása?', msg, west.gui.Dialog.SYS_QUESTION)
+                .addButton('yes', () => {
+                    answered = true;
+                    const i = at;
+                    dismissSleepOffer(false);
+                    insertSleepJob(i);
+                })
+                .addButton('no', () => {
+                    answered = true;
+                    dismissSleepOffer(true);
+                })
+                .show();
+            offer.dialogShown = true;
+
+            // Ha a felhasználó a ✕-szel zárja be, az sem maradhat válasz nélkül:
+            // különben a felajánlás örökre "függőben" ragadna, és soha többé nem
+            // kérdeznénk. A bezárást az elem eltűnéséből vesszük észre.
+            const main = typeof dlg.getMainDiv === 'function' ? dlg.getMainDiv() : null;
+            const el = main && main.jquery ? main[0] : main;
+            if (el) {
+                const timer = setInterval(() => {
+                    if (el.isConnected) return;
+                    clearInterval(timer);
+                    if (!answered) dismissSleepOffer(true);
+                }, 1000);
+            }
+            return true;
+        } catch(e) {
+            console.warn('[Lisa] Az alvás-párbeszéd nem jelent meg, marad a panelbeli kérdés:', e);
+            return false;
+        }
     }
 
     // A felajánlást az ELŐREJELZÉS is kiváltja, nem csak az, hogy a soron
@@ -2545,5 +2602,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.5 betöltve.');
+    console.log('[Lisa] Modular v12.6 betöltve.');
 })();

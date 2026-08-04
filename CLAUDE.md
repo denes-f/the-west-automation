@@ -11,7 +11,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.5.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.6.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -249,6 +249,23 @@ Two traps when injecting a bar of your own here, both hit in v12.4:
   *twdb* script inserts `.twdb_charcont_ext` with a `#duelmot_bar` right below the energy bar and
   grows the container to 191 px. Position below the **lowest** bar actually present, excluding your
   own element, or the two overlap (and including your own makes it walk down the screen).
+- The sprite's **unfilled part is transparent**, not a drawn empty bar. The game's own bars sit
+  inside the wooden frame so this never shows, but a bar hanging below the frame disappears against
+  the map at low values. Give an injected bar its own dark track (`background-color` + inset
+  shadow).
+
+### Dialogs
+
+`new west.gui.Dialog(title, msg, west.gui.Dialog.SYS_QUESTION)` → `.addButton('yes', cb)`
+`.addButton('no', cb)` → `.show()`. The strings `yes`/`no`/`ok`/`cancel`/`submit`/`change` are
+**keys the game localises itself** (`yes` → "Igen"); any other string is used verbatim. Icons:
+`SYS_WARNING`, `SYS_USERERROR`, `SYS_OK`, `SYS_QUESTION`. A callback returning `false` keeps the
+dialog open. It renders centred in the game's own style and does not block the game.
+
+**The message is escaped** — verified live, a `<br />` shows up as literal text. Pass plain text,
+or a jQuery element if markup is genuinely needed. Also watch for the ✕: a dialog closed without
+pressing a button never fires a callback, so poll `getMainDiv()` for detachment if a pending flag
+needs clearing.
 
 ### Map quick-start arrows
 
