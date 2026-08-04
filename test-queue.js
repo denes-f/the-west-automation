@@ -512,6 +512,21 @@ eq('a válasznál rövidebb köteg nem indexel túl',
    rejectedFromAddResponse([b3[0]], { tasks: [okEntry, { error: true, msg: 'x' }] }).length, 0);
 eq('üres kötegre üres', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
 
+// A visszatartás duplázódik: az energiahiány órás nagyságrendű, fix 20 mp-es
+// újrapróbálással a munka percek alatt elfogyasztaná a próbálkozásait.
+CONFIG.REJECT_BACKOFF_MS = 20000; CONFIG.REJECT_BACKOFF_MAX = 600000; CONFIG.MAX_REJECTIONS = 10;
+eval(extract('rejectBackoffMs'));
+eq('első elutasítás után 20 mp', rejectBackoffMs(1), 20000);
+eq('másodszor duplázva', rejectBackoffMs(2), 40000);
+eq('ötödször 5 perc 20', rejectBackoffMs(5), 320000);
+eq('a felső korlát 10 perc', rejectBackoffMs(9), 600000);
+eq('nulla/hiányzó érték is legalább egy kör', rejectBackoffMs(0), 20000);
+// A tíz próbálkozás összesen több mint egy órát fed le -- egy energiahiányos
+// munka (3 energia/óra regeneráció) így kivárja, amíg indíthatóvá válik.
+const totalWait = Array.from({length: CONFIG.MAX_REJECTIONS}, (_, i) => rejectBackoffMs(i + 1))
+    .reduce((a, b) => a + b, 0);
+eq('a próbálkozások együtt > 1 óra', totalWait > 3600000, true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 })();

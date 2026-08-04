@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 125 assertions, no dependencies.
+  name and runs them against stubs. 131 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `125 passed, 0 failed`.
+2. `node test-queue.js` should print `131 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -270,7 +270,7 @@ and "Nem" correctly does nothing.
   XHR interceptor pairs the response's `tasks[i]` with it — matching by jobId+duration so a
   concurrent user-initiated start can't be mistaken for ours — and puts rejected jobs back at the
   **front** of the list, in order. They are **not** dropped after a couple of tries: the most
-  common cause (not enough energy) passes by itself, so it retries slowly (`REJECT_BACKOFF_MS`)
+  common cause (not enough energy) passes by itself, so it retries on a doubling backoff (20 s → 10 min, over an hour in total)
   and only gives up after `MAX_REJECTIONS`, always showing the server's own message.
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
   display/machine sleeping — re-requested on `visibilitychange`, since the browser releases it when

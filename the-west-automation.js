@@ -23,7 +23,8 @@
         MAX_RETRIES: 5,              // ennyi hiba után a munka a sor végére kerül
         MAX_DEFERRALS: 2,            // ennyi sikertelen kör után eldobjuk
         MAX_REJECTIONS: 10,          // ennyi SZERVEROLDALI elutasítás után adjuk fel
-        REJECT_BACKOFF_MS: 20000,    // elutasítás után ennyit várunk az újrapróbálással
+        REJECT_BACKOFF_MS: 20000,    // az első elutasítás után ennyit várunk
+        REJECT_BACKOFF_MAX: 600000,  // ...majd duplázva, legfeljebb ennyit
         ADD_RESPONSE_TTL: 20000,     // ennél régebbi köteghez már nem párosítunk választ
         IDLE_RESCHEDULE: 5000,       // vészfék: ha egy ág elfelejtene időzítőt állítani
         // Verziófüggetlen kulcsok: a verziószám a tartalomban van, nem a kulcsban,
@@ -890,6 +891,16 @@
     // Nem dobjuk el őket néhány próbálkozás után: a leggyakoribb ok (nincs elég
     // energia) magától elmúlik, csak várni kell rá. Ezért lassan próbálkozunk
     // újra, a szerver üzenetét pedig kiírjuk, hogy látszódjon az OK.
+    // Duplázódó várakozás. Az energiahiány a leggyakoribb ok, és az energia
+    // óránként csak néhány pontot regenerálódik: fix 20 másodperces újrapróbálás
+    // mellett a munka percek alatt elfogyasztaná a próbálkozásait, és feladnánk
+    // egy olyan munkát, ami húsz perc múlva simán elindulna. Így a tíz
+    // próbálkozás összesen több mint egy órát fog át.
+    function rejectBackoffMs(rejections) {
+        const n = Math.max(1, rejections || 1);
+        return Math.min(CONFIG.REJECT_BACKOFF_MS * Math.pow(2, n - 1), CONFIG.REJECT_BACKOFF_MAX);
+    }
+
     function requeueRejected(rejected) {
         if (!rejected.length) return;
         const keep = [], dropped = [];
@@ -908,12 +919,14 @@
         const first = rejected[0];
         const reason = (first.msg || 'a szerver nem fogadta el').replace(/<[^>]*>/g, '').slice(0, 90);
         console.warn(`[Lisa] A szerver ${rejected.length} munkát utasított vissza: ${reason}`);
-        updateUIStatus(dropped.length
-            ? `${dropped.length} munka feladva – ${reason}`
-            : `${keep.length} munka visszakerült a sorba – ${reason}`);
 
-        // Lassú újrapróbálkozás: energiahiánynál a gyors pörgetés értelmetlen.
-        if (keep.length && !paused && isLeaderTab) scheduleNextJob(CONFIG.REJECT_BACKOFF_MS);
+        if (!keep.length) {
+            updateUIStatus(`${dropped.length} munka feladva – ${reason}`);
+            return;
+        }
+        const waitMs = rejectBackoffMs(Math.max(...keep.map(j => j.rejections)));
+        updateUIStatus(`${keep.length} munka visszakerült a sorba, újra ~${formatDuration(waitMs / 1000)} múlva – ${reason}`);
+        if (!paused && isLeaderTab) scheduleNextJob(waitMs);
     }
 
     // A játék add-válasza. Csak akkor nyúlunk hozzá a listához, ha a kérés
