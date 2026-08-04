@@ -74,7 +74,7 @@
     let observedHost = null;
 
     let uiExtraList, uiStatus, uiExtraCount, uiEmpty, uiPauseBtn;
-    let uiQueueStatus;
+    let uiQueueStatus, uiTotalEta;
 
     const OriginalXHR = window.XMLHttpRequest;
 
@@ -85,12 +85,15 @@
     const generateId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const TAB_ID = generateId();
 
+    // Egy percnél hosszabb időt sosem másodpercben mutatunk: a "~400 mp" olvashatatlan.
+    // A perc FELFELÉ kerekít, mert a várakozásnál a "még 1 p" hasznosabb, mint a "0 p".
     function formatDuration(seconds) {
         const s = Math.max(0, Math.round(seconds || 0));
         if (s < 60) return `${s} mp`;
-        if (s < 3600) return `${Math.round(s / 60)} p`;
-        const h = Math.floor(s / 3600);
-        const m = Math.round((s % 3600) / 60);
+        const min = Math.ceil(s / 60);
+        if (min < 60) return `${min} p`;
+        const h = Math.floor(min / 60);
+        const m = min % 60;
         return m ? `${h} ó ${m} p` : `${h} ó`;
     }
 
@@ -332,15 +335,24 @@
                 text-align: center;
                 text-shadow: 0 1px 0 rgba(255,255,255,0.45);
             }
+            /* A "+N" NEM külön sorban áll, hanem az utolsó megjelenített munka
+               helyén, egy munkacsempe méretében -- így a sor-UI egy sorral
+               alacsonyabb. A .task osztály hozza a játék csempeméretét, a
+               min-width/height csak biztonsági háló, ha az mégis elmaradna. */
             #queuedTasks .lisa-pending-more {
-                display: block;
-                clear: both;
-                font: bold 11px 'Georgia','Times New Roman',serif;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 112px; min-height: 67px;
+                box-sizing: border-box;
+                vertical-align: top;
+                cursor: pointer;
+                font: bold 12px 'Georgia','Times New Roman',serif;
                 color: #4a3b28;
-                padding: 2px 4px 1px;
                 text-align: center;
                 text-shadow: 0 1px 0 rgba(255,255,255,0.45);
             }
+            #queuedTasks .lisa-pending-more:hover { color: #1e160e; }
         `;
         document.head.appendChild(st);
     }
@@ -432,6 +444,14 @@
         return item;
     }
 
+    // Hány munkasor látszik és mennyi marad a "+N" csempére. Ha minden kifér, nincs
+    // csempe; ha nem, akkor a csempe az UTOLSÓ hely(!) -- vagyis eggyel kevesebb
+    // munka látszik, cserébe nem kell neki külön sor.
+    function previewSplit(total, preview) {
+        if (total <= preview) return { shown: total, hidden: 0 };
+        return { shown: preview - 1, hidden: total - (preview - 1) };
+    }
+
     function renderPendingInGameQueue() {
         injectPendingStyles();
         const host = pendingHost();
@@ -442,8 +462,9 @@
             return;
         }
 
-        const shown = extraJobs.slice(0, CONFIG.GAME_QUEUE_PREVIEW);
-        const hidden = extraJobs.length - shown.length;
+        const split = previewSplit(extraJobs.length, CONFIG.GAME_QUEUE_PREVIEW);
+        const shown = extraJobs.slice(0, split.shown);
+        const hidden = split.hidden;
         // A figyelő 2 mp-enként hív. Csak akkor építünk újra, ha változott a lista,
         // vagy ha a játék újrarajzolása közben eltűntek a soraink (öngyógyítás).
         const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}`;
@@ -462,9 +483,17 @@
 
         if (hidden > 0) {
             const more = document.createElement('span');
-            more.className = 'lisa-pending-more';
-            more.textContent = `+${hidden} további munka`;
-            more.title = `${hidden} további munka a listában`;
+            // A 'task' hozza a játék csempeméretét, hogy a "+N" pont egy munkahelyre
+            // üljön. Kattintásra a saját panel jön elő -- ott a teljes lista látszik.
+            more.className = 'task lisa-pending lisa-pending-more';
+            more.textContent = `+${hidden}`;
+            more.title = `${hidden} további munka a listában – kattints a teljes listáért`;
+            // A .middle közvetlen click-kezelője elől ezt is elzárjuk (lásd fentebb).
+            more.addEventListener('click', (e) => {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                showLisaPanel();
+            }, true);
             host.appendChild(more);
         }
     }
@@ -962,7 +991,7 @@
             }
             if (freeSlots() <= 0) {
                 const waitMs = waitUntilFreeSlotMs();
-                updateUIStatus(`Sor tele (${gameQueueLength()}/${gameQueueLimit()}) – ~${Math.round(waitMs / 1000)} mp`);
+                updateUIStatus(`Sor tele (${gameQueueLength()}/${gameQueueLimit()}) – ~${formatDuration(waitMs / 1000)}`);
                 scheduleNextJob(waitMs);
                 return;
             }
@@ -992,7 +1021,7 @@
                     scheduleNextJob(rand(CONFIG.MIN_SEND_GAP, CONFIG.MIN_SEND_GAP + 1000));
                 } else {
                     const waitMs = waitUntilFreeSlotMs();
-                    updateUIStatus(`${accepted} elindítva, még ${extraJobs.length} – következő slot ~${Math.round(waitMs / 1000)} mp múlva`);
+                    updateUIStatus(`${accepted} elindítva, még ${extraJobs.length} – következő slot ~${formatDuration(waitMs / 1000)} múlva`);
                     scheduleNextJob(waitMs);
                 }
                 return;
@@ -1003,7 +1032,7 @@
             job.retries = (job.retries || 0) + 1;
             const waitMs = waitUntilFreeSlotMs();
             console.warn(`[Lisa] A játék nem fogadta el: ${job.jobName} (${job.retries}. próba)`);
-            updateUIStatus(`${job.jobName} nem indult el – újra ~${Math.round(waitMs / 1000)} mp múlva (${job.retries})`);
+            updateUIStatus(`${job.jobName} nem indult el – újra ~${formatDuration(waitMs / 1000)} múlva (${job.retries})`);
 
             // Ha sokadszorra sem megy és van más munka is, adjunk esélyt a többinek.
             if (job.retries > CONFIG.MAX_RETRIES && extraJobs.length > 1) {
@@ -1238,7 +1267,17 @@
         st.id = 'lisa-panel-style';
         st.textContent = `
             #lisa-body { display: flex; flex-direction: column; height: 100%; font-family: Georgia,'Times New Roman',serif; }
-            #lisa-status { font: italic 11px Georgia,serif; color: #4a3b28; padding: 1px 4px 3px; flex: 0 0 auto; }
+            /* A státuszsor két részre oszlik: balra az üzenet, jobbra a teljes lista
+               várható vége. Így az összesítés nem eszik el egy újabb sornyi magasságot. */
+            #lisa-status {
+                display: flex; align-items: baseline; gap: 6px; flex: 0 0 auto;
+                font: italic 11px Georgia,serif; color: #4a3b28; padding: 1px 20px 3px 4px;
+            }
+            #lisa-status-text { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #lisa-total-eta {
+                flex: 0 0 auto; font-style: normal; font-weight: bold; color: #3b2f1e;
+                font-variant-numeric: tabular-nums; white-space: nowrap;
+            }
             /* A keret bal és jobb oldalán sötét széldísz fut. A listát beljebb húzzuk,
                hogy se a szöveg, se az eltávolító ✕ ne lógjon rá. */
             #lisa-scroll {
@@ -1312,7 +1351,10 @@
 
         el.innerHTML = `
             <div id="lisa-body">
-                <div id="lisa-status">Inicializálás...</div>
+                <div id="lisa-status">
+                    <span id="lisa-status-text">Inicializálás...</span>
+                    <span id="lisa-total-eta"></span>
+                </div>
                 <div id="lisa-scroll"><ul id="lisa-extra-list"></ul><div id="lisa-empty"></div></div>
                 <div id="lisa-toolbar">
                     <button id="lisa-pause-btn" title="Szünet / Folytatás">Szünet</button>
@@ -1321,7 +1363,8 @@
                 </div>
             </div>`;
 
-        uiStatus = el.querySelector('#lisa-status');
+        uiStatus = el.querySelector('#lisa-status-text');
+        uiTotalEta = el.querySelector('#lisa-total-eta');
         uiExtraList = el.querySelector('#lisa-extra-list');
         uiExtraCount = el.querySelector('#lisa-extra-count');
         uiQueueStatus = el.querySelector('#lisa-queue-status');
@@ -1438,11 +1481,34 @@
         renderPendingInGameQueue();
     }
 
+    // A státuszsor jobb szélén a TELJES lista várható vége: a lánc utolsó munkájának
+    // befejezése. Ez a leggyakoribb kérdés ("mikorra végez az egész?"), és az
+    // egyenkénti időpontokból fejben összeadni nem lehet -- az utazás is benne van.
+    function updateTotalEta(etas) {
+        if (!uiTotalEta) return;
+        if (!etas.length) {
+            uiTotalEta.textContent = '';
+            uiTotalEta.title = '';
+            return;
+        }
+        const last = etas[etas.length - 1];
+        uiTotalEta.textContent = `Vége ${clockHM(last.finish)}${dayOffset(last.finish)}`;
+        const workSec = extraJobs.reduce((s, j) => s + (j.duration || 0), 0);
+        const travelSec = etas.reduce((s, e) => s + e.travelMs / 1000, 0);
+        uiTotalEta.title =
+            `A teljes lista (${extraJobs.length} munka) várható vége: ${clockHM(last.finish)}${dayOffset(last.finish)}\n`
+            + `Hátralévő idő: ${formatDuration((last.finish - Date.now()) / 1000)}\n`
+            + `Ebből munka: ${formatDuration(workSec)}, út: ${formatDuration(travelSec)}`;
+        // Ha az utazási idő nem volt kiszámítható, a becslés hiányos -- jelezzük.
+        uiTotalEta.style.opacity = last.estimated ? '1' : '0.55';
+    }
+
     // Csak az időpont-szövegeket írja át, a sorokat nem építi újra: így percenként
     // sokszor frissülhet anélkül, hogy a listát folyamatosan újrarajzolnánk.
     function updateExtraEtas() {
         if (!uiExtraList) return;
         const etas = computeEtas(extraJobs);
+        updateTotalEta(etas);
         etas.forEach((eta, i) => {
             const li = uiExtraList.children[i];
             if (!li || li.dataset.id !== eta.id) return;

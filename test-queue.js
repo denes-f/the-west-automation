@@ -64,7 +64,7 @@ console.log = quiet; console.warn = quiet; console.error = quiet;
 
 eval([
     'gameReady', 'gameQueueLength', 'gameQueueLimit', 'freeSlots', 'nextFreeAtMs',
-    'waitUntilFreeSlotMs', 'startJobsViaGame', 'addExtraJobs',
+    'waitUntilFreeSlotMs', 'startJobsViaGame', 'addExtraJobs', 'formatDuration',
 ].map(extract).join('\n'));
 eval(extract('processQueue'));
 console.log = real;
@@ -437,6 +437,34 @@ eq('a státusz megmondja, mennyit törölt', /5 várakozó/.test(statusText), tr
 statusText = '';
 clearExtraAfterCancelAll();
 eq('üres listánál nincs üzenet', statusText, '');
+
+// ============================================================
+//  Barátságos időkiírás (a státuszsor korábban "~400 mp"-et mutatott)
+// ============================================================
+console.log('\n=== Időtartam-formázás ===');
+// A formatDuration-t a processQueue miatt már fent kiemeltük.
+eq('egy perc alatt másodperc marad', formatDuration(45), '45 mp');
+eq('pont egy perc', formatDuration(60), '1 p');
+eq('400 mp -> felfelé kerekített perc', formatDuration(400), '7 p');
+eq('59 mp-cel több perc is felkerekít', formatDuration(61), '2 p');
+eq('59 perc még perc', formatDuration(3540), '59 p');
+eq('pont egy óra', formatDuration(3600), '1 ó');
+eq('óra és perc', formatDuration(3600 + 400), '1 ó 7 p');
+eq('kerek óra nem ír 0 percet', formatDuration(7200), '2 ó');
+eq('hosszú lista összege', formatDuration(24 * 900), '6 ó');
+eq('nulla', formatDuration(0), '0 mp');
+
+// ============================================================
+//  A "+N" csempe az utolsó munkahelyre ül (nem külön sorba)
+// ============================================================
+console.log('\n=== Játékbeli előnézet felosztása ===');
+eval(extract('previewSplit'));
+eq('kevesebb, mint a keret: minden látszik', previewSplit(3, 6), { shown: 3, hidden: 0 });
+eq('pont annyi: még mindig nincs csempe', previewSplit(6, 6), { shown: 6, hidden: 0 });
+eq('eggyel több: 5 munka + "+2"', previewSplit(7, 6), { shown: 5, hidden: 2 });
+eq('sok munka: 5 munka + "+20"', previewSplit(25, 6), { shown: 5, hidden: 20 });
+eq('a csempe mindig a maradékot mondja',
+   (s => s.shown + s.hidden)(previewSplit(25, 6)), 25);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
