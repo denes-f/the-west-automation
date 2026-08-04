@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.1)
+// @name         The-West Modular Job Queue (Lisa v12.2)
 // @namespace   http://tampermonkey.net/
-// @version     12.1
+// @version     12.2
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -55,6 +55,11 @@
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
         KEEP_AWAKE: true,            // képernyőzár és fülfagyasztás elleni védelem
+        MOTIVATION_WARN: 75,         // ekkora (vagy kisebb) motivációnál figyelmeztetünk
+        JOB_INFO_TTL: 300000,        // ennyi ideig hisszük el a motivációt/energiaköltséget
+        AUTO_SLEEP: true,            // energiahiánynál felajánljuk az alvást
+        SLEEP_DECLINE_MS: 1800000,   // "Nem" után ennyi ideig nem kérdezünk újra
+        SLEEP_REGEN_ESTIMATE: 0.125, // csak a KIJELZETT alvásidő becsléséhez (mért érték)
         JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
         GAME_QUEUE_PREVIEW: 6,       // ennyi várakozó munka látszik a játék sorában
     };
@@ -75,6 +80,7 @@
     let dialogCloseTimer = null;
     let lastSeenQueueLen = 0;
     let inFlightBatch = null;        // amit épp átadtunk a játéknak, a válaszig
+    let lastForecast = [];           // munkánkénti energia/motiváció előrejelzés
     let renderedPendingKey = '';
     let pendingObserver = null;
     let observedHost = null;
@@ -154,14 +160,17 @@
         }
         return Object.keys(byIdx)
             .sort((a, b) => a - b)
-            .map(i => ({
-                jobId: parseInt(byIdx[i].jobId, 10),
-                x: parseInt(byIdx[i].x, 10) || 0,
-                y: parseInt(byIdx[i].y, 10) || 0,
-                duration: parseInt(byIdx[i].duration, 10) || CONFIG.DEFAULT_DURATION,
-                taskType: byIdx[i].taskType || 'job',
-            }))
-            .filter(t => !isNaN(t.jobId));
+            .map(i => {
+                const id = parseInt(byIdx[i].jobId, 10);
+                return {
+                    jobId: isNaN(id) ? null : id,      // az alvásnak nincs munkaazonosítója
+                    x: parseInt(byIdx[i].x, 10) || 0,
+                    y: parseInt(byIdx[i].y, 10) || 0,
+                    duration: parseInt(byIdx[i].duration, 10) || CONFIG.DEFAULT_DURATION,
+                    taskType: byIdx[i].taskType || 'job',
+                };
+            })
+            .filter(t => t.jobId !== null || t.taskType !== 'job');
     }
 
     // A válasz tasks[i] eleme a kérés i. munkájáról szól, és vagy {task:{...}},
@@ -184,7 +193,13 @@
     // indítása is a mi listánkat módosítaná.
     function addResponseMatchesBatch(bodyTasks, batch) {
         return !!batch && bodyTasks.length === batch.length
-            && bodyTasks.every((t, i) => t.jobId === batch[i].jobId && t.duration === batch[i].duration);
+            && bodyTasks.every((t, i) => {
+                const mine = batch[i];
+                // Az alvásnak nincs munkaazonosítója és időtartama a kérésben,
+                // ott a típus az egyetlen fogódzó.
+                if ((mine.taskType || 'job') !== 'job') return t.taskType === mine.taskType;
+                return t.jobId === mine.jobId && t.duration === mine.duration;
+            });
     }
 
     function updateUIStatus(text) {
@@ -301,9 +316,19 @@
         let tail = null;
         if (gameReady()) {
             for (const e of window.TaskQueue.queue) {
-                const done = e && e.data && e.data.date_done;
+                let done = e && e.data && e.data.date_done;
+                // Az alvás mindig 8 órára megy be, de mi megszakítjuk, amint az
+                // energia feltöltődött -- a láncot a VÁRHATÓ ébredéshez kötjük,
+                // különben minden utána jövő munka nyolc órával későbbre csúszna.
+                if (e && e.type === 'sleep' && typeof done === 'number') {
+                    const wake = now + msUntilEnergy(sleepTargetEnergy(e.data && e.data.room));
+                    done = Math.min(done, wake);
+                }
                 if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
-                    tail = { at: done, pos: (e.post && typeof e.post.x === 'number') ? { x: e.post.x, y: e.post.y } : null };
+                    // Az alvásnál a helyszín a data-ban van, nem a post-ban.
+                    const p = (e.post && typeof e.post.x === 'number') ? e.post
+                            : (e.data && typeof e.data.x === 'number') ? e.data : null;
+                    tail = { at: done, pos: p ? { x: p.x, y: p.y } : null };
                 }
             }
         }
@@ -331,6 +356,304 @@
             if (typeof job.x === 'number') pos = { x: job.x, y: job.y };
             return { id: job.id, start, finish, travelMs, estimated: perUnit !== null };
         });
+    }
+
+    // ------------------------------------------------------------
+    //  Energia és motiváció
+    // ------------------------------------------------------------
+    // Mindkettőt a játéktól kérdezzük, nem modellezzük:
+    //  - a munkánkénti energiaköltség és a motiváció egyetlen, OLVASÓ hívásból
+    //    jön (Ajax.remoteCallMode "job"/"job"), ami nem költ energiát;
+    //  - az energia jövőbeli értékét a játék saját képletével számoljuk.
+    // Semmit nem égetünk be: a 3/óra regeneráció, az 1/5/12 energiaköltség és a
+    // motivációlépcső mind a szervertől jön, így a prémiumok és a jövőbeli
+    // egyensúlyozás magától érvényesül.
+    const jobInfoCache = new Map();     // jobId -> { motivation, costs, at }
+    const jobInfoPending = new Set();
+
+    function serverNowSec() {
+        try {
+            if (window.Game && typeof Game.getServerTime === 'function') return Game.getServerTime();
+        } catch(e) {}
+        return Date.now() / 1000;
+    }
+
+    // A szerver- és a helyi óra eltérése csekély (mérve 1 mp), de a mienk helyi
+    // ezredmásodperc, az energiahorgony viszont szerver-másodperc.
+    function toServerSec(ms) {
+        return ms / 1000 + (serverNowSec() - Date.now() / 1000);
+    }
+
+    // A játék saját képlete (Game.tick4Character), változtatás nélkül. A
+    // (Character.energy, Character.energyDate) pár mindig összetartozik: a
+    // setEnergy minden változáskor újraállítja a dátumot is. Alvás alatt a játék
+    // egyszerűen megemeli az energyRegen-t (mérve 0,03 -> 0,125), ezért ugyanez
+    // a képlet az alvás alatti töltődésre is érvényes.
+    function energyAt(ms) {
+        const c = window.Character;
+        if (!c || typeof c.energy !== 'number') return null;
+        const max = c.maxEnergy || 100;
+        const regen = typeof c.energyRegen === 'number' ? c.energyRegen : 0;
+        const anchor = typeof c.energyDate === 'number' ? c.energyDate : serverNowSec();
+        const secs = Math.max(0, toServerSec(ms) - anchor);
+        return Math.min(max, Math.floor(c.energy + max * regen * secs / 3600));
+    }
+
+    // Mennyi idő, amíg az energia elér egy szintet. A játék képletét fordítjuk
+    // meg, tehát ugyanaz a regeneráció (és alvás alatt ugyanúgy a megemelt) érték.
+    function msUntilEnergy(target) {
+        const c = window.Character;
+        if (!c || typeof c.energy !== 'number') return CONFIG.MIN_SEND_GAP;
+        const max = c.maxEnergy || 100;
+        // A maximum fölé sosem jutunk: egy ilyen célra várni örökös várakozás lenne.
+        target = Math.min(target, max);
+        if (c.energy >= target) return 0;
+        const regen = typeof c.energyRegen === 'number' ? c.energyRegen : 0;
+        const perHour = max * regen;
+        if (perHour <= 0) return CONFIG.MAX_WAIT_MS;      // nem regenerálódik: ne pörögjünk
+        return Math.ceil((target - c.energy) / perHour * 3600) * 1000;
+    }
+
+    function jobEnergyCost(job) {
+        const info = jobInfoCache.get(job.jobId);
+        const cost = info && info.costs ? info.costs[job.duration] : undefined;
+        return typeof cost === 'number' ? cost : null;   // amíg nem tudjuk, nem találgatunk
+    }
+
+    function jobMotivation(jobId) {
+        const info = jobInfoCache.get(jobId);
+        return info && typeof info.motivation === 'number' ? info.motivation : null;
+    }
+
+    // Munkánként egy olvasó lekérdezés, TTL-lel. Energiát nem költ, a sor
+    // állapotát nem érinti -- kizárólag a kijelzéshez kell.
+    function requestJobInfo(job) {
+        const id = job.jobId;
+        if (!id || jobInfoPending.has(id)) return;
+        const cached = jobInfoCache.get(id);
+        if (cached && Date.now() - cached.at < CONFIG.JOB_INFO_TTL) return;
+        if (!window.Ajax || typeof Ajax.remoteCallMode !== 'function') return;
+        jobInfoPending.add(id);
+        try {
+            Ajax.remoteCallMode('job', 'job', { jobId: id, x: job.x, y: job.y }, (json) => {
+                jobInfoPending.delete(id);
+                if (!json || json.error) return;
+                const costs = {};
+                (json.durations || []).forEach(d => {
+                    if (d && typeof d.duration === 'number') costs[d.duration] = d.cost;
+                });
+                jobInfoCache.set(id, { motivation: json.motivation, costs, at: Date.now() });
+                updateExtraEtas();
+            });
+        } catch(e) {
+            jobInfoPending.delete(id);
+        }
+    }
+
+    // A LÁTHATÓ munkákra kérdezünk rá, nem az egész listára: 99 azonos munkánál
+    // is egyetlen kérés megy ki, mert a gyorsítótár kulcsa a munka azonosítója.
+    function refreshJobInfo(jobs) {
+        const seen = new Set();
+        for (const job of jobs) {
+            if (seen.has(job.jobId)) continue;
+            seen.add(job.jobId);
+            requestJobInfo(job);
+        }
+    }
+
+    // A játék sorában álló munkák a mieink ELŐTT fejeződnek be, tehát az ő
+    // motivációcsökkenésük már a mi első munkánkat is érinti.
+    function motivationAlreadyCommitted() {
+        const out = {};
+        if (!gameReady()) return out;
+        for (const t of window.TaskQueue.queue) {
+            const p = t && t.post;
+            if (!p || typeof p.jobId !== 'number') continue;
+            const cost = jobEnergyCost({ jobId: p.jobId, duration: p.duration });
+            if (cost !== null) out[p.jobId] = (out[p.jobId] || 0) + cost;
+        }
+        return out;
+    }
+
+    // Munkánkénti előrejelzés. A motiváció a munka BEFEJEZÉSEKOR csökken a munka
+    // energiaköltségével, az energia viszont már a játék sorába kerüléskor
+    // levonódik -- a kettőt tehát külön kell számolni.
+    function computeForecast(jobs, etas, opts) {
+        const committed = Object.assign({}, opts.priorMotivationCost || {});
+        let energyUsed = 0;
+        return jobs.map((job, i) => {
+            const start = etas[i] ? etas[i].start : Date.now();
+            const cost = opts.costOf(job);
+            const base = opts.motivationOf(job.jobId);
+            const motivation = (typeof base === 'number')
+                ? Math.round(base * 100) - (committed[job.jobId] || 0)
+                : null;
+            const predicted = opts.energyAt(start);
+            const energyBefore = predicted === null ? null : predicted - energyUsed;
+            const energyAfter = (energyBefore === null || cost === null) ? null : energyBefore - cost;
+            if (cost !== null) {
+                energyUsed += cost;
+                committed[job.jobId] = (committed[job.jobId] || 0) + cost;
+            }
+            return {
+                id: job.id,
+                cost,
+                motivation,
+                energyBefore,
+                energyAfter,
+                lowMotivation: motivation !== null && motivation <= opts.motivationWarn,
+                notEnoughEnergy: energyBefore !== null && cost !== null && energyBefore < cost,
+            };
+        });
+    }
+
+    function forecastForExtraQueue(jobs, etas) {
+        return computeForecast(jobs, etas, {
+            costOf: jobEnergyCost,
+            motivationOf: jobMotivation,
+            energyAt,
+            priorMotivationCost: motivationAlreadyCommitted(),
+            motivationWarn: CONFIG.MOTIVATION_WARN,
+        });
+    }
+
+    // ------------------------------------------------------------
+    //  Alvás
+    // ------------------------------------------------------------
+    // A játék az alvást ugyanazon az úton indítja, mint a munkát:
+    // TaskQueue.add(new TaskSleep(townId, room)) -- pontosan ezt teszi a hotel
+    // ablak indítógombja is. Alvás alatt a játék megemeli az energyRegen-t
+    // (mérve 0,03 -> 0,125 luxusapartmanban), tehát az energiaképlet ugyanaz.
+    //
+    // Fizetős szobát SOHA nem választunk magunktól: a saját városban a szobák
+    // ingyenesek, máshol pénzbe kerülnek, és a felhasználó pénzét nem költjük el
+    // kérdés nélkül.
+    let hotelRooms = null;          // { townId, rooms, at }
+    let sleepOffer = null;          // épp kint lévő kérdés
+    let sleepDeclinedUntil = 0;
+
+    function canSleep() {
+        try {
+            const t = window.Character && window.Character.homeTown;
+            return !!(t && t.town_id > 0 && typeof window.TaskSleep === 'function');
+        } catch(e) { return false; }
+    }
+
+    function isSleeping() {
+        return gameReady() && window.TaskQueue.queue.some(t => t && t.type === 'sleep');
+    }
+
+    function fetchHotelRooms(townId, cb) {
+        const cached = hotelRooms;
+        if (cached && cached.townId === townId && Date.now() - cached.at < CONFIG.JOB_INFO_TTL) {
+            cb(cached.rooms);
+            return;
+        }
+        if (!window.Ajax || typeof Ajax.remoteCallMode !== 'function') { cb(null); return; }
+        try {
+            Ajax.remoteCallMode('building_hotel', 'get_data', { town_id: townId }, (data) => {
+                if (!data || data.error || !data.rooms) { cb(null); return; }
+                hotelRooms = { townId, rooms: data.rooms, at: Date.now() };
+                cb(data.rooms);
+            });
+        } catch(e) { cb(null); }
+    }
+
+    // A legjobb INGYENES szoba: a szoba "energy" mezője az a szint, ameddig az
+    // alvás feltölt (kamra 64 ... luxusapartman 100).
+    function bestFreeRoom(rooms) {
+        let best = null;
+        for (const key in rooms) {
+            const r = rooms[key];
+            if (!r || !r.available || !r.free) continue;
+            if (!best || (r.energy || 0) > (best.energy || 0)) best = { key, ...r };
+        }
+        return best;
+    }
+
+    // Ameddig az alvás feltölt: a szoba szintje, de legfeljebb a saját maximum.
+    function sleepTargetEnergy(roomKey) {
+        const max = (window.Character && window.Character.maxEnergy) || 100;
+        const r = hotelRooms && hotelRooms.rooms && hotelRooms.rooms[roomKey];
+        return r && typeof r.energy === 'number' ? Math.min(max, r.energy) : max;
+    }
+
+    // Csak becslés a kijelzéshez: az alvás alatti regenerációt előre nem tudjuk
+    // (a szerver állítja be induláskor), ezért a mért értékkel számolunk. Az
+    // alvás úgyis addig tart, amíg fel nem töltődik -- akkor megszakítjuk.
+    function estimateSleepSeconds(roomKey) {
+        const c = window.Character;
+        if (!c || typeof c.energy !== 'number') return 3600;
+        const max = c.maxEnergy || 100;
+        const target = sleepTargetEnergy(roomKey);
+        const perHour = max * CONFIG.SLEEP_REGEN_ESTIMATE;
+        if (perHour <= 0 || c.energy >= target) return 60;
+        return Math.ceil((target - c.energy) / perHour * 3600);
+    }
+
+    function insertSleepJob() {
+        const town = window.Character.homeTown;
+        fetchHotelRooms(town.town_id, (rooms) => {
+            const room = rooms && bestFreeRoom(rooms);
+            if (!room) {
+                updateUIStatus('Nincs ingyenes szoba a hotelben – alvás nem lett beszúrva.');
+                return;
+            }
+            extraJobs.unshift({
+                id: generateId(), retries: 0, deferrals: 0, rejections: 0,
+                taskType: 'sleep',
+                townId: town.town_id,
+                room: room.key,
+                jobName: `Alvás – ${room.name || room.key}`,
+                jobId: 0,
+                x: town.x, y: town.y,
+                duration: estimateSleepSeconds(room.key),
+            });
+            saveExtraQueueToStorage();
+            updateUI();
+            updateUIStatus(`Alvás beszúrva a sor elejére (${room.name || room.key}).`);
+            ensureProcessing();
+        });
+    }
+
+    // Az alvás automatikus, de csak KÉRDÉS után -- a felhasználó így dönt.
+    // Ha nemet mond, egy ideig nem kérdezünk újra, hogy ne zaklassuk.
+    function maybeOfferSleep(neededEnergy) {
+        if (!CONFIG.AUTO_SLEEP || !canSleep()) return;
+        if (sleepOffer || Date.now() < sleepDeclinedUntil) return;
+        if (isSleeping()) return;
+        if (extraJobs.some(j => j.taskType === 'sleep')) return;
+        sleepOffer = { needed: neededEnergy };
+        renderSleepOffer();
+    }
+
+    function dismissSleepOffer(declined) {
+        sleepOffer = null;
+        if (declined) sleepDeclinedUntil = Date.now() + CONFIG.SLEEP_DECLINE_MS;
+        renderSleepOffer();
+    }
+
+    // Futó alvás megszakítása, ha az energia elérte, amit ez a szoba adhat.
+    // A játék cancelje a sorpozíciót várja, és a válaszban visszaküldi a valódi
+    // energiát (sleep.onCancel), tehát utána azonnal pontos az állapotunk.
+    function cancelSleepIfFull() {
+        if (!gameReady() || !isLeaderTab) return;
+        const pos = window.TaskQueue.queue.findIndex(t => t && t.type === 'sleep');
+        if (pos === -1) return;
+        const task = window.TaskQueue.queue[pos];
+        // Csak a MÁR FUTÓ alvást szakítjuk meg, a sorban állót nem.
+        if (task.queuePos !== 0) return;
+        const room = task.data && task.data.room;
+        const target = sleepTargetEnergy(room);
+        const c = window.Character;
+        if (!c || typeof c.energy !== 'number' || c.energy < target) return;
+        try {
+            console.log(`[Lisa] Alvás megszakítva: energia ${c.energy}/${target} (${room || 'ismeretlen szoba'}).`);
+            window.TaskQueue.cancel(task.queuePos);
+            updateUIStatus(`Alvás vége – energia ${c.energy}, jöhet a következő munka.`);
+        } catch(e) {
+            console.warn('[Lisa] Az alvás megszakítása nem sikerült:', e);
+        }
     }
 
     function clockHM(ms) {
@@ -362,10 +685,21 @@
     // osztályokra reagál, és a queueId-t az osztálynévből olvassa ki. A mi
     // sorainkhoz nem tartozik valódi munka, ezért egyetlen kattintást sem
     // engedünk feljebb jutni -- enélkül egy kattintás valódi munkát szakítana meg.
+    // Egy előrejelzés-sor emberi olvasatú figyelmeztetése, vagy üres szöveg.
+    function forecastWarning(f) {
+        if (!f) return '';
+        const out = [];
+        if (f.lowMotivation) out.push(`motiváció ${f.motivation}%`);
+        if (f.notEnoughEnergy) out.push(`kevés energia (${f.energyBefore} < ${f.cost})`);
+        return out.join(', ');
+    }
+
     function pendingIconUrl(job) {
         try {
             if (!gameReady()) return null;
-            const probe = new window.TaskJob(job.jobId, job.x, job.y, job.duration);
+            const probe = job.taskType === 'sleep'
+                ? new window.TaskSleep(job.townId, job.room)
+                : new window.TaskJob(job.jobId, job.x, job.y, job.duration);
             const icon = typeof probe.getIcon === 'function' ? probe.getIcon() : null;
             return (typeof icon === 'string' && icon) ? icon : null;
         } catch(e) { return null; }
@@ -385,6 +719,15 @@
             .lisa-pending { opacity: 0.68; }
             .lisa-pending:hover { opacity: 0.95; }
             .lisa-pending .taskAbort { cursor: pointer; }
+            /* Figyelmeztetés a munka ikonján: kevés motiváció vagy kevés energia.
+               A csempe pozicionálását a játék adja, ezért az ikonhoz kötjük. */
+            #queuedTasks .lisa-pending { position: relative; }
+            #queuedTasks .lisa-pending .lisa-pending-warn {
+                position: absolute; left: 2px; top: 2px; z-index: 5;
+                font: bold 13px 'Georgia',serif; color: #e8a33d;
+                text-shadow: 0 0 3px #000, 0 1px 0 #000;
+                pointer-events: none;
+            }
             #queuedTasks .lisa-pending-sep {
                 display: block;
                 clear: both;
@@ -454,7 +797,7 @@
         pendingObserver.observe(host, { childList: true });
     }
 
-    function buildPendingItem(job, eta) {
+    function buildPendingItem(job, eta, forecast) {
         const item = document.createElement('span');
         item.className = 'task lisa-pending';   // a 'task' hozza a játék stílusát
         item.dataset.id = job.id;
@@ -490,11 +833,24 @@
         item.appendChild(time);
         item.appendChild(btns);
         item.appendChild(icon);
+
+        // A figyelmeztetés a játék sorában is látszik, az ikonon -- itt nézi a
+        // felhasználó a munkáit, nem a panelben.
+        const warnText = forecastWarning(forecast);
+        if (warnText) {
+            const warn = document.createElement('div');
+            warn.className = 'lisa-pending-warn';
+            warn.textContent = '⚠';
+            item.appendChild(warn);
+            item.dataset.warn = warnText;
+        }
+
         item.title = eta
             ? (travelSec > 0
                 ? `${job.jobName} — út: ${formatDuration(travelSec)} + munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
                 : `${job.jobName} — munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`)
             : `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`;
+        if (warnText) item.title += `\n⚠ ${warnText}`;
 
         item.addEventListener('click', (e) => {
             e.stopImmediatePropagation();
@@ -528,19 +884,25 @@
         const hidden = split.hidden;
         // A figyelő 2 mp-enként hív. Csak akkor építünk újra, ha változott a lista,
         // vagy ha a játék újrarajzolása közben eltűntek a soraink (öngyógyítás).
-        const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}`;
+        // A figyelmeztetés is a kulcs része: ha egy munka motivációja vagy
+        // energiája átlépi a határt, a sorokat újra kell rajzolni.
+        const etas = computeEtas(extraJobs);
+        const forecast = forecastForExtraQueue(extraJobs, etas);
+        const warnKey = forecast.slice(0, shown.length).map(f => (forecastWarning(f) ? '1' : '0')).join('');
+        const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}|${warnKey}`;
         if (key === renderedPendingKey && host.querySelector('.lisa-pending-sep')) return;
         renderedPendingKey = key;
 
         clearPendingRows(host);
-        const etas = computeEtas(extraJobs);
 
         const sep = document.createElement('div');
         sep.className = 'lisa-pending-sep';
-        sep.textContent = `Extra sor — ${extraJobs.length}`;
+        const warned = forecast.filter(f => forecastWarning(f)).length;
+        sep.textContent = `Extra sor — ${extraJobs.length}${warned ? ` ⚠${warned}` : ''}`;
+        if (warned) sep.title = `${warned} munkánál kevés lesz a motiváció vagy az energia`;
         host.appendChild(sep);
 
-        shown.forEach((job, i) => host.appendChild(buildPendingItem(job, etas[i])));
+        shown.forEach((job, i) => host.appendChild(buildPendingItem(job, etas[i], forecast[i])));
 
         if (hidden > 0) {
             const more = document.createElement('span');
@@ -577,7 +939,9 @@
         if (!gameReady() || !jobs.length) return 0;
         const before = gameQueueLength();
         try {
-            window.TaskQueue.add(jobs.map(j => new window.TaskJob(j.jobId, j.x, j.y, j.duration)));
+            window.TaskQueue.add(jobs.map(j => j.taskType === 'sleep'
+                ? new window.TaskSleep(j.townId, j.room)
+                : new window.TaskJob(j.jobId, j.x, j.y, j.duration)));
         } catch(e) {
             console.error('[Lisa] TaskQueue.add hiba:', e);
             return 0;
@@ -1131,11 +1495,39 @@
                 return;
             }
 
+            // Alvás alatt nem töltjük a sort. A munka energiája a sorba
+            // kerüléskor levonódik, tehát az alvás alatt beküldött munkák épp azt
+            // az energiát ennék meg, amiért alszunk -- és az alvás sosem érné el
+            // a célszintet, amire megszakítanánk.
+            if (isSleeping() && extraJobs[0] && extraJobs[0].taskType !== 'sleep') {
+                updateUIStatus(`Alvás folyamatban – ${extraJobs.length} munka várja az ébredést.`);
+                scheduleNextJob(rand(CONFIG.FULL_QUEUE_POLL_MIN, CONFIG.FULL_QUEUE_POLL_MAX));
+                return;
+            }
+
+            // Energiafedezet. A szerver úgyis visszautasítaná, csak épp azután,
+            // hogy a játék már betette a sorba -- azt a kört itt megspóroljuk, és
+            // pontosan addig várunk, amíg az energia tényleg összejön. A költséget
+            // a szervertől tudjuk; ha még nem tudjuk, nem tippelünk, hanem küldünk.
+            const head = extraJobs[0];
+            const headCost = jobEnergyCost(head);
+            if (headCost !== null && typeof Character.energy === 'number' && Character.energy < headCost) {
+                const waitMs = msUntilEnergy(headCost);
+                updateUIStatus(`${head.jobName}: ${headCost} energia kell, van ${Character.energy} – várakozás ~${formatDuration(waitMs / 1000)}`);
+                maybeOfferSleep(headCost);
+                scheduleNextJob(Math.min(Math.max(waitMs, CONFIG.MIN_SEND_GAP), CONFIG.MAX_WAIT_MS));
+                return;
+            }
+
             // FONTOS: csak megnézzük a sor elejét, nem vesszük le. A munkák
             // kizárólag akkor kerülnek ki a listából, ha a játék tényleg
             // elfogadta őket. Hibánál, elutasításnál, kivételnél sem tűnhet el
             // semmi -- ez szerkezetileg zárja ki a "munka eltűnt" hibaosztályt.
-            const batch = extraJobs.slice(0, freeSlots());
+            // Az alvást MAGÁBAN küldjük: a mögötte lévő munkák energiája már a
+            // sorba kerüléskor levonódna, pont az alvás alatt gyűjtött energiából.
+            const batch = extraJobs[0].taskType === 'sleep'
+                ? extraJobs.slice(0, 1)
+                : extraJobs.slice(0, freeSlots());
             console.log(`[Lisa] Indítás: ${batch.length} munka (${batch[0].jobName}...), szabad slot: ${freeSlots()}`);
 
             const accepted = startJobsViaGame(batch);
@@ -1232,19 +1624,29 @@
 
     function sanitizeJobs(list) {
         return list
-            .filter(j => j && j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10)))
-            .map(j => ({
-                id: j.id || generateId(),
-                retries: parseInt(j.retries, 10) || 0,
-                deferrals: parseInt(j.deferrals, 10) || 0,
-                rejections: parseInt(j.rejections, 10) || 0,
-                jobName: j.jobName || `Job #${j.jobId}`,
-                jobId: parseInt(j.jobId, 10),
-                x: parseInt(j.x, 10) || 0,
-                y: parseInt(j.y, 10) || 0,
-                duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION,
-                taskType: j.taskType || 'job',
-            }))
+            .filter(j => j && (j.taskType === 'sleep'
+                ? (parseInt(j.townId, 10) > 0 && !!j.room)
+                : (j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10)))))
+            .map(j => {
+                const base = {
+                    id: j.id || generateId(),
+                    retries: parseInt(j.retries, 10) || 0,
+                    deferrals: parseInt(j.deferrals, 10) || 0,
+                    rejections: parseInt(j.rejections, 10) || 0,
+                    jobName: j.jobName || `Job #${j.jobId}`,
+                    jobId: parseInt(j.jobId, 10) || 0,
+                    x: parseInt(j.x, 10) || 0,
+                    y: parseInt(j.y, 10) || 0,
+                    duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION,
+                    taskType: j.taskType || 'job',
+                };
+                // Az alvásnak nincs munkaazonosítója; a város és a szoba írja le.
+                if (base.taskType === 'sleep') {
+                    base.townId = parseInt(j.townId, 10);
+                    base.room = j.room;
+                }
+                return base;
+            })
             .slice(0, CONFIG.MAX_EXTRA_QUEUE);
     }
 
@@ -1409,6 +1811,7 @@
         updateQueueBadge();
         updateExtraEtas();
         updateKeepAwake();
+        cancelSleepIfFull();
         observePendingHost();
         renderPendingInGameQueue();
 
@@ -1523,10 +1926,32 @@
             }
             #lisa-extra-list li:nth-child(even) { background: rgba(120,95,60,0.07); }
             .lisa-job-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #lisa-extra-list li.lisa-row-warn { background: rgba(170,90,30,0.16); }
+            .lisa-warn { flex: 0 0 auto; font-size: 11px; color: #a05a1e; margin-right: 3px; cursor: help; }
+            .lisa-warn:empty { display: none; }
+            .lisa-energy {
+                flex: 0 0 auto; font-size: 10px; color: #4a6b42; margin-left: 6px;
+                font-variant-numeric: tabular-nums; cursor: help;
+            }
+            .lisa-energy:empty { display: none; }
+            .lisa-energy.lisa-energy-low { color: #a03020; font-weight: bold; }
             .lisa-eta { font-size: 10px; color: #6b5a42; white-space: nowrap; margin-left: 6px; font-variant-numeric: tabular-nums; }
             #lisa-extra-list .remove { color: #a03020; cursor: pointer; font-weight: bold; margin-left: 8px; font-size: 13px; line-height: 1; }
             #lisa-extra-list .remove:hover { color: #d04030; }
             #lisa-empty { padding: 8px 4px; font: italic 11px Georgia,serif; color: #6b5a42; text-align: center; }
+            #lisa-sleep-offer {
+                flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+                margin: 0 20px 2px 2px; padding: 2px 4px;
+                background: rgba(170,90,30,0.18); border: 1px solid #a05a1e; border-radius: 3px;
+                font: 11px Georgia,serif; color: #3b2f1e;
+            }
+            #lisa-sleep-offer span { flex: 1 1 auto; }
+            #lisa-sleep-offer button {
+                flex: 0 0 auto; font: 10px Georgia,serif; color: #f0e4c6; cursor: pointer;
+                background: linear-gradient(#6b5636,#4a3b28);
+                border: 1px solid #2e2416; border-radius: 3px; padding: 1px 6px;
+            }
+            #lisa-sleep-offer button:hover { background: linear-gradient(#8a7048,#5c4a30); }
             #lisa-toolbar {
                 flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
                 padding: 4px 20px 0 2px; font-size: 11px; color: #4a3b28;
@@ -1580,6 +2005,7 @@
                     <span id="lisa-status-text">Inicializálás...</span>
                     <span id="lisa-total-eta"></span>
                 </div>
+                <div id="lisa-sleep-offer" style="display:none"></div>
                 <div id="lisa-scroll"><ul id="lisa-extra-list"></ul><div id="lisa-empty"></div></div>
                 <div id="lisa-toolbar">
                     <button id="lisa-pause-btn" title="Szünet / Folytatás">Szünet</button>
@@ -1623,6 +2049,33 @@
             refreshIdleStatus();
         }
         return win;
+    }
+
+    // Az alvás felajánlása a panelben, nem felugró ablakban: a játék saját
+    // dialógusai a sorra vonatkoznak, és egy odatévedt kattintás ott drága.
+    function renderSleepOffer() {
+        const box = document.getElementById('lisa-sleep-offer');
+        if (!box) return;
+        if (!sleepOffer) {
+            box.style.display = 'none';
+            box.textContent = '';
+            return;
+        }
+        box.textContent = '';
+        box.style.display = '';
+        const text = document.createElement('span');
+        text.textContent = `Kevés az energia (${sleepOffer.needed} kell). Alvás?`;
+        const yes = document.createElement('button');
+        yes.textContent = 'Igen';
+        yes.title = 'Alvás beszúrása a sor elejére, a legjobb ingyenes szobába';
+        yes.addEventListener('click', () => { dismissSleepOffer(false); insertSleepJob(); });
+        const no = document.createElement('button');
+        no.textContent = 'Nem';
+        no.title = `Most nem – ${Math.round(CONFIG.SLEEP_DECLINE_MS / 60000)} percig nem kérdezünk újra`;
+        no.addEventListener('click', () => dismissSleepOffer(true));
+        box.appendChild(text);
+        box.appendChild(yes);
+        box.appendChild(no);
     }
 
     // Újranyitás után a státuszsor a helyőrzőt mutatná; írjuk ki a valós állapotot.
@@ -1681,10 +2134,17 @@
             const li = document.createElement('li');
             li.dataset.id = job.id;
 
+            const warnEl = document.createElement('span');
+            warnEl.className = 'lisa-warn';
+            warnEl.textContent = '';
+
             const nameEl = document.createElement('span');
             nameEl.className = 'lisa-job-name';
             nameEl.textContent = job.jobName;
             nameEl.title = `${job.jobName} — ID:${job.jobId}, x:${job.x}, y:${job.y}, ${formatDuration(job.duration)}`;
+
+            const energyEl = document.createElement('span');
+            energyEl.className = 'lisa-energy';
 
             const etaEl = document.createElement('span');
             etaEl.className = 'lisa-eta';
@@ -1695,7 +2155,9 @@
             removeEl.title = 'Eltávolítás';
             removeEl.addEventListener('click', () => removeExtraJobById(job.id));
 
+            li.appendChild(warnEl);
             li.appendChild(nameEl);
+            li.appendChild(energyEl);
             li.appendChild(etaEl);
             li.appendChild(removeEl);
             uiExtraList.appendChild(li);
@@ -1728,15 +2190,42 @@
         uiTotalEta.style.opacity = last.estimated ? '1' : '0.55';
     }
 
+    // Egy sor figyelmeztetései és energiaelőrejelzése. A motiváció a munka
+    // BEFEJEZÉSEKOR csökken, ezért itt a munka INDULÁSÁRA jósolt érték látszik --
+    // a kérdés úgy hangzik, hogy "mennyi motivációval fog nekiállni".
+    function paintForecastRow(li, job, f) {
+        if (!f) return;
+        const warnEl = li.querySelector('.lisa-warn');
+        const energyEl = li.querySelector('.lisa-energy');
+        if (!warnEl || !energyEl) return;
+
+        const reasons = [];
+        if (f.lowMotivation) reasons.push(`motiváció ${f.motivation}% (≤ ${CONFIG.MOTIVATION_WARN}%)`);
+        if (f.notEnoughEnergy) reasons.push(`nem lesz elég energia (${f.energyBefore} < ${f.cost})`);
+        warnEl.textContent = reasons.length ? '⚠' : '';
+        warnEl.title = reasons.length ? `${job.jobName} – ${reasons.join(', ')}` : '';
+        li.classList.toggle('lisa-row-warn', reasons.length > 0);
+
+        energyEl.textContent = f.energyAfter === null ? '' : `⚡${Math.max(0, f.energyAfter)}`;
+        energyEl.title = f.energyAfter === null ? '' :
+            `Induláskor ${f.energyBefore} energia, a munka ${f.cost}-t visz, marad ${f.energyAfter}`
+            + (f.motivation === null ? '' : `\nMotiváció induláskor: ${f.motivation}%`);
+        energyEl.classList.toggle('lisa-energy-low', !!f.notEnoughEnergy);
+    }
+
     // Csak az időpont-szövegeket írja át, a sorokat nem építi újra: így percenként
     // sokszor frissülhet anélkül, hogy a listát folyamatosan újrarajzolnánk.
     function updateExtraEtas() {
         if (!uiExtraList) return;
+        refreshJobInfo(extraJobs);
         const etas = computeEtas(extraJobs);
+        const forecast = forecastForExtraQueue(extraJobs, etas);
+        lastForecast = forecast;
         updateTotalEta(etas);
         etas.forEach((eta, i) => {
             const li = uiExtraList.children[i];
             if (!li || li.dataset.id !== eta.id) return;
+            paintForecastRow(li, extraJobs[i], forecast[i]);
             const el = li.querySelector('.lisa-eta');
             if (!el) return;
             el.textContent = formatEta(eta);
@@ -1811,5 +2300,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.1 betöltve.');
+    console.log('[Lisa] Modular v12.2 betöltve.');
 })();

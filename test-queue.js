@@ -44,6 +44,11 @@ global.Premium = { hasBonus: () => false };
 window.Premium = global.Premium;
 
 let extraJobs = [], paused = false, processing = false, nextJobTimer = null, isLeaderTab = true;
+// Alvás/energia: alapesetben nincs alvás és minden munka kifizethető; a
+// forgatókönyvek ezeket felülírják, ahol számít.
+let isSleeping = () => false;
+let jobEnergyCost = () => null;
+let maybeOfferSleep = () => {};
 let scheduled = null;
 const rand = (a) => a;
 const saveExtraQueueToStorage = () => {};
@@ -293,7 +298,8 @@ eq('másnapi vég jelölve', formatEta({ start: base.getTime(), finish: tomorrow
 // ============================================================
 console.log('\n=== Slot-figyelő ===');
 CONFIG.SLOT_FREED_DELAY = 1500;
-const updateKeepAwake = () => {};   // ébrentartás: böngészőfüggő, itt nem mérhető
+const updateKeepAwake = () => {};     // ébrentartás: böngészőfüggő, itt nem mérhető
+const cancelSleepIfFull = () => {};   // az alvás megszakítása élő játékállapotot igényel
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -526,6 +532,93 @@ eq('nulla/hiányzó érték is legalább egy kör', rejectBackoffMs(0), 20000);
 const totalWait = Array.from({length: CONFIG.MAX_REJECTIONS}, (_, i) => rejectBackoffMs(i + 1))
     .reduce((a, b) => a + b, 0);
 eq('a próbálkozások együtt > 1 óra', totalWait > 3600000, true);
+
+// ============================================================
+//  Energia- és motivációelőrejelzés
+// ============================================================
+// Mért játékadatok: a 15 mp-es munka 1 energiába kerül, a motiváció a munka
+// BEFEJEZÉSEKOR csökken ugyanennyivel, az energia viszont már a sorba
+// kerüléskor levonódik. A regeneráció maxEnergy * energyRegen / óra.
+console.log('\n=== Energia és motiváció ===');
+CONFIG.MOTIVATION_WARN = 75;
+eval(extract('computeForecast'));
+
+const mkEtas = (n, stepMs) => Array.from({length: n}, (_, i) => ({ start: 1000 + i * stepMs }));
+const flat = (energy) => () => energy;
+
+// Energia: minden munka levon, a regeneráció nélküli eset a legegyszerűbb
+let fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
+    costOf: () => 5, motivationOf: () => 1, energyAt: flat(12),
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('az első munka után 7 marad', [fc[0].energyBefore, fc[0].energyAfter], [12, 7]);
+eq('a második a maradékból indul', [fc[1].energyBefore, fc[1].energyAfter], [7, 2]);
+eq('a harmadikra már nincs fedezet', fc[2].notEnoughEnergy, true);
+eq('a fedezettel bíróknál nincs jelzés', [fc[0].notEnoughEnergy, fc[1].notEnoughEnergy], [false, false]);
+
+// A regeneráció beleszámít: ha a jóslás szerint közben töltődik, futja
+fc = computeForecast(mkJobs(2), mkEtas(2, 60000), {
+    costOf: () => 5, motivationOf: () => 1,
+    energyAt: (t) => (t === 1000 ? 5 : 10),          // a második indulásáig töltődik
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('a regenerálódott energia is számít', fc[1].notEnoughEnergy, false);
+
+// Motiváció: minden BEFEJEZETT azonos munka a saját energiaköltségével csökkenti
+const same = Array.from({length: 4}, (_, i) => ({ ...mkJobs(1)[0], id: 'm' + i, jobId: 42 }));
+fc = computeForecast(same, mkEtas(4, 0), {
+    costOf: () => 1, motivationOf: () => 1, energyAt: flat(100),
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('az első még teljes motivációval indul', fc[0].motivation, 100);
+eq('a negyedik már hárommal kevesebbel', fc[3].motivation, 97);
+eq('100%-nál nincs figyelmeztetés', fc.some(f => f.lowMotivation), false);
+
+// A játék sorában álló munkák is csökkentik, mielőtt a mieink sorra kerülnének
+fc = computeForecast(same, mkEtas(4, 0), {
+    costOf: () => 1, motivationOf: () => 0.78, energyAt: flat(100),
+    priorMotivationCost: { 42: 2 }, motivationWarn: 75 });
+eq('a játék sorát is beszámítjuk', fc[0].motivation, 76);
+eq('a küszöb alatt figyelmeztetünk', [fc[0].lowMotivation, fc[1].lowMotivation], [false, true]);
+eq('pontosan a küszöbön is figyelmeztetünk', fc[1].motivation, 75);
+
+// Amíg nem tudjuk a költséget/motivációt, NEM tippelünk
+fc = computeForecast(mkJobs(2), mkEtas(2, 0), {
+    costOf: () => null, motivationOf: () => null, energyAt: flat(3),
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('ismeretlen költség -> nincs energiajóslás', [fc[0].energyAfter, fc[0].cost], [null, null]);
+eq('ismeretlen motiváció -> nincs jelzés', [fc[0].motivation, fc[0].lowMotivation], [null, false]);
+eq('ismeretlen költségnél nem állítjuk, hogy kevés', fc[0].notEnoughEnergy, false);
+
+// ============================================================
+//  Alvás: szobaválasztás és célszint
+// ============================================================
+// Élesben mért hoteladat: a szoba "energy" mezője az a szint, ameddig feltölt
+// (kamra 64 ... luxusapartman 100), és a saját városban minden szoba ingyenes.
+console.log('\n=== Alvás ===');
+eval(extract('bestFreeRoom'));
+const rooms = {
+    cubby: { level: 1, energy: 64, name: 'Kamra', available: true, free: true },
+    bedroom: { level: 2, energy: 72, name: 'Hálószoba', available: true, free: true },
+    luxurious_apartment: { level: 5, energy: 100, name: 'Luxusapartman', available: true, free: true },
+};
+eq('a legjobb ingyenes szoba nyer', bestFreeRoom(rooms).key, 'luxurious_apartment');
+eq('fizetős szobát nem választunk magunktól',
+   bestFreeRoom({ ...rooms, luxurious_apartment: { ...rooms.luxurious_apartment, free: false } }).key, 'bedroom');
+eq('nem elérhető szobát sem',
+   bestFreeRoom({ cubby: { ...rooms.cubby, available: false }, bedroom: rooms.bedroom }).key, 'bedroom');
+eq('ha egy sem ingyenes, nincs választás',
+   bestFreeRoom({ cubby: { ...rooms.cubby, free: false } }), null);
+eq('üres hotel -> nincs választás', bestFreeRoom({}), null);
+
+// A tárolás átvészelése: az alvásnak nincs jobId-je, de a városa és szobája kell
+eval(extract('sanitizeJobs'));
+const stored = sanitizeJobs([
+    { taskType: 'sleep', townId: 4206, room: 'luxurious_apartment', jobName: 'Alvás', x: 1, y: 2, duration: 900 },
+    { taskType: 'sleep', townId: 0, room: 'cubby' },          // város nélkül értelmetlen
+    { taskType: 'sleep', townId: 4206 },                      // szoba nélkül is
+    { jobId: 129, x: 1, y: 2, duration: 15 },
+]);
+eq('az alvás túléli a mentést', stored.length, 2);
+eq('a város és a szoba megmarad', [stored[0].townId, stored[0].room], [4206, 'luxurious_apartment']);
+eq('a hiányos alvásbejegyzések kiesnek', stored[1].jobId, 129);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

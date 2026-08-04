@@ -6,12 +6,12 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 131 assertions, no dependencies.
+  name and runs them against stubs. 153 assertions, no dependencies.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.1.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.2.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -20,7 +20,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `131 passed, 0 failed`.
+2. `node test-queue.js` should print `153 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -30,6 +30,9 @@ treat it as the baseline rather than something to redesign.
 - Intercepts **both** ways to start a job — the job window's start buttons and the map's quick-start
   arrows — and puts the whole batch at the end of its own `extraJobs` list.
 - Feeds jobs into the game's queue as slots free, always in FIFO order.
+- Warns per job when the **motivation** at its predicted start would be ≤ 75%, or when the
+  **energy** won't cover its cost — and offers to insert a **sleep** (never unasked, never a paid
+  room), cancelling it as soon as the room's energy level is reached.
 - Shows waiting jobs in **two places**: its own game-style window (top right, scrollable) and as
   extra rows in the game's bottom-right queue widget, under a separator (6 shown, then `+N`).
 - Shows predicted start→finish times per job, chaining travel between locations.
@@ -272,6 +275,26 @@ and "Nem" correctly does nothing.
   **front** of the list, in order. They are **not** dropped after a couple of tries: the most
   common cause (not enough energy) passes by itself, so it retries on a doubling backoff (20 s → 10 min, over an hour in total)
   and only gives up after `MAX_REJECTIONS`, always showing the server's own message.
+- **Energy and motivation are forecast, never modelled.** `computeForecast` walks the waiting list
+  in ETA order: energy comes from the game's own formula, the per-job cost and the motivation from
+  the read-only job call. A job is flagged when its predicted motivation at **start** is ≤
+  `MOTIVATION_WARN` (75) or when the energy at that point won't cover its cost — shown as `⚠` on the
+  panel row, on the injected in-game tile, and summarised on the separator. When a value isn't known
+  yet, nothing is guessed and nothing is flagged.
+  **Known simplification:** motivation regeneration over time is not modelled (it was not measured),
+  so a long queue's warnings are pessimistic rather than optimistic — the safe direction.
+- **The energy pre-check** in `processQueue` refuses to hand over a job the character can't afford
+  and waits exactly as long as the regen needs, instead of letting the server reject it. This is the
+  proper fix for "energy ran out"; the rejection recovery above is the safety net behind it.
+- **Sleeping** is an ordinary entry in `extraJobs` (`taskType: 'sleep'` with `townId`/`room`), so it
+  inherits FIFO, storage and rendering. Three rules earned their place:
+  it is **sent alone** (jobs queued behind it would have their energy deducted immediately — exactly
+  the energy the sleep is meant to build); **nothing is fed into the queue while sleeping**, for the
+  same reason; and only a **free** room is ever chosen automatically, never one that costs the
+  user's money. It is offered, never inserted unasked, and `cancelSleepIfFull` ends it via
+  `TaskQueue.cancel(queuePos)` once energy reaches what that room can give.
+  `queueTailAnchor` also clamps a running sleep's 8-hour `date_done` to the predicted wake-up,
+  otherwise every following ETA would be pushed eight hours out.
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
   display/machine sleeping — re-requested on `visibilitychange`, since the browser releases it when
   the tab is hidden — plus an inaudible looping WAV, because Chrome does not freeze a tab that is
