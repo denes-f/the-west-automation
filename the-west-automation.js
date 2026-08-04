@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.0 - A játék saját munkasorán keresztül)
+// @name         The-West Modular Job Queue (Lisa v11.1 - A látható fül dolgozik)
 // @namespace   http://tampermonkey.net/
-// @version     11.0
+// @version     11.1
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, mennyiség max 99.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -532,7 +532,7 @@
             // Csak egy fül dolgozhatja fel a sort, különben két példány
             // párhuzamosan küldene ugyanabból a listából.
             if (!isLeaderTab) {
-                updateUIStatus('Egy másik fül dolgozza fel a sort.');
+                updateUIStatus(`Passzív fül – egy másik, látható fül dolgozza fel (${extraJobs.length} vár).`);
                 scheduleNextJob(CONFIG.LEADER_HEARTBEAT);
                 return;
             }
@@ -696,14 +696,27 @@
     // ============================================================
     // Két nyitott játékfül eddig ugyanabból a listából küldött párhuzamosan.
     // A vezető fül szívverést ír a localStorage-ba; a többi passzívan követi.
+    function isVisible() {
+        return document.visibilityState !== 'hidden';
+    }
+
     function refreshLeadership() {
         const wasLeader = isLeaderTab;
+        const visible = isVisible();
         try {
             const raw = localStorage.getItem(CONFIG.STORAGE_LEADER);
             const cur = raw ? JSON.parse(raw) : null;
             const now = Date.now();
-            if (!cur || !cur.id || cur.id === TAB_ID || (now - cur.ts) > CONFIG.LEADER_TTL) {
-                localStorage.setItem(CONFIG.STORAGE_LEADER, JSON.stringify({ id: TAB_ID, ts: now }));
+            const stale = !cur || !cur.id || (now - cur.ts) > CONFIG.LEADER_TTL;
+            const mine = !!cur && cur.id === TAB_ID;
+            // A LÁTHATÓ fül mindig elveheti a vezetést egy háttérben lévőtől: a
+            // felhasználó ott várja a munkát. Enélkül egy nyitva felejtett háttérfül
+            // némán blokkolta a feldolgozást azon a fülön, amit a felhasználó néz --
+            // és a UI csak annyit mondott, hogy "passzív fül".
+            const canTakeOver = visible && cur && !cur.visible;
+
+            if (stale || mine || canTakeOver) {
+                localStorage.setItem(CONFIG.STORAGE_LEADER, JSON.stringify({ id: TAB_ID, ts: now, visible }));
                 isLeaderTab = true;
             } else {
                 isLeaderTab = false;
@@ -716,13 +729,30 @@
             console.log('[Lisa] Ez a fül vette át a feldolgozást.');
             ensureProcessing();
         } else if (!isLeaderTab && wasLeader) {
-            console.log('[Lisa] Egy másik fül vette át a feldolgozást.');
+            console.log('[Lisa] Egy másik, látható fül vette át a feldolgozást.');
         }
+        // A vezető fül is ütemezzen, ha van mit tenni és épp nem várakozik időzítőre.
+        if (isLeaderTab) ensureProcessing();
+    }
+
+    function releaseLeadership() {
+        try {
+            const raw = localStorage.getItem(CONFIG.STORAGE_LEADER);
+            const cur = raw ? JSON.parse(raw) : null;
+            // Csak a sajátunkat engedjük el, hogy egy másik fül azonnal átvehesse
+            // ahelyett, hogy megvárná a TTL lejártát.
+            if (cur && cur.id === TAB_ID) localStorage.removeItem(CONFIG.STORAGE_LEADER);
+        } catch(e) {}
     }
 
     function initTabSync() {
         refreshLeadership();
         setInterval(refreshLeadership, CONFIG.LEADER_HEARTBEAT);
+
+        // Fülváltásnál azonnal újraértékelünk, nem várunk a szívverésre.
+        document.addEventListener('visibilitychange', refreshLeadership);
+        // Bezáráskor elengedjük a vezetést: a bezárt fül eddig a TTL végéig fogta.
+        window.addEventListener('pagehide', releaseLeadership);
 
         // A storage esemény csak a TÖBBI fülben sül el, tehát mindig idegen
         // változást jelez. Minden fül újratölt -- a vezető is, különben a
@@ -1211,7 +1241,7 @@
         updateUI();
         updateUIStatus(isLeaderTab
             ? `Kész (sor: ${gameQueueLength()}/${gameQueueLimit()}).`
-            : 'Kész (passzív fül – egy másik fül dolgozza fel a sort).');
+            : 'Passzív fül – egy másik, látható fül dolgozza fel a sort.');
         initAmountPatch();
         // A játék sora kívülről is változik (munka lejár, a felhasználó megszakít),
         // ezért a jelzőt periodikusan frissítjük.
@@ -1237,5 +1267,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.0 betöltve.');
+    console.log('[Lisa] Modular v11.1 betöltve.');
 })();

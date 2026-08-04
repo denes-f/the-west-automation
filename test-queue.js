@@ -137,7 +137,7 @@ for (const [txt, want] of [['15mp',15],['45mp',45],['10p',600],['30p',1800],['1�
 // ============================================================
 console.log('\n=== Tárolás ===');
 const store = {};
-global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k,v) => { store[k]=v; } };
+global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k,v) => { store[k]=v; }, removeItem: k => { delete store[k]; } };
 CONFIG.STORAGE_VERSION = 2;
 CONFIG.MAX_HISTORY = 60;
 eval([extract('saveStore'), extract('loadStore'), extract('sanitizeJobs')].join('\n'));
@@ -160,6 +160,57 @@ eq('számmá alakít', [sj.jobId, sj.x], [7, 3]);
 eq('rossz duration -> default', sj.duration, 900);
 eq('hiányzó név pótolva', sj.jobName, 'Job #7');
 eq('felső korlát', sanitizeJobs(new Array(900).fill({ jobId: 1 })).length, 500);
+
+
+// ============================================================
+//  Vezetőválasztás: a látható fül soha ne maradjon némán passzív
+// ============================================================
+console.log('\n=== Vezetőválasztás ===');
+CONFIG.STORAGE_LEADER = 'lisa_leader_tab';
+CONFIG.LEADER_TTL = 15000;
+let TAB_ID = 'engem';
+let visibility = 'visible';
+global.document = { visibilityState: 'visible' };
+Object.defineProperty(global.document, 'visibilityState', { get: () => visibility });
+eval([extract('isVisible'), extract('refreshLeadership'), extract('releaseLeadership')].join('\n'));
+
+const setLeader = o => { store[CONFIG.STORAGE_LEADER] = JSON.stringify(o); };
+const getLeader = () => JSON.parse(store[CONFIG.STORAGE_LEADER] || 'null');
+
+delete store[CONFIG.STORAGE_LEADER];
+isLeaderTab = false; refreshLeadership();
+eq('egyedüli fül vezető lesz', isLeaderTab, true);
+
+// Háttérben lévő vezető + látható fül -> a látható elveszi (ez volt a hiba)
+setLeader({ id: 'masik', ts: Date.now(), visible: false });
+isLeaderTab = false; visibility = 'visible'; refreshLeadership();
+eq('látható fül elveszi a háttérfültől', isLeaderTab, true);
+eq('a bejegyzés a miénk lesz', getLeader().id, 'engem');
+
+// Látható vezető + látható fül -> nem vesszük el (duplikálás elleni védelem marad)
+setLeader({ id: 'masik', ts: Date.now(), visible: true });
+isLeaderTab = true; refreshLeadership();
+eq('látható vezetőt nem előzünk meg', isLeaderTab, false);
+
+// Rejtett fül nem veszi el a látható vezetőtől
+setLeader({ id: 'masik', ts: Date.now(), visible: false });
+isLeaderTab = false; visibility = 'hidden'; refreshLeadership();
+eq('rejtett fül nem vesz át', isLeaderTab, false);
+visibility = 'visible';
+
+// Lejárt bejegyzést bárki átvehet
+setLeader({ id: 'masik', ts: Date.now() - 60000, visible: true });
+isLeaderTab = false; refreshLeadership();
+eq('lejárt vezetés átvehető', isLeaderTab, true);
+
+// Bezáráskor elengedjük -> a következő fül azonnal átveheti
+setLeader({ id: 'engem', ts: Date.now(), visible: true });
+releaseLeadership();
+eq('bezáráskor elengedi a sajátját', getLeader(), null);
+setLeader({ id: 'masik', ts: Date.now(), visible: true });
+releaseLeadership();
+eq('másét nem törli', getLeader().id, 'masik');
+
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
