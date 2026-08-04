@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v11.7 - Alacsonyabb ablak, visszanyitó gomb)
+// @name         The-West Modular Job Queue (Lisa v12.0)
 // @namespace   http://tampermonkey.net/
-// @version     11.7
+// @version     12.0
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -42,7 +42,7 @@
         BOOT_MAX_ATTEMPTS: 60,
         WINDOW_ID: 'lisaExtraQueue',
         PANEL_WIDTH: 320,
-        PANEL_HEIGHT: 300,           // kb. 9 munkasor látszik, a többi görgetéssel
+        PANEL_HEIGHT: 210,           // kb. 4-5 munkasor látszik, a többi görgetéssel
         PANEL_TOP: 140,
         PANEL_RIGHT: 35,
         MAX_AMOUNT: 99,
@@ -51,7 +51,7 @@
         DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
         MAX_EXTRA_QUEUE: 500,
         JOBGROUP_MAX_DIST: 200,      // ennél messzebbi munkacsoportot nem fogadunk el helyszínnek
-        GAME_QUEUE_PREVIEW: 8,       // ennyi várakozó munka látszik a játék sorában
+        GAME_QUEUE_PREVIEW: 6,       // ennyi várakozó munka látszik a játék sorában
     };
 
     // ============================================================
@@ -333,11 +333,12 @@
                 text-shadow: 0 1px 0 rgba(255,255,255,0.45);
             }
             #queuedTasks .lisa-pending-more {
-                display: inline-block;
-                vertical-align: top;
-                font: bold 13px 'Georgia','Times New Roman',serif;
+                display: block;
+                clear: both;
+                font: bold 11px 'Georgia','Times New Roman',serif;
                 color: #4a3b28;
-                padding: 24px 10px;
+                padding: 2px 4px 1px;
+                text-align: center;
                 text-shadow: 0 1px 0 rgba(255,255,255,0.45);
             }
         `;
@@ -462,7 +463,7 @@
         if (hidden > 0) {
             const more = document.createElement('span');
             more.className = 'lisa-pending-more';
-            more.textContent = `+${hidden}`;
+            more.textContent = `+${hidden} további munka`;
             more.title = `${hidden} további munka a listában`;
             host.appendChild(more);
         }
@@ -1288,11 +1289,11 @@
         try { return wman.getById(CONFIG.WINDOW_ID) || null; } catch(e) { return null; }
     }
 
-    // Az ablak szándékosan alacsony: kb. 9 sor fér el, a többi görgetéssel érhető el.
+    // Az ablak szándékosan alacsony; ami nem fér ki, az görgetéssel érhető el.
     // Ennél magasabbra nem érdemes menni, mert a pergamen háttér natúr magassága
     // 420 px, efölé nyúlva a keret teteje üresen maradna.
     function panelHeight() {
-        return Math.max(220, Math.min(CONFIG.PANEL_HEIGHT, window.innerHeight - 180));
+        return Math.max(170, Math.min(CONFIG.PANEL_HEIGHT, window.innerHeight - 180));
     }
 
     function applyPanelGeometry(win) {
@@ -1351,8 +1352,18 @@
         if (!document.getElementById('lisa-body')) {
             if (!buildPanelContent(win)) return null;
             updateUI();
+            refreshIdleStatus();
         }
         return win;
+    }
+
+    // Újranyitás után a státuszsor a helyőrzőt mutatná; írjuk ki a valós állapotot.
+    function refreshIdleStatus() {
+        updateUIStatus(
+            paused ? 'Szüneteltetve'
+            : !isLeaderTab ? 'Passzív fül – egy másik, látható fül dolgozza fel a sort.'
+            : extraJobs.length ? `${extraJobs.length} munka várakozik.`
+            : 'Kész.');
     }
 
     function showLisaPanel() {
@@ -1509,5 +1520,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v11.7 betöltve.');
+    console.log('[Lisa] Modular v12.0 betöltve.');
 })();

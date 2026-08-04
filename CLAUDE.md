@@ -8,7 +8,29 @@ jobs beyond that limit and feeds them in as slots free up.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
   name and runs them against stubs. 93 assertions, no dependencies.
 
-The user installs the script by pasting it into Tampermonkey. There is no deploy step.
+The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
+any change ask them to reinstall before testing live.
+
+**Current release: v12.0.** Feature-complete and in daily use. The behaviour below is all verified;
+treat it as the baseline rather than something to redesign.
+
+## Picking up a new session
+
+1. Read this file first — the game facts below cost many live browser sessions to establish.
+2. `node test-queue.js` should print `93 passed, 0 failed`.
+3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
+   the code is right *because* of these measurements, not the other way round.
+4. Close your tab when finished and say what energy you spent.
+
+## What the script does
+
+- Intercepts **both** ways to start a job — the job window's start buttons and the map's quick-start
+  arrows — and puts the whole batch at the end of its own `extraJobs` list.
+- Feeds jobs into the game's queue as slots free, always in FIFO order.
+- Shows waiting jobs in **two places**: its own game-style window (top right, scrollable) and as
+  extra rows in the game's bottom-right queue widget, under a separator (6 shown, then `+N`).
+- Shows predicted start→finish times per job, chaining travel between locations.
+- Clears the waiting list when the user confirms the game's "cancel all".
 
 ## Ground rules learned the hard way
 
@@ -96,7 +118,8 @@ Bar duration text is compact — `15mp`, `10p`, `1ó` — but prefer `data-base`
   cancels a real job. Verified: with the guard the game handler fires 0 times; an identical
   control element without it fires once.
 - The game **rebuilds `#queuedTasks` when the queue changes** (not on every tick), so injected rows
-  must be re-added — the 2 s watcher does this.
+  must be re-added. A `MutationObserver` does this immediately; relying on the poll made the rows
+  visibly blink out and back on every completion.
 - `.task`/`.icon` CSS is **scoped to `#queuedTasks`**. Rows placed in a sibling container lose all
   styling (collapse to `display:inline`, zero-height icon). They must live inside it, appended
   after the real ones so the game's index mapping is untouched.
@@ -132,6 +155,10 @@ Background layers, measured — these cap how tall a window can usefully be:
 - `.tw2gui_window_inset` carries the **parchment field**: natural **721×420**, `no-repeat`, anchored
   bottom-left. Any window taller than ~454 px leaves the top bare.
 - `.tw2gui_inner_window_bg2` is a **32×420** right-hand edge strip anchored bottom-right.
+
+The script uses **320×210 at top-right (140 px down, 35 px in)** — deliberately short, about
+4 visible rows, everything else by scrolling. Fixed chrome (title bar, status line, toolbar) eats
+~134 px, so visible rows ≈ (height − 134) / 19.
 
 **Keep the window under ~450 px and no override is needed** — the parchment covers it naturally and
 the frame looks exactly like the game's. Stretching the layers to allow a taller window is possible
