@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v10.21 - Megbízható hibakezelés)
+// @name         The-West Modular Job Queue (Lisa v10.22 - FIFO sorrend)
 // @namespace   http://tampermonkey.net/
-// @version     10.21
+// @version     10.22
 // @description XHR‑alapú munkaindítás, maradék automatikus sorba, mennyiség max 99, fallback, auto-close dialógus, menü gomb.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -33,6 +33,9 @@
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_TIMEOUT: 1500,
+        QUEUE_SIZE: 4,               // a játék saját munkasorának mérete
+        DEFAULT_DURATION: 900,       // csak ha se a DOM-ból, se az előzményekből nem derül ki
+        MAX_EXTRA_QUEUE: 500,
     };
 
     // ============================================================
@@ -44,6 +47,7 @@
     let cachedHash = null;
     let pendingJobName = null;
     let pendingJobAmount = 0;
+    let pendingQueueLengthBefore = 0;
     let processing = false;
     let nextJobTimer = null;
     let currentQueueLength = 0;
@@ -65,18 +69,43 @@
     const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
     const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
 
-    function extractJobName(body) {
-        if (!body) return 'Ismeretlen';
-        let params = {};
+    function parseBodyParams(body) {
         try {
-            if (typeof body === 'string') params = Object.fromEntries(new URLSearchParams(body));
-            else if (body instanceof FormData) for (let [k, v] of body.entries()) params[k] = v;
-            else if (typeof body === 'object') params = body;
+            if (typeof body === 'string') return Object.fromEntries(new URLSearchParams(body));
+            if (body instanceof FormData) {
+                const out = {};
+                for (const [k, v] of body.entries()) out[k] = v;
+                return out;
+            }
+            if (body && typeof body === 'object') return body;
         } catch(e) {}
-        for (let k in params) {
-            if (k.endsWith('[jobId]')) return `Job #${params[k]}`;
+        return {};
+    }
+
+    // tasks[N][jobId] & társai -> normalizált munkaobjektum, vagy null.
+    function extractTaskFromBody(body) {
+        const params = parseBodyParams(body);
+        let jobId = null, x = null, y = null, duration = null, taskType = 'job';
+        for (const k in params) {
+            if (k.endsWith('[jobId]')) jobId = params[k];
+            else if (k.endsWith('[x]')) x = params[k];
+            else if (k.endsWith('[y]')) y = params[k];
+            else if (k.endsWith('[duration]')) duration = params[k];
+            else if (k.endsWith('[taskType]')) taskType = params[k];
         }
-        return 'Ismeretlen';
+        if (jobId === null) return null;
+        return {
+            jobId: parseInt(jobId, 10),
+            x: parseInt(x, 10) || 0,
+            y: parseInt(y, 10) || 0,
+            duration: parseInt(duration, 10) || CONFIG.DEFAULT_DURATION,
+            taskType: taskType || 'job',
+        };
+    }
+
+    function extractJobName(body) {
+        const task = extractTaskFromBody(body);
+        return task ? `Job #${task.jobId}` : 'Ismeretlen';
     }
 
     function extractHashFromURL(url) {
@@ -201,6 +230,26 @@
     // ============================================================
     //  6. JOB ADATOK KINYERÉSE (FALLBACKHEZ)
     // ============================================================
+    // "45 mp", "15 p", "1 ó", "1 ó 30 p" -> másodperc. Összetett alakot is kezel,
+    // és az órát is: enélkül minden hosszú munka 15 percnek látszott.
+    function parseDurationText(text) {
+        if (!text) return null;
+        const t = text.trim().toLowerCase();
+        let total = 0, matched = false;
+
+        const hours = t.match(/(\d+)\s*(?:óra|ó|h)/);
+        if (hours) { total += parseInt(hours[1], 10) * 3600; matched = true; }
+
+        const seconds = t.match(/(\d+)\s*(?:mp|sec|s)\b/);
+        if (seconds) { total += parseInt(seconds[1], 10); matched = true; }
+
+        // A perceket csak az "mp" eltávolítása után keressük, különben az "mp" is 'p'-re végződik.
+        const minutes = t.replace(/\d+\s*mp/g, '').match(/(\d+)\s*(?:perc|min|p|m)\b/);
+        if (minutes) { total += parseInt(minutes[1], 10) * 60; matched = true; }
+
+        return matched && total > 0 ? total : null;
+    }
+
     function parseJobWindow(windowEl) {
         const classList = windowEl.className;
         const match = classList.match(/job-(\d+)-(\d+)-(\d+)/);
@@ -208,16 +257,16 @@
         const x = parseInt(match[1], 10);
         const y = parseInt(match[2], 10);
         const jobId = parseInt(match[3], 10);
+
         const activeBar = windowEl.querySelector('.job_durationbar:not(.disabled)');
-        let duration = 15 * 60;
         const durationEl = activeBar ? activeBar.querySelector('.job_value_duration') : null;
-        if (durationEl) {
-            const text = durationEl.textContent.trim();
-            if (text.includes('mp')) {
-                duration = parseInt(text, 10) || 15;
-            } else if (text.includes('p')) {
-                duration = parseInt(text, 10) * 60 || 15 * 60;
-            }
+        let duration = durationEl ? parseDurationText(durationEl.textContent) : null;
+
+        if (!duration) {
+            // A szerver által korábban visszaigazolt érték megbízhatóbb, mint egy vak default.
+            const known = jobHistory.find(j => j.jobId === jobId);
+            duration = known ? known.duration : CONFIG.DEFAULT_DURATION;
+            console.warn(`[Lisa] Időtartam nem olvasható ki (job #${jobId}), használt érték: ${duration}s`);
         }
         return { jobId, x, y, duration, taskType: 'job' };
     }
@@ -241,11 +290,9 @@
         }
         const { amount, jobId, x, y, duration, taskType, jobName } = pendingFallback;
         console.log(`[Lisa Fallback] Sor tele, a játék nem küldött kérést. ${amount} munka az extra sorba.`);
-        for (let i = 0; i < amount; i++) {
-            addExtraJob({ jobId, x, y, duration, taskType }, jobName, false);
-        }
+        const added = addExtraJobs({ jobId, x, y, duration, taskType }, amount, jobName);
         updateUI();
-        updateUIStatus(`${amount} munka az extra sorba helyezve (fallback).`);
+        updateUIStatus(`${added} munka az extra sorba helyezve (fallback).`);
         ensureProcessing();
         clearFallback();
     }
@@ -259,24 +306,41 @@
         const jobWindow = startBtn.closest('.tw2gui_window');
         if (!jobWindow) return;
 
-        scheduleDialogClose();
-
         const titleElem = jobWindow.querySelector('.textart_title');
-        if (titleElem) {
-            pendingJobName = titleElem.textContent.trim();
-            console.log('[Lisa] Munkanév rögzítve:', pendingJobName);
-        }
+        const jobName = titleElem ? titleElem.textContent.trim() : null;
 
         const amountElem = jobWindow.querySelector('.job-amount-num');
-        if (amountElem) {
-            pendingJobAmount = parseInt(amountElem.textContent.trim(), 10) || 1;
-        } else {
-            pendingJobAmount = 1;
+        const amount = amountElem ? (parseInt(amountElem.textContent.trim(), 10) || 1) : 1;
+
+        // Ha az extra sorban már várakozik munka, a játékot NEM engedjük elküldeni
+        // a kérést. Különben a szabad játékslotokba az új munkák kerülnének, azaz
+        // beelőznének a régebben sorbaállítottak elé. Így a sorrend mindig FIFO.
+        const takeoverData = extraJobs.length > 0 ? parseJobWindow(jobWindow) : null;
+        if (takeoverData) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            clearFallback();
+            const name = jobName || `Job #${takeoverData.jobId}`;
+            const added = addExtraJobs(takeoverData, amount, name);
+            addJobToHistory({ ...takeoverData, jobName: name });
+            updateUI();
+            updateUIStatus(`${added} munka az extra sor végére (${extraJobs.length} várakozik).`);
+            ensureProcessing();
+            return;
         }
-        console.log(`[Lisa] Mennyiség: ${pendingJobAmount}`);
+        if (extraJobs.length > 0) {
+            console.warn('[Lisa] Extra sor nem üres, de a munka adatai nem olvashatók ki – a játék kezeli a kattintást.');
+        }
+
+        // Innentől a játék küldi a kérést, mi csak a maradékot kapjuk el.
+        scheduleDialogClose();
+        pendingJobName = jobName;
+        pendingJobAmount = amount;
+        pendingQueueLengthBefore = currentQueueLength;
+        console.log(`[Lisa] Munka: ${pendingJobName}, mennyiség: ${pendingJobAmount}, sor előtte: ${pendingQueueLengthBefore}`);
 
         clearFallback();
-        if (currentQueueLength >= 4) {
+        if (currentQueueLength >= CONFIG.QUEUE_SIZE) {
             const jobData = parseJobWindow(jobWindow);
             if (jobData) {
                 pendingFallback = {
@@ -306,6 +370,12 @@
 
         xhr.send = function(body) {
             reqBody = body;
+            if (reqMethod === 'POST' && reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) {
+                // A fallbacknak azt kell tudnia, hogy a játék ELINDÍTOTTA a kérést.
+                // Ha csak a válasz beérkezésekor jeleznénk, egy a FALLBACK_TIMEOUT-nál
+                // lassabb válasz esetén a fallback is és a játék is hozzáadná a munkákat.
+                jobRequestSent = true;
+            }
             xhr.addEventListener('load', function() {
                 if (reqMethod !== 'POST') return;
 
@@ -320,102 +390,55 @@
                 }
 
                 if (reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) {
-                    jobRequestSent = true;
                     clearFallback();
 
-                    let isError = false;
-                    let resp = null;
-                    try {
-                        resp = JSON.parse(xhr.responseText);
-                        if (resp.error) {
-                            console.log('[Lisa] Szerverhiba:', resp.error);
-                            isError = true;
+                    const verdict = classifyAddResponse(xhr.status, xhr.responseText);
+                    const resp = verdict.resp;
+                    const task = extractTaskFromBody(reqBody);
+                    const jobName = pendingJobName || (task ? `Job #${task.jobId}` : 'Ismeretlen');
+
+                    let queueLengthAfter = null;
+                    if (resp && resp.tasks && typeof resp.tasks === 'object') {
+                        queueLengthAfter = Array.isArray(resp.tasks) ? resp.tasks.length : Object.keys(resp.tasks).length;
+                        currentQueueLength = queueLengthAfter;
+                        if (queueLengthAfter > CONFIG.QUEUE_SIZE) CONFIG.QUEUE_SIZE = queueLengthAfter;
+                        console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
+                    }
+
+                    if (task && (verdict.outcome === 'success' || verdict.outcome === 'queue_full')) {
+                        addJobToHistory({ ...task, jobName });
+                        console.log('[Lisa] Munka rögzítve:', jobName);
+                    }
+
+                    if (task && pendingJobAmount > 0) {
+                        // resp.tasks a sor TELJES tartalma az indítás után, nem a most
+                        // hozzáadottak száma -- a kettő csak üres sorra indítva egyezik.
+                        // A különbségből számolunk, különben részben tele sorra indítva
+                        // némán elveszne a köteg egy része.
+                        let added;
+                        if (verdict.outcome !== 'success') {
+                            added = 0; // a szerver elutasította: a teljes köteg a miénk
+                        } else if (queueLengthAfter !== null) {
+                            added = Math.max(0, queueLengthAfter - pendingQueueLengthBefore);
+                        } else {
+                            added = Math.min(pendingJobAmount, Math.max(0, CONFIG.QUEUE_SIZE - pendingQueueLengthBefore));
                         }
-                    } catch(e) {}
+                        const remaining = Math.max(0, pendingJobAmount - added);
+                        console.log(`[Lisa] Manuális: kért ${pendingJobAmount}, sor ${pendingQueueLengthBefore} -> ${queueLengthAfter}, hozzáadva ${added}, maradék ${remaining}`);
 
-                    if (!isError && resp) {
-                        let addedCount = 0;
-                        if (resp.tasks) {
-                            if (Array.isArray(resp.tasks)) {
-                                currentQueueLength = resp.tasks.length;
-                                addedCount = resp.tasks.length;
-                            } else if (typeof resp.tasks === 'object') {
-                                currentQueueLength = Object.keys(resp.tasks).length;
-                                addedCount = currentQueueLength;
-                            }
-                            console.log(`[Lisa] Sor hossza frissítve: ${currentQueueLength}`);
-                        }
-
-                        if (pendingJobName && pendingJobAmount > 0) {
-                            const remaining = pendingJobAmount - addedCount;
-                            console.log(`[Lisa] Manuális: kért ${pendingJobAmount}, hozzáadva ${addedCount}, maradék: ${remaining}`);
-                            if (remaining > 0) {
-                                let params = {};
-                                try {
-                                    if (typeof reqBody === 'string') params = Object.fromEntries(new URLSearchParams(reqBody));
-                                    else if (reqBody instanceof FormData) for (let [k, v] of reqBody.entries()) params[k] = v;
-                                    else if (reqBody && typeof reqBody === 'object') params = reqBody;
-                                } catch(e) {}
-
-                                let jobId = null, x = null, y = null, duration = null, taskType = 'job';
-                                for (let k in params) {
-                                    if (k.endsWith('[jobId]')) jobId = params[k];
-                                    if (k.endsWith('[x]')) x = params[k];
-                                    if (k.endsWith('[y]')) y = params[k];
-                                    if (k.endsWith('[duration]')) duration = params[k];
-                                    if (k.endsWith('[taskType]')) taskType = params[k];
-                                }
-
-                                if (jobId) {
-                                    for (let i = 0; i < remaining; i++) {
-                                        addExtraJob({
-                                            jobId: parseInt(jobId),
-                                            x: parseInt(x) || 0,
-                                            y: parseInt(y) || 0,
-                                            duration: parseInt(duration) || 3600,
-                                            taskType: taskType,
-                                        }, pendingJobName, false);
-                                    }
-                                    updateUI();
-                                    updateUIStatus(`${remaining} maradék munka az extra sorba helyezve.`);
-                                    ensureProcessing();
-                                }
-                            }
-                        }
-
-                        let params = {};
-                        try {
-                            if (typeof reqBody === 'string') params = Object.fromEntries(new URLSearchParams(reqBody));
-                            else if (reqBody instanceof FormData) for (let [k, v] of reqBody.entries()) params[k] = v;
-                            else if (reqBody && typeof reqBody === 'object') params = reqBody;
-                        } catch(e) {}
-
-                        let jobId = null, x = null, y = null, duration = null, taskType = 'job';
-                        for (let k in params) {
-                            if (k.endsWith('[jobId]')) jobId = params[k];
-                            if (k.endsWith('[x]')) x = params[k];
-                            if (k.endsWith('[y]')) y = params[k];
-                            if (k.endsWith('[duration]')) duration = params[k];
-                            if (k.endsWith('[taskType]')) taskType = params[k];
-                        }
-
-                        if (jobId) {
-                            const jobName = pendingJobName || extractJobName(reqBody);
-                            addJobToHistory({
-                                jobId: parseInt(jobId),
-                                x: parseInt(x) || 0,
-                                y: parseInt(y) || 0,
-                                duration: parseInt(duration) || 3600,
-                                taskType: taskType,
-                                jobName: jobName,
-                                body: reqBody,
-                            });
-                            console.log('[Lisa] Munka rögzítve:', jobName);
+                        if (remaining > 0) {
+                            const queued = addExtraJobs(task, remaining, jobName);
+                            updateUI();
+                            updateUIStatus(verdict.outcome === 'success'
+                                ? `${queued} maradék munka az extra sorba helyezve.`
+                                : `${queued} munka az extra sorba (szerver: ${verdict.reason}).`);
+                            ensureProcessing();
                         }
                     }
 
                     pendingJobName = null;
                     pendingJobAmount = 0;
+                    pendingQueueLengthBefore = 0;
                 }
             });
             origSend.apply(this, arguments);
@@ -455,20 +478,38 @@
     // ============================================================
     //  9. EXTRA SOR KEZELÉSE
     // ============================================================
-    function addExtraJob(params, displayName = null, updateUIAfter = false) {
-        const job = {
-            id: generateId(),
-            retries: 0,
-            jobName: displayName || `Job #${params.jobId}`,
-            jobId: params.jobId,
-            x: params.x,
-            y: params.y,
-            duration: params.duration,
-            taskType: params.taskType || 'job',
-        };
-        extraJobs.push(job);
+    // Kötegelt hozzáadás: egyetlen localStorage írás N helyett. 99 munka
+    // hozzáadása korábban 99 szinkron stringify+write ciklust jelentett.
+    function addExtraJobs(params, count, displayName) {
+        const wanted = Math.max(0, Math.min(parseInt(count, 10) || 0, CONFIG.MAX_AMOUNT));
+        const room = Math.max(0, CONFIG.MAX_EXTRA_QUEUE - extraJobs.length);
+        const n = Math.min(wanted, room);
+        const name = displayName || `Job #${params.jobId}`;
+
+        for (let i = 0; i < n; i++) {
+            extraJobs.push({
+                id: generateId(),
+                retries: 0,
+                deferrals: 0,
+                jobName: name,
+                jobId: params.jobId,
+                x: params.x,
+                y: params.y,
+                duration: params.duration,
+                taskType: params.taskType || 'job',
+            });
+        }
         saveExtraQueueToStorage();
-        console.log(`[Lisa] Extra sorba: ${job.jobName} (ID:${job.jobId}) (${extraJobs.length})`);
+
+        if (n < wanted) {
+            console.warn(`[Lisa] Extra sor megtelt (${CONFIG.MAX_EXTRA_QUEUE}), ${wanted - n} munka nem fért be.`);
+        }
+        if (n > 0) console.log(`[Lisa] Extra sorba: ${n}x ${name} (ID:${params.jobId}) (összesen ${extraJobs.length})`);
+        return n;
+    }
+
+    function addExtraJob(params, displayName = null, updateUIAfter = false) {
+        addExtraJobs(params, 1, displayName);
         if (updateUIAfter && uiExtraList) updateUI();
     }
 
@@ -638,7 +679,7 @@
             updateUIStatus(`Indítás: ${job.jobName} (még ${extraJobs.length} a sorban)`);
             console.log(`[Lisa] Munka indítása: ${job.jobName} (ID:${job.jobId})`);
 
-            const slotIndex = currentQueueLength % 4;
+            const slotIndex = currentQueueLength % CONFIG.QUEUE_SIZE;
             const bodyParams = new URLSearchParams();
             bodyParams.set(`tasks[${slotIndex}][jobId]`, job.jobId);
             bodyParams.set(`tasks[${slotIndex}][x]`, job.x);
