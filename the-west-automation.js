@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.3)
+// @name         The-West Modular Job Queue (Lisa v12.4)
 // @namespace   http://tampermonkey.net/
-// @version     12.3
+// @version     12.4
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -506,6 +506,72 @@
                 notEnoughEnergy: energyBefore !== null && cost !== null && energyBefore < cost,
             };
         });
+    }
+
+    // ------------------------------------------------------------
+    //  Előrejelzett energiasáv a karakter energiasávja alatt
+    // ------------------------------------------------------------
+    // A játék sávja egyetlen div, a töltöttséget a háttérsprite eltolása adja.
+    // A képletet a játékból olvastuk ki (WestUi.updateEnergy), így a saját
+    // sávunk pixelre ugyanúgy néz ki -- csak halványabb, mert ez jóslat.
+    const ENERGY_BAR_WIDTH = 137;
+
+    function energySpriteY() {
+        try {
+            return (window.Premium && Premium.hasBonus('regen')) ? -26 : -13;
+        } catch(e) { return -13; }
+    }
+
+    // A játék calcWidth-e, változtatás nélkül.
+    function energyBarFill(value, max, width) {
+        return Math.min(width, Math.max(0, Math.ceil(width * (value / max * 100) / 100)));
+    }
+
+    function ensureEnergyForecastBar() {
+        const real = document.querySelector('#ui_character_container > .energy_bar');
+        if (!real) return null;
+        let bar = document.getElementById('lisa-energy-forecast');
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.id = 'lisa-energy-forecast';
+            // A játék osztályai hozzák a spritot és a tipográfiát; a
+            // hasMousePopup-ot NEM vesszük át, mert az a játék sávjáé.
+            bar.className = 'status_bar energy_bar';
+            real.parentElement.appendChild(bar);
+        }
+        // Ugyanaz a térköz, ahogy az energiasáv követi az életsávot (15 px).
+        bar.style.position = 'absolute';
+        bar.style.left = getComputedStyle(real).left;
+        bar.style.top = (real.offsetTop + 15) + 'px';
+        bar.style.opacity = '0.72';
+        bar.style.cursor = 'help';
+        return bar;
+    }
+
+    // A lista VÉGÉN várható energia. Dinamikus: a jóslás a regenerációt is
+    // tartalmazza, tehát ha közben töltődik, a sáv magától követi.
+    function updateEnergyForecastBar() {
+        const bar = ensureEnergyForecastBar();
+        if (!bar) return;
+        const c = window.Character;
+        const max = (c && c.maxEnergy) || 100;
+        const last = lastForecast.length ? lastForecast[lastForecast.length - 1] : null;
+        const value = last && typeof last.energyAfter === 'number' ? last.energyAfter : null;
+
+        // Üres listánál vagy ismeretlen költségnél nincs mit jósolni.
+        if (value === null || !extraJobs.length) {
+            bar.style.display = 'none';
+            return;
+        }
+        bar.style.display = 'block';
+        const shown = Math.max(0, Math.min(max, value));
+        bar.style.backgroundPosition =
+            `${-ENERGY_BAR_WIDTH + energyBarFill(shown, max, ENERGY_BAR_WIDTH)}px ${energySpriteY()}px`;
+        bar.textContent = `${shown} / ${max}`;
+        bar.title = `Várható energia a lista végén (${extraJobs.length} munka után): ${value}`
+            + (value < 0 ? `\nEnnyi energia nem lesz meg – ${-value} hiányzik.` : '');
+        // Ha a lista elfogyasztaná az összes energiát, az szembetűnő legyen.
+        bar.style.boxShadow = value <= 0 ? 'inset 0 0 0 1px #a03020' : '';
     }
 
     function forecastForExtraQueue(jobs, etas) {
@@ -1873,7 +1939,8 @@
         ensureMenuButton();
         patchHotelStart();      // a hotel ablak később is betöltődhet
         updateQueueBadge();
-        updateExtraEtas();
+        updateExtraEtas(refreshForecast());
+        updateEnergyForecastBar();
         updateKeepAwake();
         cancelSleepIfFull();
         observePendingHost();
@@ -2306,12 +2373,19 @@
 
     // Csak az időpont-szövegeket írja át, a sorokat nem építi újra: így percenként
     // sokszor frissülhet anélkül, hogy a listát folyamatosan újrarajzolnánk.
-    function updateExtraEtas() {
-        if (!uiExtraList) return;
+    // Az előrejelzés a paneltől FÜGGETLENÜL frissül: az energiasáv a karakter
+    // dobozában akkor is látszik, ha a panel épp zárva vagy minimalizálva van.
+    function refreshForecast() {
         refreshJobInfo(extraJobs);
         const etas = computeEtas(extraJobs);
-        const forecast = forecastForExtraQueue(extraJobs, etas);
-        lastForecast = forecast;
+        lastForecast = forecastForExtraQueue(extraJobs, etas);
+        return etas;
+    }
+
+    function updateExtraEtas(precomputed) {
+        const etas = precomputed || refreshForecast();
+        if (!uiExtraList) return;
+        const forecast = lastForecast;
         updateTotalEta(etas);
         etas.forEach((eta, i) => {
             const li = uiExtraList.children[i];
@@ -2391,5 +2465,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.3 betöltve.');
+    console.log('[Lisa] Modular v12.4 betöltve.');
 })();

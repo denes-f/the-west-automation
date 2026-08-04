@@ -11,7 +11,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.3.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.4.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -30,6 +30,9 @@ treat it as the baseline rather than something to redesign.
 - Intercepts **both** ways to start a job — the job window's start buttons and the map's quick-start
   arrows — and puts the whole batch at the end of its own `extraJobs` list.
 - Feeds jobs into the game's queue as slots free, always in FIFO order.
+- Shows a **third status bar** under the character's own energy bar with the energy predicted for
+  the end of the waiting list — same sprite, faded. It updates every second even when the panel is
+  closed, so recovered energy is reflected as it happens.
 - Warns per job when the **motivation** at its predicted start would be ≤ 75%, or when the
   **energy** won't cover its cost — and offers to insert a **sleep** (never unasked, never a paid
   room), cancelling it as soon as the room's energy level is reached.
@@ -217,6 +220,25 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   `#ui_workcontainer` is `display:none` when the queue is empty — injected rows are then invisible.
   Accepted limitation; forcing it visible would fight the game's own show/hide.
 - The queue background is **light parchment**, so overlay text must be dark (`#4a3b28`), not cream.
+
+### The character's status bars
+
+`#ui_character_container` holds `.status_bar.health_bar` (`top:146px`) and `.status_bar.energy_bar`
+(`top:161px`), each `137×13` at `left:3px`, `position:absolute`. The container is only 176 px tall
+but `overflow:visible`, so a third bar at `top:176px` renders cleanly just below it.
+
+Each bar is a **single div**; the fill is the sprite's horizontal offset, from `WestUi.updateEnergy`:
+
+```js
+calcWidth = (v, max, w) => Math.min(w, Math.max(0, Math.ceil(w * (v / max * 100) / 100)));
+el.text(energy + ' / ' + maxEnergy)
+  .css('background-position', (-137 + calcWidth(energy, maxEnergy, 137)) + 'px ' + y + 'px');
+```
+
+`y` is `-13` normally and `-26` with the `regen` premium bonus (which also adds
+`.energy_premium_bonus`). Reusing the game's `status_bar energy_bar` classes and this formula makes
+an injected forecast bar pixel-identical — do **not** copy `hasMousePopup`, that belongs to the
+game's own bar and would attach its tooltip handler.
 
 ### Map quick-start arrows
 

@@ -57,6 +57,8 @@ const updateExtraList = () => {};
 const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
+const refreshForecast = () => [];          // előrejelzés: élő játékállapot kell hozzá
+const updateEnergyForecastBar = () => {};  // a karakterdoboz sávja szintén
 const renderPendingInGameQueue = () => {};
 const observePendingHost = () => {};
 const ensureMenuButton = () => {};
