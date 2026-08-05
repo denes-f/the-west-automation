@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.12)
+// @name         The-West Modular Job Queue (Lisa v12.13)
 // @namespace   http://tampermonkey.net/
-// @version     12.12
+// @version     12.13
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -42,6 +42,7 @@
         TICK_STALL_WARN: 5000,       // ennél nagyobb ütemkihagyást már naplózunk
         LONG_GAP_MS: 30000,          // ennél hosszabb kihagyás után a játék is lemaradt
         LONG_GAP_SETTLE_MS: 1500,    // ...ezért hagyunk neki ennyit, mielőtt döntenénk
+        AUDIO_STALL_MS: 4000,        // ennyi néma timeupdate után hisszük elakadtnak
         SLOT_FREED_DELAY: 400,       // felszabadult slot után ennyivel indítjuk a következőt
         NEW_WORK_DELAY: 500,         // új munka érkezésekor eddig hozzuk előre a következő kört
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
@@ -1085,7 +1086,8 @@
         if (sleepModeAsked) return;
         const task = window.TaskQueue.queue.find(t => t && t.type === 'sleep');
         if (!task || !task.queueId) return;
-        if (!hasWorkWaiting()) return;                       // nincs miért ébredni
+        // Nincs miért ébredni: csak az EZ UTÁN következő munka számít.
+        if (!hasWorkWaiting(task)) return;
         if (runningSleepDecision && runningSleepDecision.queueId === task.queueId) return;
         if (!window.west || !west.gui || typeof west.gui.Dialog !== 'function') {
             saveSleepDecision(task.queueId, 'full');         // kérdezni sem tudunk
@@ -1097,9 +1099,12 @@
         // viszont nem: a sorba került munka energiája már le van vonva, tehát
         // hozzá nem kell újabb. Ezért a 0-t inkább elhagyjuk, mint kiírjuk.
         const needed = energyNeededFrom(0);
-        const count = countWorkWaiting();
+        const count = countWorkWaiting(task);
         const roomTarget = sleepTargetEnergy(task.data && task.data.room);
-        const msg = `Alszol, és ${count} munka vár a sorban`
+        // A kérdés akkor is jöhet, amikor az alvás még csak a sorban áll (előtte
+        // futó munkákkal), ezért nem állítjuk, hogy a karakter már alszik.
+        const bevezeto = task.queuePos === 0 ? 'Alszol, és' : 'Alvás van a sorban, és';
+        const msg = `${bevezeto} ${count} munka vár mögötte`
             + (needed ? ` (${needed} energia kell hozzájuk). ` : '. ')
             + `Menjen végig az alvás (${roomTarget} energiáig), vagy szakítsam meg, amint elég energia gyűlt?`;
         let answered = false;
@@ -1137,16 +1142,26 @@
     // szolgálati bejegyzés is ilyen, azok miatt viszont nincs értelme ébredni.
     // A munkát az azonosítja, hogy a `post`-jában van jobId (ezt a Task ősosztály
     // tölti ki minden bejegyzésnél; az alvás post-ja csak {taskType:'sleep'}).
-    function hasWorkWaiting() {
-        return countWorkWaiting() > 0;
+    function hasWorkWaiting(sleepTask) {
+        return countWorkWaiting(sleepTask) > 0;
     }
 
     // Ugyanaz, de darabszámmal -- a kérdés szövege ezt írja ki.
-    function countWorkWaiting() {
+    //
+    // A `sleepTask` megadásakor CSAK az az alvás MÖGÖTT álló munka számít. Ez nem
+    // finomkodás: az alvást magában küldjük ugyan, de a játék sorában előtte még
+    // ott futhatnak a korábban elindított munkák. Azok az alvás ELŐTT fejeződnek
+    // be, tehát értük semmi értelme korábban ébredni -- a v12.11-ben mégis
+    // előjött tőlük a "meddig aludjak?" kérdés egy olyan alvásnál, ami után
+    // egyetlen munka sem következett.
+    function countWorkWaiting(sleepTask) {
         let n = extraJobs.filter(j => j && j.taskType !== 'sleep').length;
         if (gameReady()) {
-            n += window.TaskQueue.queue.filter(t =>
-                t && t.type !== 'sleep' && t.post && typeof t.post.jobId === 'number').length;
+            const q = window.TaskQueue.queue;
+            const after = sleepTask ? q.indexOf(sleepTask) : -1;
+            n += q.filter((t, i) =>
+                t && t.type !== 'sleep' && t.post && typeof t.post.jobId === 'number'
+                && (after < 0 || i > after)).length;
         }
         return n;
     }
@@ -1160,12 +1175,13 @@
     // energiával is. Enélkül a script minden alvást azonnal megszakítana.
     function cancelSleepIfFull() {
         if (!gameReady() || !isLeaderTab) return;
-        if (!hasWorkWaiting()) return;
         const pos = window.TaskQueue.queue.findIndex(t => t && t.type === 'sleep');
         if (pos === -1) return;
         const task = window.TaskQueue.queue[pos];
         // Csak a MÁR FUTÓ alvást szakítjuk meg, a sorban állót nem.
         if (task.queuePos !== 0) return;
+        // ...és csak akkor, ha van MÖGÖTTE munka. Az előtte állókért nincs értelme.
+        if (!hasWorkWaiting(task)) return;
         const room = task.data && task.data.room;
         // A cél lehet a szoba szintje ('full'), vagy csak annyi, amennyi a
         // várakozó munkákhoz kell ('enough') -- ez utóbbi élőben újraszámolódik,
@@ -2307,28 +2323,43 @@
         return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
     }
 
-    function startKeepAudio() {
-        if (!keepAwakeWanted) return;
+    // A hurok-elem LÉTREHOZÁSA külön lépés, és szándékosan korán történik.
+    //
+    // MÉRVE (Chrome): a REJTETT fülön létrehozott media elemet a böngésző el sem
+    // kezdi betölteni -- readyState végig 0, networkState LOADING, a play()
+    // ígérete pedig sosem dől el. Se blob:, se data: URI-val nem indul el.
+    // Ugyanaz az elem viszont, ha LÁTHATÓ fülön jött létre, elrejtés után is
+    // vidáman szól (mérve: 7 percen át, 4 timeupdate/mp).
+    //
+    // Ezért az elemet a boot-nál hozzuk létre, amikor a fül jellemzően látható,
+    // és ha mégis rejtve született (a játék háttérfülön indult), láthatóvá
+    // váláskor újra nekifutunk. Enélkül a "hosszú listát indítok, majd elteszem
+    // a böngészőt" eset -- vagyis a tipikus -- pont a védelem nélkül maradna.
+    function ensureKeepAudioElement() {
+        if (keepAudio && keepAudio.readyState > 0) return;   // már betöltött, kész
+        if (keepAudio && !isVisible()) return;               // rejtve úgysem töltődne be
         if (!keepAudio) {
             keepAudio = new Audio(quietLoopUrl());
             keepAudio.loop = true;
             keepAudio.volume = 0.01;
-            // Safariban a beágyazott lejátszás külön engedélyt kér; enélkül a
-            // hang el sem indul, és a fül fagyás elleni védettsége is elmarad.
+            keepAudio.preload = 'auto';
             keepAudio.setAttribute('playsinline', '');
-            keepAudio.muted = false;         // a NÉMA hangot nem tekintik lejátszásnak
-            // A médialejátszás saját eseményei NEM ritkulnak a rejtett fülön:
-            // mérve percenkénti helyett ~4/mp (legrosszabb kihagyás 271 ms).
-            // Ez a MÁSODIK ütemforrásunk, arra az esetre, ha a worker nem indul
-            // (szigorú CSP). Csak akkor szól, amikor van várakozó munka -- tehát
-            // pont akkor jár, amikor kell.
-            keepAudio.addEventListener('timeupdate', () => tick('audio'));
+            keepAudio.addEventListener('timeupdate', () => { noteAudioProgress(); tick('audio'); });
         }
+        try { keepAudio.load(); } catch(e) {}
+    }
+
+    function startKeepAudio() {
+        if (!keepAwakeWanted) return;
+        ensureKeepAudioElement();
+        if (!keepAudio) return;
         if (keepAudio.paused) {
             // Felhasználói mozdulat előtt a böngésző letilthatja a lejátszást (a
             // Safari ebben szigorúbb). A játékban úgyis történik mozdulat, és az
             // arra kötött újrapróbálkozás indítja el.
-            keepAudio.play().catch(() => {});
+            // A sikeres indítástól számít az elakadás-figyelés: enélkül egy soha
+            // el nem induló hangot "rendben"-nek látnánk.
+            keepAudio.play().then(noteAudioProgress).catch(() => {});
         }
     }
 
@@ -2337,16 +2368,33 @@
     }
 
     // Tényleg SZÓL-e? A `paused === false` még nem elég: egy meg sem induló
-    // elem is lehet "nem szüneteltetett". Az számít, hogy halad-e az idő.
-    let lastAudioTime = -1;
+    // elem is lehet "nem szüneteltetett".
+    //
+    // FONTOS, hogy NE a currentTime-ot hasonlítsuk össze két ütem között: a hurok
+    // pontosan 1 másodperc, az ütem is nagyjából annyi, tehát a két frekvencia
+    // összecsúszik, és a mintavétel újra meg újra ugyanarra a fázisra esik.
+    // A v12.12 pont ettől jelentett tévesen "elakadt" hangot -- Chrome-ban és
+    // Safariban egyaránt --, holott a lejátszás végig rendben volt (mérve: a
+    // timeupdate 4/mp-cel jött, miközben a kijelzés elakadást mutatott).
+    // Ezért az utolsó timeupdate ÓTA ELTELT IDŐ dönt: az fázisfüggetlen.
+    let lastAudioEventAt = 0;
     let audioStalled = false;
 
+    function noteAudioProgress() {
+        lastAudioEventAt = Date.now();
+        audioStalled = false;
+    }
+
     function checkKeepAudio() {
-        if (!keepAwakeWanted || !keepAudio) { lastAudioTime = -1; audioStalled = false; return; }
-        const t = keepAudio.currentTime;
-        // Hurokban a currentTime vissza is ugorhat 0-ra, az is haladás.
-        audioStalled = (lastAudioTime >= 0 && t === lastAudioTime);
-        lastAudioTime = t;
+        if (!keepAwakeWanted || !keepAudio || keepAudio.paused) {
+            audioStalled = false;
+            return;
+        }
+        // A readyState 0 az a bizonyos "rejtett fülön született, sosem töltődött
+        // be" eset: a paused ilyenkor is false, tehát ezt külön kell nézni.
+        const soseIndult = keepAudio.readyState === 0;
+        audioStalled = soseIndult
+            || (lastAudioEventAt > 0 && (Date.now() - lastAudioEventAt) > CONFIG.AUDIO_STALL_MS);
         if (audioStalled) startKeepAudio();
     }
 
@@ -2355,6 +2403,8 @@
         const parts = [];
         parts.push(wakeLock ? 'képernyőzár: aktív' : 'képernyőzár: nincs');
         if (!keepAudio) parts.push('hang: nincs');
+        else if (keepAudio.readyState === 0)
+            parts.push('hang: nem töltődött be (rejtett fülön indult; hozd előtérbe egyszer)');
         else if (keepAudio.paused) parts.push('hang: szünetel (kattints a játékba)');
         else if (audioStalled) parts.push('hang: elakadt');
         else parts.push('hang: szól');
@@ -2548,7 +2598,7 @@
 
     // Kívülről is lekérdezhető, hogy a felhasználó látni tudja, mit ér a védekezés.
     window.lisaDiag = () => ({
-        verzio: '12.12',
+        verzio: '12.13',
         lathato: isVisible(),
         fokusz: document.hasFocus(),
         utemado: tickWorker ? 'worker' : 'fül-időzítő',
@@ -2661,7 +2711,11 @@
         // újra kell kérni -- enélkül az első fülváltás után már nem védene.
         document.addEventListener('visibilitychange', () => {
             refreshLeadership();
-            if (isVisible()) requestWakeLock();
+            if (isVisible()) {
+                requestWakeLock();
+                // Ha az elem rejtett fülön született, most van esélye betöltődni.
+                ensureKeepAudioElement();
+            }
             catchUpNow('visibility');
         });
         // Ablak előhozása, gépébredés, hálózat visszatérése, bfcache-ből visszalépés:
@@ -3148,6 +3202,12 @@
         // A játék sora kívülről is változik (munka lejár, a felhasználó megszakít),
         // ezért rendszeresen ránézünk.
         lastSeenQueueLen = gameQueueLength();
+        // A hurok-elemet MOST hozzuk létre, nem majd az első munkánál: a
+        // böngésző a rejtett fülön születő media elemet el sem kezdi betölteni,
+        // és a tipikus használat épp az, hogy a felhasználó sorba állít, majd
+        // elteszi a böngészőt. Betöltjük, de nem játsszuk le -- a lejátszás
+        // csak akkor indul, amikor tényleg van várakozó munka.
+        ensureKeepAudioElement();
         startTicker();
         if (extraJobs.length > 0) ensureProcessing();
     }
@@ -3170,5 +3230,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.12 betöltve.');
+    console.log('[Lisa] Modular v12.13 betöltve.');
 })();

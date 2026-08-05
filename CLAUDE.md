@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 215 assertions, no dependencies.
+  name and runs them against stubs. 220 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,7 +15,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.12.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.13.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -66,7 +66,7 @@ you spent.
 **Only one game tab.** A second tab holding the leader lock is what made v11.0 look completely
 broken. Close your own tab when finished.
 
-## State of play (end of the v12.12 session)
+## State of play (end of the v12.13 session)
 
 Everything is committed and pushed on `dev`; `main` is at v12.0 and has not been moved since.
 The user runs the script on two accounts: the `hu27` test character (level 10, max energy 100, in a
@@ -90,18 +90,21 @@ not fix background throughput** — the user reported ~2.2 min per 15 s job in S
 the real cause.
 
 Confirmed live by the user in v12.11: the worker ticker runs in **Safari** too (`utemado: "worker"`,
-worst hidden-tab gap 3.0 s — coarser than Chrome's 1.0 s but far from 60 s). Also in Safari the
-quiet loop reported `hang: elakadt` — `play()` resolved, `paused === false`, but `currentTime` never
-advanced, so the audio is not actually running there and neither the freeze protection nor the
-`timeupdate` tick source is available. Not yet diagnosed.
+worst hidden-tab gap 3.0 s — coarser than Chrome's 1.0 s but far from 60 s).
+
+**v12.12 was tested end-to-end in a real game session** (Chrome, installed build, jobs started
+through the job window so the script's own interception ran): `utemado: "worker"`,
+`jatekPorgetes: "aktív"`, and the 4.0 jobs/minute hidden-tab result recorded under "Keep-awake".
+The `hang: elakadt` the user saw in Safari turned out to be **two separate bugs of mine**, both
+reproduced and fixed in v12.13 — the `currentTime` aliasing false positive, and the genuinely
+never-loading element created in a hidden tab. Both are written up under "Keep-awake".
 
 Verified **only by unit tests**, never yet exercised end-to-end in a real game: the rejected-job
 requeue path — its trigger was reproduced live, but the recovery was written afterwards. Worth
-watching the first time it fires for real. Also the *wiring* of v12.11's ticker and v12.12's pump:
-the mechanisms were each measured in the live page by hand and the script loads clean under a
-stubbed DOM, but the assembled `startTicker`/`tick`/`pumpGameClient` path has not run inside a real
-game session — check `lisaDiag()` shows `utemado: "worker"`, `jatekPorgetes: "aktív"`, and a ~1 s
-worst hidden-tab gap the first time it runs.
+watching the first time it fires for real. Also v12.13 itself: the sleep-position fix and the two
+audio fixes have unit tests and were each measured in the page by hand, but the assembled build has
+not run a full game session — check `keepAwakeStatus()` reports `hang: szól` (not `nem töltődött
+be`) once jobs are queued.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -478,15 +481,35 @@ and "Nem" correctly does nothing.
   `hasWorkWaiting` from "anything that isn't a sleep", which let a non-job queue entry raise the
   dialog with "0 munka vár a sorban". `countWorkWaiting` is the same predicate with a count, so
   the dialog's number covers both sources (the old text printed `extraJobs.length` alone).
+  **Only work *behind* the sleep counts** (v12.13). `hasWorkWaiting(sleepTask)`/
+  `countWorkWaiting(sleepTask)` ignore game-queue entries at an index at or before the sleep's.
+  A sleep is sent alone, but the jobs started *before* it are still running in the game's queue
+  ahead of it — they finish before the sleep even starts, so waking early does nothing for them.
+  Counting them is what raised "meddig aludjak?" for a sleep queued last with nothing after it.
+  The dialog also no longer claims the character is asleep when the sleep is still queued
+  (`queuePos !== 0`).
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
   display/machine sleeping — re-requested on `visibilitychange` and `focus`, since the browser
   releases it when the tab is hidden — plus an inaudible looping WAV, because Chrome does not freeze
   a tab that is playing audio. A fully silent track would not count as playing, hence amplitude ±1.
   Autoplay is blocked until a user gesture, so playback is retried on `click`/`pointerdown`/
-  `keydown`/`touchstart`, and `checkKeepAudio` verifies `currentTime` is actually advancing —
-  `paused === false` alone does not prove the element ever started. Neither mechanism replaces the
-  OS/browser settings (`caffeinate`, Chrome Memory Saver exclusion — Memory Saver *discards* the
-  tab, which no wake lock or audio survives).
+  `keydown`/`touchstart`. Neither mechanism replaces the OS/browser settings (`caffeinate`, Chrome
+  Memory Saver exclusion — Memory Saver *discards* the tab, which no wake lock or audio survives).
+
+  **A media element created while the tab is hidden never loads** (measured, Chrome): `readyState`
+  stays 0, `networkState` stays LOADING, and the `play()` promise never settles. Not a URI problem —
+  `blob:` and `data:` behave identically. The same element created while *visible* keeps playing
+  happily after the tab is hidden (measured: 7 minutes, 4 `timeupdate`/s). So `ensureKeepAudioElement`
+  runs at **boot** and again on every `visibilitychange` → visible, rather than lazily at the first
+  queued job — otherwise the most common case of all ("queue a long list, then put the browser away")
+  is exactly the one left unprotected. Note `document.visibilityState` is `hidden` for an **occluded
+  or minimized window**, not just a background tab, so this is easy to hit.
+
+  **Do not detect a stalled loop by comparing `currentTime` between ticks.** The loop is exactly 1 s
+  and the tick is ~1 s, so the sampling aliases onto the same phase and reports a false stall — v12.12
+  shipped this and cried "hang: elakadt" in both Chrome and Safari while playback was fine. Use time
+  since the last `timeupdate` (phase-independent), plus an explicit `readyState === 0` check for the
+  never-loaded case above, which is the one condition `paused === false` hides.
 - **The ticker (`startTicker`/`tick`) is what makes a background tab usable.** Measured on the live
   game page, Chrome, two 7-minute runs with the tab hidden — worst gap between ticks:
 
@@ -555,6 +578,12 @@ and "Nem" correctly does nothing.
   functions at the rate the game already intends** — we are restoring the normal 1 Hz, not
   exceeding it. Skipped while `TaskQueue.busy` or our own `processing` is set, so we never splice
   the queue under an in-flight batch. `lisaDiag().jatekPorgetes` reports whether it is available.
+
+  **End-to-end result** (v12.12, measured through the script's own interception path — 30 × 15 s
+  jobs started from the job window, tab hidden for the entire 10-minute run, well past the 5-minute
+  intensive-throttling threshold): 25 feeds, gaps **min 14 s / max 16 s / mean 15.0 s**, each slot
+  refilled within ~1 s of freeing. That is **4.0 jobs/minute — the theoretical maximum** for 15 s
+  jobs, sustained in a hidden tab, against the ~0.45/min the user measured before the fix.
 - **After a gap ≥ `LONG_GAP_MS`, if the pump is unavailable, the game client is stale.** `tick`
   then pushes the next decision out by `LONG_GAP_SETTLE_MS` to let the game catch up on its own.
   With the pump working this branch never runs — it is the fallback for a client without

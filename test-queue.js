@@ -823,6 +823,26 @@ setState([], [{ type: 'sleep' }, { type: 'walk', post: { taskType: 'walk' } }]);
 eq('utazás nem munka -> nem kérdezünk', hasWorkWaiting(), false);
 setState(mkJobs(2), [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
 eq('a két forrás összeadódik', countWorkWaiting(), 3);
+
+// Az alvás ELŐTT futó munkák nem számítanak: azok az alvás előtt befejeződnek,
+// tehát értük nincs értelme korábban ébredni. Élesben ettől jött elő a "meddig
+// aludjak?" kérdés egy olyan alvásnál, ami után egyetlen munka sem következett.
+const alvas = { type: 'sleep', queuePos: 3 };
+setState([], [
+    { type: 'job', post: { jobId: 7 } },
+    { type: 'job', post: { jobId: 7 } },
+    { type: 'job', post: { jobId: 7 } },
+    alvas,
+]);
+eq('az alvás ELŐTTI munkák nem számítanak', countWorkWaiting(alvas), 0);
+eq('...tehát nincs miért ébredni', hasWorkWaiting(alvas), false);
+eq('alvás megadása nélkül viszont igen', hasWorkWaiting(), true);
+// Ami MÖGÖTTE áll, az továbbra is számít.
+window.TaskQueue.queue.push({ type: 'job', post: { jobId: 9 } });
+eq('az alvás MÖGÖTTI munka számít', countWorkWaiting(alvas), 1);
+// A saját listánk mindig az alvás mögött van.
+setState(mkJobs(2), [{ type: 'job', post: { jobId: 7 } }, alvas]);
+eq('a saját listánk mindig mögötte van', countWorkWaiting(alvas), 2);
 extraJobs = [];
 
 // ============================================================
