@@ -698,6 +698,13 @@ extraJobs = [{ taskType: 'sleep', room: 'x', sleepMode: 'enough' }, mkJobs(1)[0]
 eq('az alvás a mögötte állókra gyűjt', sleepGoalForEntry(extraJobs[0], 0), 10);
 extraJobs[0].sleepMode = 'full';
 eq('teljes módban a szoba szintjéig', sleepGoalForEntry(extraJobs[0], 0), 150);
+
+// Ha nincs mögötte munka (pl. a felhasználó időközben törölte őket), az
+// 'enough' cél 0 lenne -- olyankor viszont nincs miért ébredni, tehát a
+// teljes alvásra állunk vissza. Enélkül a cél 0, és a script azonnal ébreszt.
+extraJobs = [{ taskType: 'sleep', room: 'x', sleepMode: 'enough' }];
+eq('mögötte semmi -> mégis teljes alvás', sleepGoalForEntry(extraJobs[0], 0), 150);
+eq('üres listánál is a szoba szintje', sleepGoalEnergy('enough', 'x', 5), 150);
 extraJobs = [];
 
 // ============================================================
@@ -796,19 +803,26 @@ eq('a hiányos alvásbejegyzések kiesnek', stored[1].jobId, 129);
 
 // Alvás közben a karaktert nem lehet párbajra hívni, ezért munka híján NEM
 // ébresztünk -- még tele energiával sem. Csak akkor, ha van mit dolgozni.
-eval(extract('hasWorkWaiting'));
+eval([extract('hasWorkWaiting'), extract('countWorkWaiting')].join('\n'));
 const setState = (extra, queue) => {
     extraJobs = extra;
     window.TaskQueue = { queue, limit: { normal: 4, premium: 9 } };
 };
 setState([], [{ type: 'sleep' }]);
 eq('üres sor + alvás -> hagyjuk aludni', hasWorkWaiting(), false);
+eq('üres sor + alvás -> 0 munka', countWorkWaiting(), 0);
 setState([{ taskType: 'sleep' }], [{ type: 'sleep' }]);
 eq('csak egy másik alvás vár -> nem ébresztünk', hasWorkWaiting(), false);
 setState(mkJobs(1), [{ type: 'sleep' }]);
 eq('várakozó munka -> ébresztünk', hasWorkWaiting(), true);
-setState([], [{ type: 'sleep' }, { type: 'job' }]);
+setState([], [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
 eq('a játék sorában álló munka is számít', hasWorkWaiting(), true);
+// A játék sorában a "nem alvás" önmagában kevés: utazás és egyéb szolgálati
+// bejegyzés miatt nem ébresztünk, és a kérdést sem tesszük fel emiatt.
+setState([], [{ type: 'sleep' }, { type: 'walk', post: { taskType: 'walk' } }]);
+eq('utazás nem munka -> nem kérdezünk', hasWorkWaiting(), false);
+setState(mkJobs(2), [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
+eq('a két forrás összeadódik', countWorkWaiting(), 3);
 extraJobs = [];
 
 console.log(`\n${pass} passed, ${fail} failed`);

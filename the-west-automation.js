@@ -1,10 +1,11 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.9)
+// @name         The-West Modular Job Queue (Lisa v12.11)
 // @namespace   http://tampermonkey.net/
-// @version     12.9
+// @version     12.11
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
+// @match       https://*.the-west.hu/*
 // @grant       none
 // @run-at      document-end
 // ==/UserScript==
@@ -38,6 +39,9 @@
         LEGACY_HISTORY: 'lisa_modular_history_v97',
         MIN_SEND_GAP: 2000,          // két egymást követő küldés között
         WATCH_INTERVAL: 1000,        // ilyen sűrűn nézzük a játék sorát és az időpontokat
+        TICK_STALL_WARN: 5000,       // ennél nagyobb ütemkihagyást már naplózunk
+        LONG_GAP_MS: 30000,          // ennél hosszabb kihagyás után a játék is lemaradt
+        LONG_GAP_SETTLE_MS: 1500,    // ...ezért hagyunk neki ennyit, mielőtt döntenénk
         SLOT_FREED_DELAY: 400,       // felszabadult slot után ennyivel indítjuk a következőt
         NEW_WORK_DELAY: 500,         // új munka érkezésekor eddig hozzuk előre a következő kört
         MAX_WAIT_MS: 3600000,        // egy hibás date_done se tudja örökre megállítani
@@ -206,7 +210,11 @@
     }
 
     function updateUIStatus(text) {
-        if (uiStatus) uiStatus.textContent = text;
+        if (!uiStatus) return;
+        uiStatus.textContent = text;
+        // Az ütem egészsége az egérrel odaérve derül ki: a háttérfül lassulása
+        // különben láthatatlan lenne, és pont azt akarjuk mérni.
+        uiStatus.title = tickHealthText();
     }
 
     // A fejlécben a játék sorának élő állapota látszik. Korábban itt a
@@ -847,6 +855,11 @@
         if (mode !== 'enough') return roomTarget;
         const needed = energyNeededFrom(fromIndex);
         if (needed === null) return roomTarget;  // amíg nem tudjuk, aludjunk tele
+        // Ha nincs mögötte munka, nincs miért korábban ébredni: alvás közben a
+        // karaktert nem lehet párbajra hívni, tehát a teljes alvás a jobb. Ez
+        // az az eset is, amikor a felhasználó időközben törölte a munkáit --
+        // olyankor a korábban választott 'enough' magától visszaáll teljesre.
+        if (needed <= 0) return roomTarget;
         return Math.min(roomTarget, needed);     // a szoba szintje a plafon
     }
 
@@ -967,9 +980,22 @@
         if (sleepOffer || Date.now() < sleepDeclinedUntil) return;
         if (isSleeping()) return;
         if (extraJobs.some(j => j.taskType === 'sleep')) return;
-        sleepOffer = { needed: neededEnergy, at: atIndex || 0 };
+        // A hiányzó munka SAJÁT költsége félrevezetően kicsi ("1 kellene"),
+        // miközben mögötte még sok munka áll. Az alvás hosszáról a hátralévő
+        // lista összenergiája alapján lehet dönteni, tehát azt is elmentjük.
+        const at = atIndex || 0;
+        sleepOffer = { needed: neededEnergy, at, total: energyNeededFrom(at) };
         renderSleepOffer();
         showSleepDialog(sleepOffer);
+    }
+
+    // Mennyi energia kell a hátralévő munkákhoz? Ez a szám mondja meg, mennyit
+    // érdemes aludni -- a megakadó munka saját költsége (sokszor 1) nem.
+    // Ha csak egy munka van hátra, a két szám ugyanaz, akkor felesleges kétszer.
+    function sleepOfferRestText(offer) {
+        const total = offer && offer.total;
+        if (typeof total !== 'number' || total <= 0) return '';
+        return ` (a hátralévő munkákhoz ${total} energia kell)`;
     }
 
     // A panelbe írt kérdést könnyű nem észrevenni, ezért a játék SAJÁT
@@ -981,10 +1007,11 @@
         try {
             if (!window.west || !west.gui || typeof west.gui.Dialog !== 'function') return false;
             const at = offer.at || 0;
+            const rest = sleepOfferRestText(offer);
             const msg = at > 0
-                ? `A(z) ${at + 1}. munkára elfogy az energia (${offer.needed} kellene). `
+                ? `A(z) ${at + 1}. munkára elfogy az energia${rest}. `
                   + 'Beszúrjak elé egy alvást a legjobb ingyenes szobába?'
-                : `Nincs elég energia a következő munkához (${offer.needed} kellene). `
+                : `Nincs elég energia a következő munkához${rest}. `
                   + 'Beszúrjak egy alvást a sor elejére?';
 
             let answered = false;
@@ -1066,10 +1093,14 @@
         }
 
         sleepModeAsked = true;
+        // A várakozó munkák száma a JÁTÉK sorát is tartalmazza, az energiaigény
+        // viszont nem: a sorba került munka energiája már le van vonva, tehát
+        // hozzá nem kell újabb. Ezért a 0-t inkább elhagyjuk, mint kiírjuk.
         const needed = energyNeededFrom(0);
+        const count = countWorkWaiting();
         const roomTarget = sleepTargetEnergy(task.data && task.data.room);
-        const msg = `Alszol, és ${extraJobs.length} munka vár a sorban`
-            + (needed === null ? '. ' : ` (${needed} energia kell hozzájuk). `)
+        const msg = `Alszol, és ${count} munka vár a sorban`
+            + (needed ? ` (${needed} energia kell hozzájuk). ` : '. ')
             + `Menjen végig az alvás (${roomTarget} energiáig), vagy szakítsam meg, amint elég energia gyűlt?`;
         let answered = false;
         const finish = (mode) => {
@@ -1100,10 +1131,24 @@
         }
     }
 
-    // Van-e egyáltalán miért felébredni?
+    // Van-e egyáltalán miért felébredni? Csak VALÓDI munka számít: a saját
+    // listánk nem-alvás bejegyzései, és a játék sorában álló munkák.
+    // A játék sorában a "nem alvás" önmagában kevés: az utazás és a többi
+    // szolgálati bejegyzés is ilyen, azok miatt viszont nincs értelme ébredni.
+    // A munkát az azonosítja, hogy a `post`-jában van jobId (ezt a Task ősosztály
+    // tölti ki minden bejegyzésnél; az alvás post-ja csak {taskType:'sleep'}).
     function hasWorkWaiting() {
-        if (extraJobs.some(j => j.taskType !== 'sleep')) return true;
-        return gameReady() && window.TaskQueue.queue.some(t => t && t.type !== 'sleep');
+        return countWorkWaiting() > 0;
+    }
+
+    // Ugyanaz, de darabszámmal -- a kérdés szövege ezt írja ki.
+    function countWorkWaiting() {
+        let n = extraJobs.filter(j => j && j.taskType !== 'sleep').length;
+        if (gameReady()) {
+            n += window.TaskQueue.queue.filter(t =>
+                t && t.type !== 'sleep' && t.post && typeof t.post.jobId === 'number').length;
+        }
+        return n;
     }
 
     // Futó alvás megszakítása, ha az energia elérte, amit ez a szoba adhat.
@@ -1973,6 +2018,18 @@
         nextJobTimer = setTimeout(armNextJobTimer, Math.min(remaining, CONFIG.TIMER_CHUNK));
     }
 
+    // A csonkokra bontott időzítő is a fül időzítője, tehát háttérben ritkulhat.
+    // Ha az ütemadó (worker) észreveszi, hogy a határidő már lejárt, itt hozzuk
+    // be azonnal, ahelyett hogy a következő -- akár egy perccel későbbi -- csonkra
+    // várnánk. Ugyanaz az abszolút határidő dönt, tehát ez nem siettet semmit.
+    function pumpNextJobTimer() {
+        if (!nextJobTimer || processing || paused) return;
+        if (nextJobDeadline > Date.now()) return;
+        clearTimeout(nextJobTimer);
+        nextJobTimer = null;
+        processQueue();
+    }
+
     async function processQueue() {
         if (processing) return;
         processing = true;
@@ -2256,10 +2313,21 @@
             keepAudio = new Audio(quietLoopUrl());
             keepAudio.loop = true;
             keepAudio.volume = 0.01;
+            // Safariban a beágyazott lejátszás külön engedélyt kér; enélkül a
+            // hang el sem indul, és a fül fagyás elleni védettsége is elmarad.
+            keepAudio.setAttribute('playsinline', '');
+            keepAudio.muted = false;         // a NÉMA hangot nem tekintik lejátszásnak
+            // A médialejátszás saját eseményei NEM ritkulnak a rejtett fülön:
+            // mérve percenkénti helyett ~4/mp (legrosszabb kihagyás 271 ms).
+            // Ez a MÁSODIK ütemforrásunk, arra az esetre, ha a worker nem indul
+            // (szigorú CSP). Csak akkor szól, amikor van várakozó munka -- tehát
+            // pont akkor jár, amikor kell.
+            keepAudio.addEventListener('timeupdate', () => tick('audio'));
         }
         if (keepAudio.paused) {
-            // Kattintás előtt a böngésző letilthatja a lejátszást; a játékban
-            // úgyis kattint a felhasználó, és akkor a következő kör elindítja.
+            // Felhasználói mozdulat előtt a böngésző letilthatja a lejátszást (a
+            // Safari ebben szigorúbb). A játékban úgyis történik mozdulat, és az
+            // arra kötött újrapróbálkozás indítja el.
             keepAudio.play().catch(() => {});
         }
     }
@@ -2268,12 +2336,178 @@
         if (keepAudio && !keepAudio.paused) keepAudio.pause();
     }
 
+    // Tényleg SZÓL-e? A `paused === false` még nem elég: egy meg sem induló
+    // elem is lehet "nem szüneteltetett". Az számít, hogy halad-e az idő.
+    let lastAudioTime = -1;
+    let audioStalled = false;
+
+    function checkKeepAudio() {
+        if (!keepAwakeWanted || !keepAudio) { lastAudioTime = -1; audioStalled = false; return; }
+        const t = keepAudio.currentTime;
+        // Hurokban a currentTime vissza is ugorhat 0-ra, az is haladás.
+        audioStalled = (lastAudioTime >= 0 && t === lastAudioTime);
+        lastAudioTime = t;
+        if (audioStalled) startKeepAudio();
+    }
+
+    function keepAwakeStatus() {
+        if (!keepAwakeWanted) return 'kikapcsolva (nincs várakozó munka)';
+        const parts = [];
+        parts.push(wakeLock ? 'képernyőzár: aktív' : 'képernyőzár: nincs');
+        if (!keepAudio) parts.push('hang: nincs');
+        else if (keepAudio.paused) parts.push('hang: szünetel (kattints a játékba)');
+        else if (audioStalled) parts.push('hang: elakadt');
+        else parts.push('hang: szól');
+        return parts.join(', ');
+    }
+
     function updateKeepAwake() {
         const wanted = CONFIG.KEEP_AWAKE && !paused && extraJobs.length > 0;
         keepAwakeWanted = wanted;
-        if (wanted) { requestWakeLock(); startKeepAudio(); }
-        else { releaseWakeLock(); stopKeepAudio(); }
+        if (wanted) { requestWakeLock(); startKeepAudio(); checkKeepAudio(); }
+        else { releaseWakeLock(); stopKeepAudio(); checkKeepAudio(); }
     }
+
+    // ============================================================
+    //  13/b. ÜTEMADÓ: A HÁTTÉRFÜL IDŐZÍTŐI RITKULNAK
+    // ============================================================
+    // MÉRVE (Chrome, hu27, rejtett fül, 2×7 perc):
+    //
+    //   forrás                    látható fül   rejtett fül (legrosszabb kihagyás)
+    //   setInterval(1000)             1,0 mp        60,0 mp
+    //   setTimeout-lánc               1,0 mp        60,0 mp
+    //   Web Worker setInterval        1,0 mp         1,0 mp
+    //   <audio> 'timeupdate'             --          0,27 mp
+    //
+    // Vagyis a fül saját időzítői percesre lassulnak ("intensive throttling"),
+    // és ezen a HALK HUROK SEM SEGÍT: a második mérés úgy futott, hogy a hang
+    // bizonyítottan szólt, a setInterval mégis 60 mp-enként ébredt. A hang tehát
+    // a FAGYASZTÁS ellen véd, a ritkítás ellen nem -- a kettő külön probléma.
+    //
+    // Amire viszont a ritkítás nem vonatkozik: a dedikált Web Worker időzítője,
+    // és a médialejátszás saját eseményei. Ezért három rétegben ütemezünk:
+    //
+    //   1. Web Worker  -- ez a fő forrás, mindig fut, másodperces.
+    //   2. a halk hurok 'timeupdate' eseménye -- ha a worker nem indulna el
+    //      (szigorú CSP tilthatja a blob: workert), és van várakozó munka.
+    //   3. a fül saját setInterval-ja -- végső tartalék, rejtett fülön perces.
+    //
+    // A worker csak JELET ad, minden logika a fő szálon marad (a játék API-ját
+    // amúgy sem érné el). Mindhárom forrás ugyanazt a `tick`-et hívja, és a
+    // legutóbbi futás ideje dönt, kell-e dolgozni -- így sosem duplázzák egymást.
+    let tickWorker = null;
+    let lastWatchAt = 0;
+    let lastLeaderAt = 0;
+    let lastTickAt = Date.now();
+    // Az ütem egészsége: enélkül csak találgatnánk, elég-e a védekezés.
+    const tickHealth = { worstVisible: 0, worstHidden: 0, lastGap: 0, source: '-', stalls: 0 };
+
+    function createTickWorker() {
+        try {
+            if (typeof Worker !== 'function' || typeof Blob !== 'function') return null;
+            const src = 'setInterval(function(){postMessage(0)}, ' + CONFIG.WATCH_INTERVAL + ');';
+            const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+            const w = new Worker(url);
+            URL.revokeObjectURL(url);
+            return w;
+        } catch(e) {
+            console.warn('[Lisa] Nincs worker-ütemadó, marad a fül saját időzítője:', e);
+            return null;
+        }
+    }
+
+    function recordTickGap(now) {
+        const gap = now - lastTickAt;
+        lastTickAt = now;
+        tickHealth.lastGap = gap;
+        if (isVisible()) tickHealth.worstVisible = Math.max(tickHealth.worstVisible, gap);
+        else tickHealth.worstHidden = Math.max(tickHealth.worstHidden, gap);
+        if (gap >= CONFIG.TICK_STALL_WARN) {
+            tickHealth.stalls++;
+            // Csak akkor érdekes, ha volt is mit csinálni közben.
+            if (extraJobs.length > 0) {
+                console.warn(`[Lisa] Az ütem kihagyott ${Math.round(gap / 1000)} mp-et `
+                    + `(${isVisible() ? 'látható' : 'rejtett'} fül, forrás: ${tickHealth.source}).`);
+            }
+        }
+        return gap;
+    }
+
+    // Minden ütem ide fut be, forrástól függetlenül.
+    function tick(source) {
+        const now = Date.now();
+        // A gyorsabb forrás nyer; a másik ilyenkor nem csinál semmit.
+        if (now - lastWatchAt < CONFIG.WATCH_INTERVAL * 0.6) return;
+        tickHealth.source = source;
+        const gap = recordTickGap(now);
+        lastWatchAt = now;
+
+        // Hosszú kihagyás után nem csak MI maradtunk le: a játék kliense is a
+        // fül időzítőin fut, tehát a TaskQueue pillanatnyilag még a fagyás előtti
+        // állapotot mutathatja. Adunk neki egy kör időt, mielőtt döntenénk --
+        // különben egy már lejárt munkát látnánk futónak, vagy fordítva.
+        if (gap >= CONFIG.LONG_GAP_MS && nextJobTimer && nextJobDeadline < now + CONFIG.LONG_GAP_SETTLE_MS) {
+            scheduleNextJob(CONFIG.LONG_GAP_SETTLE_MS);
+        }
+
+        if (now - lastLeaderAt >= CONFIG.LEADER_HEARTBEAT) {
+            lastLeaderAt = now;
+            refreshLeadership();
+        }
+        watchGameQueue();
+        pumpNextJobTimer();
+    }
+
+    // Fülváltás, ablak előhozása, gépébredés, hálózat visszatérése: mindegyik után
+    // azonnal utolérjük magunkat, nem várunk a következő ütemre. A határidőt NEM
+    // hozzuk előre -- egy folyamatban lévő visszatartást (elutasítás után) ez nem
+    // írhat felül.
+    function catchUpNow(reason) {
+        lastWatchAt = 0;
+        tick(reason);
+    }
+
+    function startTicker() {
+        lastWatchAt = lastLeaderAt = 0;
+        lastTickAt = Date.now();
+        tickWorker = createTickWorker();
+        if (tickWorker) {
+            tickWorker.onmessage = () => tick('worker');
+            tickWorker.onerror = (e) => {
+                console.warn('[Lisa] A worker-ütemadó elhallgatott, marad a tartalék:', e && e.message);
+                try { tickWorker.terminate(); } catch(err) {}
+                tickWorker = null;
+            };
+            console.log('[Lisa] Worker-ütemadó aktív (háttérfülön is másodperces).');
+        }
+        // Tartalék: worker nélkül ez az egyetlen forrás, worker mellett pedig
+        // akkor lép be, ha az valamiért elnémul.
+        setInterval(() => tick('timer'), CONFIG.WATCH_INTERVAL);
+    }
+
+    function tickHealthText() {
+        const w = tickHealth.worstHidden;
+        return `Ütemadó: ${tickWorker ? 'worker' : 'fül-időzítő'} (${tickHealth.source})`
+            + ` · legrosszabb kihagyás rejtett fülön: ${(w / 1000).toFixed(1)} mp`
+            + ` · látható fülön: ${(tickHealth.worstVisible / 1000).toFixed(1)} mp`
+            + ` · ${keepAwakeStatus()}`;
+    }
+
+    // Kívülről is lekérdezhető, hogy a felhasználó látni tudja, mit ér a védekezés.
+    window.lisaDiag = () => ({
+        verzio: '12.11',
+        lathato: isVisible(),
+        fokusz: document.hasFocus(),
+        utemado: tickWorker ? 'worker' : 'fül-időzítő',
+        utolsoForras: tickHealth.source,
+        utolsoKihagyasMp: +(tickHealth.lastGap / 1000).toFixed(1),
+        legrosszabbLathatoMp: +(tickHealth.worstVisible / 1000).toFixed(1),
+        legrosszabbRejtettMp: +(tickHealth.worstHidden / 1000).toFixed(1),
+        kihagyasok: tickHealth.stalls,
+        ebrentartas: keepAwakeStatus(),
+        varakozoMunkak: extraJobs.length,
+        vezetoFul: isLeaderTab,
+    });
 
     // ============================================================
     //  14. TÖBB FÜL: EGYETLEN FELDOLGOZÓ
@@ -2363,7 +2597,9 @@
 
     function initTabSync() {
         refreshLeadership();
-        setInterval(refreshLeadership, CONFIG.LEADER_HEARTBEAT);
+        // A szívverést innentől az ütemadó hajtja (startTicker), hogy háttérfülön
+        // se ritkuljon percesre: egy lelassult vezető fül különben lejáratná a
+        // saját TTL-jét, és a fülek elkezdenék egymástól elvenni a vezetést.
 
         // Fülváltásnál azonnal újraértékelünk, nem várunk a szívverésre.
         // A képernyőzárolást a böngésző elrejtéskor elengedi, ezért látszáskor
@@ -2371,12 +2607,21 @@
         document.addEventListener('visibilitychange', () => {
             refreshLeadership();
             if (isVisible()) requestWakeLock();
+            catchUpNow('visibility');
         });
+        // Ablak előhozása, gépébredés, hálózat visszatérése, bfcache-ből visszalépés:
+        // mindegyik után lemaradásban vagyunk, tehát azonnal utolérjük magunkat.
+        window.addEventListener('focus', () => { requestWakeLock(); catchUpNow('focus'); });
+        window.addEventListener('pageshow', () => catchUpNow('pageshow'));
+        window.addEventListener('online', () => catchUpNow('online'));
         // Bezáráskor elengedjük a vezetést: a bezárt fül eddig a TTL végéig fogta.
         window.addEventListener('pagehide', () => { releaseLeadership(); releaseWakeLock(); });
         // Az automatikus lejátszást a böngésző az első felhasználói mozdulatig
-        // tilthatja; a játékban úgyis kattint a felhasználó.
-        document.addEventListener('click', () => { if (keepAwakeWanted) startKeepAudio(); }, true);
+        // tilthatja (a Safari ebben szigorúbb), ezért többféle mozdulatra is
+        // újrapróbáljuk -- a játékban mindegyik előfordul.
+        const nudge = () => { if (keepAwakeWanted) startKeepAudio(); };
+        ['click', 'pointerdown', 'keydown', 'touchstart'].forEach(
+            ev => document.addEventListener(ev, nudge, true));
 
         // A storage esemény csak a TÖBBI fülben sül el, tehát mindig idegen
         // változást jelez. Minden fül újratölt -- a vezető is, különben a
@@ -2587,10 +2832,13 @@
         box.style.display = '';
         const text = document.createElement('span');
         const at = sleepOffer.at || 0;
+        const rest = typeof sleepOffer.total === 'number' && sleepOffer.total > 0
+            ? ` (még ${sleepOffer.total} kell)` : '';
         text.textContent = at > 0
-            ? `A(z) ${at + 1}. munkára elfogy az energia. Alvás?`
-            : `Kevés az energia (${sleepOffer.needed} kell). Alvás?`;
-        text.title = 'A jóslat szerint innentől nem lenne indítható a munka.';
+            ? `A(z) ${at + 1}. munkára elfogy az energia${rest}. Alvás?`
+            : `Kevés az energia${rest || ` (${sleepOffer.needed} kell)`}. Alvás?`;
+        text.title = 'A jóslat szerint innentől nem lenne indítható a munka.'
+            + (rest ? ` A hátralévő munkák teljes energiaigénye: ${sleepOffer.total}.` : '');
         const where = at > 0 ? `a(z) ${at + 1}. munka elé` : 'a sor elejére';
         const yes = document.createElement('button');
         yes.textContent = 'Teljes';
@@ -2845,7 +3093,7 @@
         // A játék sora kívülről is változik (munka lejár, a felhasználó megszakít),
         // ezért rendszeresen ránézünk.
         lastSeenQueueLen = gameQueueLength();
-        setInterval(watchGameQueue, CONFIG.WATCH_INTERVAL);
+        startTicker();
         if (extraJobs.length > 0) ensureProcessing();
     }
 
@@ -2867,5 +3115,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.9 betöltve.');
+    console.log('[Lisa] Modular v12.11 betöltve.');
 })();

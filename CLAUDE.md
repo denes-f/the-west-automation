@@ -6,12 +6,16 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 200 assertions, no dependencies.
+  name and runs them against stubs. 205 assertions, no dependencies.
+- `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
+  `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
+  fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
+  that would show up live as an empty panel. Run this one first.
 
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.9.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.11.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -62,7 +66,7 @@ you spent.
 **Only one game tab.** A second tab holding the leader lock is what made v11.0 look completely
 broken. Close your own tab when finished.
 
-## State of play (end of the v12.9 session)
+## State of play (end of the v12.11 session)
 
 Everything is committed and pushed on `dev`; `main` is at v12.0 and has not been moved since.
 The user runs the script on two accounts: the `hu27` test character (level 10, max energy 100, in a
@@ -78,12 +82,33 @@ three dialogs' rendering, and cancelling a running sleep.
 Also confirmed live by the user in v12.9: the running-sleep dialog, the `'enough'` mode and its
 live-recalculated goal (queueing more jobs mid-sleep moved the wake-up correctly).
 
+Measured live in v12.11 on the game page itself: the background-tab throttling table under
+"Keep-awake" in the architecture section, and that `the-west.hu` permits `blob:` Web Workers.
+
 Verified **only by unit tests**, never yet exercised end-to-end in a real game: the rejected-job
 requeue path — its trigger was reproduced live, but the recovery was written afterwards. Worth
-watching the first time it fires for real.
+watching the first time it fires for real. Also v12.11's ticker *wiring*: the three tick sources
+were each measured in the live page, and the script loads clean under a stubbed DOM, but the
+assembled `startTicker`/`tick` path has not run in a real game session — check `lisaDiag()` shows
+`utemado: "worker"` and a ~1 s worst hidden-tab gap the first time it runs.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
+
+## Browsers
+
+Chrome is the reference and the only browser anything has been measured in. The script is written
+to work in Safari too (Tampermonkey for Safari, or the *Userscripts* extension — the header carries
+both `@include` and `@match` for that reason), but **nothing below is verified there**:
+
+- `navigator.wakeLock` needs Safari 16.4+; the call is feature-guarded, so an older Safari simply
+  loses the screen lock and keeps everything else.
+- Safari's autoplay policy is stricter than Chrome's, which is why the audio retries on four
+  different gesture types and `checkKeepAudio` re-checks that it actually started.
+- Safari throttles and can outright suspend background tabs, on its own schedule. Whether its Web
+  Worker timers survive that the way Chrome's do is **unknown** — measure it with `lisaDiag()`
+  before assuming the ticker helps there.
+- The blob-Worker CSP check was done on Chrome only.
 
 ## Verified facts about the game
 
@@ -434,11 +459,54 @@ and "Nem" correctly does nothing.
   unbound mode must never survive long enough to be picked up by a different sleep.
   `queueTailAnchor` also clamps a running sleep's 8-hour `date_done` to the predicted wake-up,
   otherwise every following ETA would be pushed eight hours out.
+  **No work waiting ⇒ no question and no wake-up.** Uninterrupted sleep is the default; the
+  running-sleep dialog is only raised once real work exists, and if that work is later removed
+  `'enough'` falls back to the room's level by itself (`sleepGoalEnergy` returns the room target
+  when the need is `0`, not just when it is unknown). "Real work" means a non-sleep entry in
+  `extraJobs`, or a game-queue entry whose `post` carries a numeric `jobId` — v12.10 tightened
+  `hasWorkWaiting` from "anything that isn't a sleep", which let a non-job queue entry raise the
+  dialog with "0 munka vár a sorban". `countWorkWaiting` is the same predicate with a count, so
+  the dialog's number covers both sources (the old text printed `extraJobs.length` alone).
 - **Keep-awake** (`updateKeepAwake`, only while jobs are waiting): a Screen Wake Lock against the
-  display/machine sleeping — re-requested on `visibilitychange`, since the browser releases it when
-  the tab is hidden — plus an inaudible looping WAV, because Chrome does not freeze a tab that is
-  playing audio. A fully silent track would not count as playing, hence amplitude ±1. Neither
-  replaces the OS/browser settings (`caffeinate`, Chrome Memory Saver exclusion).
+  display/machine sleeping — re-requested on `visibilitychange` and `focus`, since the browser
+  releases it when the tab is hidden — plus an inaudible looping WAV, because Chrome does not freeze
+  a tab that is playing audio. A fully silent track would not count as playing, hence amplitude ±1.
+  Autoplay is blocked until a user gesture, so playback is retried on `click`/`pointerdown`/
+  `keydown`/`touchstart`, and `checkKeepAudio` verifies `currentTime` is actually advancing —
+  `paused === false` alone does not prove the element ever started. Neither mechanism replaces the
+  OS/browser settings (`caffeinate`, Chrome Memory Saver exclusion — Memory Saver *discards* the
+  tab, which no wake lock or audio survives).
+- **The ticker (`startTicker`/`tick`) is what makes a background tab usable.** Measured on the live
+  game page, Chrome, two 7-minute runs with the tab hidden — worst gap between ticks:
+
+  | source | visible tab | hidden tab |
+  | --- | --- | --- |
+  | `setInterval(1000)` | 1.0 s | **60.0 s** |
+  | `setTimeout` chain | 1.0 s | **60.0 s** |
+  | Web Worker `setInterval(1000)` | 1.0 s | **1.0 s** |
+  | `<audio>` `timeupdate` | — | **0.27 s** |
+
+  Two facts worth keeping. First, the tab's own timers collapse to once a minute
+  ("intensive throttling") — so a freed slot could sit empty for a minute. Second, **the quiet loop
+  does not help with this**: the second run was measured with the audio provably playing
+  (`paused:false`, `currentTime` advancing) and `setInterval` still woke only 7 times in 440 s. The
+  audio defends against *freezing*, the worker against *throttling*; they are separate problems and
+  both are needed. Neither run froze the tab within 7 minutes.
+
+  Hence three tick sources, all calling the same `tick()`, which de-duplicates on
+  `WATCH_INTERVAL * 0.6` so they can never double up: the Web Worker (primary), the keep-awake
+  audio's `timeupdate` (only while jobs wait, and the fallback if a CSP ever blocks `blob:` workers
+  — **verified live that the-west.hu allows them**), and the tab's own `setInterval` (last resort).
+  `tick` also drives `refreshLeadership`; leaving that on its own `setInterval` meant a throttled
+  leader let its own 15 s TTL lapse, and two hidden tabs would take the lead from each other.
+- **`pumpNextJobTimer`** fires the deadline as soon as a tick observes it has passed, instead of
+  waiting for the next `TIMER_CHUNK`. Same absolute deadline — it never starts anything early.
+- **After a gap ≥ `LONG_GAP_MS` the game client is stale too.** It runs on the same throttled tab
+  timers, so `TaskQueue` may still show the pre-freeze state. `tick` pushes the next decision out by
+  `LONG_GAP_SETTLE_MS` to let the game catch up first.
+- **Diagnostics**: `window.lisaDiag()` in the console, and the same summary as the tooltip on the
+  panel's status line. Worst hidden-tab gap is the number that matters — if it is ~1 s the ticker is
+  doing its job, if it is ~60 s the worker never started.
 - **In-game rows are re-injected by a `MutationObserver`** on `#queuedTasks`, not just by the timer.
   The game rebuilds that container on every queue change and drops our rows with it; waiting for the
   poll made them visibly blink out and back. The observer only re-renders when our separator is
@@ -466,7 +534,7 @@ and "Nem" correctly does nothing.
 - Comments explain *why*, especially where a subtle game behaviour forced the design. Keep them.
 - Bump `@name`, `@version` and the boot `console.log` together on every release — and the release
   number plus the assertion count at the top of this file.
-- Run `node test-queue.js` before committing. Add cases for anything measured in-game so it does not
+- Run `node smoke-load.js && node test-queue.js` before committing. Add cases for anything measured in-game so it does not
   have to be rediscovered.
 - The test harness pulls functions out of the userscript **by name** (`extract('foo')`), so renaming
   a function breaks the tests, and a new call to a browser-only function inside an already-extracted
