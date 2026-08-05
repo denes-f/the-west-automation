@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.11)
+// @name         The-West Modular Job Queue (Lisa v12.12)
 // @namespace   http://tampermonkey.net/
-// @version     12.11
+// @version     12.12
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -2433,6 +2433,55 @@
         return gap;
     }
 
+    // A JÁTÉK KLIENSÉNEK UTOLÉRÉSE -- ez az, ami a háttérfulet használhatóvá teszi.
+    //
+    // A játék a saját, FŐ SZÁLON futó időzítőin dolgozik (a bundle-ből kiolvasva):
+    //
+    //   window.setInterval(TaskQueueUi.tick, 1000)      -- a lejárt munka kivétele
+    //   new Ticker(Character.tick4Character).setPeriod(2000) -- energia/élet töltése
+    //
+    // Rejtett fülön mindkettő percesre ritkul (mérve), és a TaskQueueUi.tick
+    // ráadásul HÍVÁSONKÉNT CSAK EGY munkát vesz ki: csak a queue[0]-t nézi, és a
+    // TaskQueue.finish(task) után azonnal visszatér. Ezért ragad a sor a fagyás
+    // előtti állapotban, holott a szerver rendben végzett a munkákkal.
+    //
+    // Innen jött a "háttérben 2-3 percenként fut le egy 15 másodperces munka":
+    //   - a szabad slotok száma a ragadt sorhosszból jön, tehát nem is küldtünk,
+    //   - és a TaskQueue.add a SAJÁT limitjét szintén a ragadt hosszra nézi
+    //     (taskLimit < queue.length + tasks.length -> csendben levágja), tehát
+    //     hiába számolnánk mi helyesen, akkor sem fogadná el.
+    // Ugyanez látszott a script előtt is: a fülre visszatérve a négy munka
+    // "leszámol nullára", majd 2-3 másodperc alatt egyenként eltűnik -- vagyis a
+    // tick 1 Hz-en, egyesével dolgozza le a lemaradást.
+    //
+    // A megoldás nem a mi ütemezésünkben van: a JÁTÉK SAJÁT függvényeit hívjuk meg
+    // a worker-hajtotta ütemünkből. Nem csinálunk helyettük semmit, csak azon a
+    // ritmuson futnak, amit a játék amúgy is szán nekik.
+    function pumpGameClient() {
+        const ui = window.TaskQueueUi;
+        if (!ui || typeof ui.tick !== 'function') return false;
+        // Folyamatban lévő köteg (a mienk vagy a játéké) alatt nem nyúlunk a sorba.
+        if (processing || (window.TaskQueue && window.TaskQueue.busy)) return true;
+
+        // Az energiát is a játék számolja vissza. Enélkül a Character.energy a
+        // fagyás előtti, alacsonyabb értéken áll, és az energia-előellenőrzés
+        // olyan regenerációra várna, ami valójában már megtörtént.
+        try {
+            const c = window.Character;
+            if (c && typeof c.tick4Character === 'function') c.tick4Character();
+        } catch(e) {}
+
+        // Hívásonként egy munka jön ki, ezért addig hívjuk, amíg fogy a sor. A
+        // korlát a sorhossz: ennél több lejárt munka nem lehet benne.
+        let guard = gameQueueLimit() + 1;
+        while (guard-- > 0) {
+            const before = gameQueueLength();
+            try { ui.tick(); } catch(e) { break; }
+            if (gameQueueLength() >= before) break;      // nem járt le több
+        }
+        return true;
+    }
+
     // Minden ütem ide fut be, forrástól függetlenül.
     function tick(source) {
         const now = Date.now();
@@ -2442,11 +2491,15 @@
         const gap = recordTickGap(now);
         lastWatchAt = now;
 
-        // Hosszú kihagyás után nem csak MI maradtunk le: a játék kliense is a
-        // fül időzítőin fut, tehát a TaskQueue pillanatnyilag még a fagyás előtti
-        // állapotot mutathatja. Adunk neki egy kör időt, mielőtt döntenénk --
-        // különben egy már lejárt munkát látnánk futónak, vagy fordítva.
-        if (gap >= CONFIG.LONG_GAP_MS && nextJobTimer && nextJobDeadline < now + CONFIG.LONG_GAP_SETTLE_MS) {
+        // ELSŐ dolgunk: a játék kliensét utolérni. Minden alatta hozott döntés
+        // (szabad slot, energia, ETA) az ő állapotából olvas.
+        const pumped = pumpGameClient();
+
+        // Ha a játékot nem tudtuk megpörgetni (nincs TaskQueueUi), marad a régi
+        // óvatosság: hosszú kihagyás után hagyunk neki egy kör időt, mielőtt a
+        // sor állapotára bármit alapoznánk.
+        if (!pumped && gap >= CONFIG.LONG_GAP_MS && nextJobTimer
+            && nextJobDeadline < now + CONFIG.LONG_GAP_SETTLE_MS) {
             scheduleNextJob(CONFIG.LONG_GAP_SETTLE_MS);
         }
 
@@ -2495,7 +2548,7 @@
 
     // Kívülről is lekérdezhető, hogy a felhasználó látni tudja, mit ér a védekezés.
     window.lisaDiag = () => ({
-        verzio: '12.11',
+        verzio: '12.12',
         lathato: isVisible(),
         fokusz: document.hasFocus(),
         utemado: tickWorker ? 'worker' : 'fül-időzítő',
@@ -2504,6 +2557,8 @@
         legrosszabbLathatoMp: +(tickHealth.worstVisible / 1000).toFixed(1),
         legrosszabbRejtettMp: +(tickHealth.worstHidden / 1000).toFixed(1),
         kihagyasok: tickHealth.stalls,
+        jatekPorgetes: (window.TaskQueueUi && typeof window.TaskQueueUi.tick === 'function')
+            ? 'aktív' : 'NEM ELÉRHETŐ (a sor háttérben beragadhat)',
         ebrentartas: keepAwakeStatus(),
         varakozoMunkak: extraJobs.length,
         vezetoFul: isLeaderTab,
@@ -3115,5 +3170,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.11 betöltve.');
+    console.log('[Lisa] Modular v12.12 betöltve.');
 })();

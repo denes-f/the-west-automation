@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 205 assertions, no dependencies.
+  name and runs them against stubs. 215 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,7 +15,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.11.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.12.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -66,7 +66,7 @@ you spent.
 **Only one game tab.** A second tab holding the leader lock is what made v11.0 look completely
 broken. Close your own tab when finished.
 
-## State of play (end of the v12.11 session)
+## State of play (end of the v12.12 session)
 
 Everything is committed and pushed on `dev`; `main` is at v12.0 and has not been moved since.
 The user runs the script on two accounts: the `hu27` test character (level 10, max energy 100, in a
@@ -82,15 +82,26 @@ three dialogs' rendering, and cancelling a running sleep.
 Also confirmed live by the user in v12.9: the running-sleep dialog, the `'enough'` mode and its
 live-recalculated goal (queueing more jobs mid-sleep moved the wake-up correctly).
 
-Measured live in v12.11 on the game page itself: the background-tab throttling table under
-"Keep-awake" in the architecture section, and that `the-west.hu` permits `blob:` Web Workers.
+Measured live in v12.11–12.12 on the game page itself: the background-tab throttling table under
+"Keep-awake", that `the-west.hu` permits `blob:` Web Workers, and the `pumpGameClient` A/B (control
+vs pump in the same hidden, throttled tab) under the same section. **The worker ticker alone did
+not fix background throughput** — the user reported ~2.2 min per 15 s job in Safari with
+`utemado: "worker"` and a 3.0 s worst gap. That is what led to the game-client staleness, which was
+the real cause.
+
+Confirmed live by the user in v12.11: the worker ticker runs in **Safari** too (`utemado: "worker"`,
+worst hidden-tab gap 3.0 s — coarser than Chrome's 1.0 s but far from 60 s). Also in Safari the
+quiet loop reported `hang: elakadt` — `play()` resolved, `paused === false`, but `currentTime` never
+advanced, so the audio is not actually running there and neither the freeze protection nor the
+`timeupdate` tick source is available. Not yet diagnosed.
 
 Verified **only by unit tests**, never yet exercised end-to-end in a real game: the rejected-job
 requeue path — its trigger was reproduced live, but the recovery was written afterwards. Worth
-watching the first time it fires for real. Also v12.11's ticker *wiring*: the three tick sources
-were each measured in the live page, and the script loads clean under a stubbed DOM, but the
-assembled `startTicker`/`tick` path has not run in a real game session — check `lisaDiag()` shows
-`utemado: "worker"` and a ~1 s worst hidden-tab gap the first time it runs.
+watching the first time it fires for real. Also the *wiring* of v12.11's ticker and v12.12's pump:
+the mechanisms were each measured in the live page by hand and the script loads clean under a
+stubbed DOM, but the assembled `startTicker`/`tick`/`pumpGameClient` path has not run inside a real
+game session — check `lisaDiag()` shows `utemado: "worker"`, `jatekPorgetes: "aktív"`, and a ~1 s
+worst hidden-tab gap the first time it runs.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -501,9 +512,53 @@ and "Nem" correctly does nothing.
   leader let its own 15 s TTL lapse, and two hidden tabs would take the lead from each other.
 - **`pumpNextJobTimer`** fires the deadline as soon as a tick observes it has passed, instead of
   waiting for the next `TIMER_CHUNK`. Same absolute deadline — it never starts anything early.
-- **After a gap ≥ `LONG_GAP_MS` the game client is stale too.** It runs on the same throttled tab
-  timers, so `TaskQueue` may still show the pre-freeze state. `tick` pushes the next decision out by
-  `LONG_GAP_SETTLE_MS` to let the game catch up first.
+- **`pumpGameClient` is what actually makes a background tab work.** Ticking our own code faster
+  was necessary but nowhere near sufficient: **the game's client is the thing that falls behind.**
+  Read out of the bundle:
+
+  ```js
+  obj.init = function(){ … window.setInterval(obj.tick, 1000); };      // TaskQueueUi
+  obj.tick = function(){
+      if (!TaskQueue.queue[0] || !TaskQueue.queue[0].queueId) return TaskQueue.timeleft = 0;
+      var task = TaskQueue.getByQueuePos(0); …
+      if (taskDur <= 0) { EventHandler.signal('task-finish-'+task.type, [task.data]);
+                          TaskQueue.finish(task); return; }   // ← ONE task, then returns
+      … };
+  ```
+
+  So retiring a finished task is driven by a **main-thread `setInterval`** — throttled to once a
+  minute in a hidden tab — and it retires **at most one task per call**. `Character.tick4Character`
+  is the same story on a 2 s `Ticker`, so `Character.energy` goes stale too.
+
+  The consequence is not cosmetic. `TaskQueue.queue` stays at its pre-freeze length, so `freeSlots()`
+  reads 0 — and even computing free slots ourselves would not help, because **`TaskQueue.add` gates
+  on its own stale `queue.length`** (`taskLimit < obj.queue.length + tasks.length` → silently
+  truncates). Nothing can be started until the game's own client catches up.
+
+  Measured live, one hidden tab already in intensive throttling, 4 × 15 s jobs, the only variable
+  being whether we call the game's tick:
+
+  | | control (no pump) | with `pumpGameClient` |
+  | --- | --- | --- |
+  | queue drained at | 384, 444, 504, 564 s | 23, 38, 53, 68 s |
+  | spacing | **60 s** (the throttle period) | **15 s** (the real job length) |
+  | total to drain | **234 s** | **63 s** |
+  | client lag behind server | up to **174 s** | ~3 s |
+
+  The server had finished all four by ~390 s in both arms — it never cared about the tab. This is
+  also exactly what the user saw *before* the script existed: come back to the tab and four jobs
+  "count down to zero" and vanish one per second, because the tick resumes at 1 Hz and works off the
+  backlog one task per call.
+
+  So `tick` calls `TaskQueueUi.tick()` in a loop while the queue keeps shrinking (bounded by
+  `gameQueueLimit() + 1`), plus `Character.tick4Character()` once. **These are the game's own
+  functions at the rate the game already intends** — we are restoring the normal 1 Hz, not
+  exceeding it. Skipped while `TaskQueue.busy` or our own `processing` is set, so we never splice
+  the queue under an in-flight batch. `lisaDiag().jatekPorgetes` reports whether it is available.
+- **After a gap ≥ `LONG_GAP_MS`, if the pump is unavailable, the game client is stale.** `tick`
+  then pushes the next decision out by `LONG_GAP_SETTLE_MS` to let the game catch up on its own.
+  With the pump working this branch never runs — it is the fallback for a client without
+  `TaskQueueUi`.
 - **Diagnostics**: `window.lisaDiag()` in the console, and the same summary as the tooltip on the
   panel's status line. Worst hidden-tab gap is the number that matters — if it is ~1 s the ticker is
   doing its job, if it is ~60 s the worker never started.

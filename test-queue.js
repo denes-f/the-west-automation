@@ -825,6 +825,60 @@ setState(mkJobs(2), [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
 eq('a két forrás összeadódik', countWorkWaiting(), 3);
 extraJobs = [];
 
+// ============================================================
+//  A játék kliensének megpörgetése (a háttérfül igazi hibája)
+// ============================================================
+// A TaskQueueUi.tick hívásonként EGY lejárt munkát vesz ki a sorból, és rejtett
+// fülön percenként egyszer fut. A sor így a fagyás előtti hosszon ragad, a
+// TaskQueue.add pedig a SAJÁT limitjét erre a hosszra nézi -- vagyis semmit nem
+// tudunk indítani. Ezért annyiszor hívjuk a játék tickjét, ahány lejárt munka van.
+console.log('\n=== A játék kliensének megpörgetése ===');
+eval([extract('gameReady'), extract('gameQueueLength'), extract('gameQueueLimit'),
+      extract('pumpGameClient')].join('\n'));
+
+// Négy munka a sorban, mind lejárt: egyetlen ütem alatt mind ki kell jönnie.
+const mkGameQueue = (n) => {
+    const q = [];
+    for (let i = 0; i < n; i++) q.push({ type: 'job', queueId: 100 + i, post: { jobId: 7 } });
+    return q;
+};
+let energiaPorgetes = 0;
+window.Character = { tick4Character: () => { energiaPorgetes++; } };
+window.TaskQueue = { queue: mkGameQueue(4), limit: { normal: 4, premium: 9 }, busy: false };
+// A játék tickje: egy hívás egy lejárt munkát vesz ki.
+let lejart = 4;
+window.TaskQueueUi = { tick: () => { if (lejart > 0) { lejart--; window.TaskQueue.queue.shift(); } } };
+
+eq('a pörgetés lefutott', pumpGameClient(), true);
+eq('mind a négy lejárt munka kijött', window.TaskQueue.queue.length, 0);
+eq('az energiát is visszaszámoltattuk', energiaPorgetes, 1);
+
+// Ha semmi nem járt le, egyetlen (normál) tick fut, a sor érintetlen marad.
+window.TaskQueue.queue = mkGameQueue(3);
+lejart = 0;
+let tickHivasok = 0;
+window.TaskQueueUi = { tick: () => { tickHivasok++; } };
+eq('lejárt munka nélkül is fut egy kör', pumpGameClient(), true);
+eq('...de csak egy', tickHivasok, 1);
+eq('és a sor érintetlen', window.TaskQueue.queue.length, 3);
+
+// Folyamatban lévő köteg alatt nem nyúlunk a sorhoz.
+window.TaskQueue.busy = true;
+tickHivasok = 0;
+eq('köteg közben nem pörgetünk', pumpGameClient(), true);
+eq('...és a játék tickjét sem hívjuk', tickHivasok, 0);
+window.TaskQueue.busy = false;
+
+// Régi kliens (nincs TaskQueueUi): jelezzük, hogy nem tudtunk pörgetni.
+delete window.TaskQueueUi;
+eq('TaskQueueUi nélkül nincs pörgetés', pumpGameClient(), false);
+
+// Egy hibás tick nem akaszthatja meg az ütemet.
+window.TaskQueueUi = { tick: () => { throw new Error('bumm'); } };
+eq('a hibás tick nem dob tovább', pumpGameClient(), true);
+delete window.TaskQueueUi;
+delete window.Character;
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 })();
