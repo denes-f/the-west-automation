@@ -86,15 +86,15 @@ Measured live in v12.11–12.12 on the game page itself: the background-tab thro
 "Keep-awake", that `the-west.hu` permits `blob:` Web Workers, and the `pumpGameClient` A/B (control
 vs pump in the same hidden, throttled tab) under the same section. **The worker ticker alone did
 not fix background throughput** — the user reported ~2.2 min per 15 s job in Safari with
-`utemado: "worker"` and a 3.0 s worst gap. That is what led to the game-client staleness, which was
+`ticker: "worker"` and a 3.0 s worst gap. That is what led to the game-client staleness, which was
 the real cause.
 
-Confirmed live by the user in v12.11: the worker ticker runs in **Safari** too (`utemado: "worker"`,
+Confirmed live by the user in v12.11: the worker ticker runs in **Safari** too (`ticker: "worker"`,
 worst hidden-tab gap 3.0 s — coarser than Chrome's 1.0 s but far from 60 s).
 
 **v12.12 was tested end-to-end in a real game session** (Chrome, installed build, jobs started
-through the job window so the script's own interception ran): `utemado: "worker"`,
-`jatekPorgetes: "aktív"`, and the 4.0 jobs/minute hidden-tab result recorded under "Keep-awake".
+through the job window so the script's own interception ran): `ticker: "worker"`,
+`gamePump: "active"`, and the 4.0 jobs/minute hidden-tab result recorded under "Keep-awake".
 The `hang: elakadt` the user saw in Safari turned out to be **two separate bugs of mine**, both
 reproduced and fixed in v12.13 — the `currentTime` aliasing false positive, and the genuinely
 never-loading element created in a hidden tab. Both are written up under "Keep-awake".
@@ -577,7 +577,7 @@ and "Nem" correctly does nothing.
   `gameQueueLimit() + 1`), plus `Character.tick4Character()` once. **These are the game's own
   functions at the rate the game already intends** — we are restoring the normal 1 Hz, not
   exceeding it. Skipped while `TaskQueue.busy` or our own `processing` is set, so we never splice
-  the queue under an in-flight batch. `lisaDiag().jatekPorgetes` reports whether it is available.
+  the queue under an in-flight batch. `lisaDiag().gamePump` reports whether it is available.
 
   **End-to-end result** (v12.12, measured through the script's own interception path — 30 × 15 s
   jobs started from the job window, tab hidden for the entire 10-minute run, well past the 5-minute
@@ -614,7 +614,13 @@ and "Nem" correctly does nothing.
 
 ## Conventions
 
-- Code comments and all user-facing strings are **Hungarian**. Commit messages are Hungarian too.
+- **Everything in the code is English except what the user actually sees in the game.** Comments,
+  identifiers, `console.*` messages and the test assertion labels are English. Hungarian is reserved
+  for the in-game UI: panel texts and tooltips, `west.gui` dialogs, `updateUIStatus` lines, the
+  injected queue rows and the `@description` header. `lisaDiag()`'s keys and values are English, with
+  one deliberate exception — `keepAwake` carries `keepAwakeStatus()`, which is also rendered as the
+  panel status line's tooltip, so it (and `tickHealthText()`) stays Hungarian. Commit messages are
+  Hungarian too. (This was translated wholesale after v12.13; before that everything was Hungarian.)
 - Comments explain *why*, especially where a subtle game behaviour forced the design. Keep them.
 - Bump `@name`, `@version` and the boot `console.log` together on every release — and the release
   number plus the assertion count at the top of this file.

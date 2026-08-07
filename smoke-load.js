@@ -1,10 +1,10 @@
-// Betöltési füstteszt: `node smoke-load.js`.
+// Load smoke test: `node smoke-load.js`.
 //
-// A test-queue.js NÉVVEL szedi ki az egyes függvényeket, tehát nem veszi észre, ha
-// a script EGÉSZE nem tölthető be -- egy elgépelt globális név, egy rossz sorrendű
-// const (TDZ), vagy egy hiányzó böngésző-API csak élesben derülne ki, üres panelként.
-// Ez a teszt lefuttatja a teljes IIFE-t egy csonkolt böngészőben, és megnézi, hogy a
-// lisaDiag() felépült-e. Nem helyettesíti a test-queue.js-t, csak elé kerül.
+// test-queue.js pulls the individual functions out BY NAME, so it cannot notice when
+// the script as a WHOLE fails to load -- a typo'd global, a const in the temporal dead
+// zone, or a missing browser API would only show up live, as an empty panel.
+// This test runs the entire IIFE in a stubbed browser and checks that lisaDiag() came
+// up. It does not replace test-queue.js, it just runs before it.
 const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(require('path').join(__dirname, 'the-west-automation.js'), 'utf8');
@@ -48,8 +48,8 @@ sandbox.URL.revokeObjectURL = () => {};
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'the-west-automation.js' });
 
-if (typeof sandbox.window.lisaDiag !== 'function') throw new Error('lisaDiag hiányzik');
+if (typeof sandbox.window.lisaDiag !== 'function') throw new Error('lisaDiag is missing');
 const d = sandbox.window.lisaDiag();
 console.log('lisaDiag ->', JSON.stringify(d));
-console.log(`időzítők regisztrálva: ${timers.length}`);
-console.log('FÜSTTESZT OK');
+console.log(`timers registered: ${timers.length}`);
+console.log('SMOKE TEST OK');

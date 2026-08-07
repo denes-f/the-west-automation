@@ -1,5 +1,5 @@
 (async () => {
-// A valódi processQueue-t futtatja egy szimulált TaskQueue ellen.
+// Runs the real processQueue against a simulated TaskQueue.
 const fs = require('fs');
 const src = fs.readFileSync(require('path').join(__dirname, 'the-west-automation.js'), 'utf8');
 function extract(name) {
@@ -19,7 +19,7 @@ const CONFIG = { FALLBACK_QUEUE_LIMIT: 4, DEFAULT_DURATION: 900, SAFETY_MARGIN_M
     FULL_QUEUE_POLL_MIN: 15000, FULL_QUEUE_POLL_MAX: 25000, MIN_SEND_GAP: 2000,
     MAX_WAIT_MS: 3600000, IDLE_RESCHEDULE: 5000, MAX_RETRIES: 5, MAX_DEFERRALS: 2, MAX_AMOUNT: 99, MAX_EXTRA_QUEUE: 500 };
 
-// --- A játék TaskQueue-jának hű mása: szinkron push, limitnél néma elutasítás ---
+// --- A faithful copy of the game's TaskQueue: synchronous push, silent refusal at the limit ---
 function makeGame(limit, initial = 0) {
     const q = [];
     for (let i = 0; i < initial; i++) q.push({ data: { date_done: Date.now() + 60000 * (i + 1) } });
@@ -31,7 +31,7 @@ function makeGame(limit, initial = 0) {
             this.addCalls++;
             const list = Array.isArray(tasks) ? tasks : [tasks];
             for (const t of list) {
-                if (this.queue.length >= limit) break;   // néma elutasítás, mint az igazi
+                if (this.queue.length >= limit) break;   // silent refusal, like the real one
                 this.queue.push({ data: { date_done: Date.now() + 60000 * (this.queue.length + 1) }, post: t });
             }
         },
@@ -44,8 +44,8 @@ global.Premium = { hasBonus: () => false };
 window.Premium = global.Premium;
 
 let extraJobs = [], paused = false, processing = false, nextJobTimer = null, isLeaderTab = true;
-// Alvás/energia: alapesetben nincs alvás és minden munka kifizethető; a
-// forgatókönyvek ezeket felülírják, ahol számít.
+// Sleep/energy: by default there is no sleep and every job is affordable; the
+// scenarios override these where it matters.
 let isSleeping = () => false;
 let jobEnergyCost = () => null;
 let maybeOfferSleep = () => {};
@@ -57,8 +57,8 @@ const updateExtraList = () => {};
 const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
-const refreshForecast = () => [];          // előrejelzés: élő játékállapot kell hozzá
-const updateEnergyForecastBar = () => {};  // a karakterdoboz sávja szintén
+const refreshForecast = () => [];          // forecast: needs live game state
+const updateEnergyForecastBar = () => {};  // the character box's bar likewise
 const offerSleepIfForecastRunsOut = () => {};
 const renderPendingInGameQueue = () => {};
 const observePendingHost = () => {};
@@ -78,13 +78,13 @@ console.log = real;
 
 const mkJobs = n => Array.from({ length: n }, (_, i) => ({
     id: 'j' + i, jobId: 100 + i, x: 1, y: 2, duration: 600, taskType: 'job',
-    jobName: 'Munka ' + (i + 1), retries: 0, deferrals: 0 }));
+    jobName: 'Job ' + (i + 1), retries: 0, deferrals: 0 }));
 
 let pass = 0, fail = 0;
 const eq = (l, g, w) => { const ok = JSON.stringify(g) === JSON.stringify(w);
     ok ? pass++ : fail++; console.log(`${ok?'ok  ':'FAIL'} ${l.padEnd(52)} ${ok?'':`got ${JSON.stringify(g)} want ${JSON.stringify(w)}`}`); };
 
-// --- A bejelentett hibaeset: 7 munka, üres sor, limit 4 ---
+// --- The reported failure case: 7 jobs, empty queue, limit 4 ---
 async function scenario(limit, initial, jobCount, rounds) {
     window.TaskQueue = makeGame(limit, initial);
     extraJobs = mkJobs(jobCount); processing = false; nextJobTimer = null; scheduled = null;
@@ -92,49 +92,49 @@ async function scenario(limit, initial, jobCount, rounds) {
     return { left: extraJobs.length, inGame: window.TaskQueue.queue.length, addCalls: window.TaskQueue.addCalls };
 }
 
-console.log('=== A bejelentett eset: 7 munka indítása üres sorra (limit 4) ===');
+console.log('=== The reported case: 7 jobs started on an empty queue (limit 4) ===');
 let r = await scenario(4, 0, 7, 1);
-eq('1 kör: 4 a játékba, 3 marad a listán', [r.inGame, r.left], [4, 3]);
-eq('egyetlen kérés megy ki a kötegre', r.addCalls, 1);
+eq('1 round: 4 into the game, 3 stay on the list', [r.inGame, r.left], [4, 3]);
+eq('a single request goes out for the batch', r.addCalls, 1);
 
 r = await scenario(4, 0, 7, 5);
-eq('tele sorra tovább próbálva SEMMI nem vész el', [r.inGame, r.left], [4, 3]);
+eq('retrying against a full queue loses NOTHING', [r.inGame, r.left], [4, 3]);
 
-console.log('\n=== Az eltűnés szerkezetileg lehetetlen ===');
-r = await scenario(0, 0, 3, 6);                      // a játék soha nem fogad el
-eq('limit 0: mind a 3 megmarad', [r.inGame, r.left], [0, 3]);
+console.log('\n=== Vanishing is structurally impossible ===');
+r = await scenario(0, 0, 3, 6);                      // the game never accepts
+eq('limit 0: all 3 stay', [r.inGame, r.left], [0, 3]);
 window.TaskQueue = { queue: [], limit: { normal: 4 }, add() { throw new Error('boom'); } };
 extraJobs = mkJobs(3); processing = false;
 await processQueue();
-eq('TaskQueue.add kivétel: a lista érintetlen', extraJobs.length, 3);
+eq('TaskQueue.add throws: the list is untouched', extraJobs.length, 3);
 window.TaskQueue = undefined;
 extraJobs = mkJobs(3); processing = false;
 await processQueue();
-eq('nincs TaskQueue: a lista érintetlen', extraJobs.length, 3);
+eq('no TaskQueue: the list is untouched', extraJobs.length, 3);
 
-console.log('\n=== Részben tele sor ===');
+console.log('\n=== Partly full queue ===');
 r = await scenario(4, 2, 5, 1);
-eq('2 foglalt + 5 kért -> 2 indul, 3 marad', [r.inGame, r.left], [4, 3]);
+eq('2 taken + 5 asked -> 2 start, 3 stay', [r.inGame, r.left], [4, 3]);
 r = await scenario(4, 4, 5, 1);
-eq('tele sor -> 0 indul, 5 marad', [r.inGame, r.left], [4, 5]);
-eq('tele sornál el sem küldjük a kérést', window.TaskQueue.addCalls, 0);
+eq('full queue -> 0 start, 5 stay', [r.inGame, r.left], [4, 5]);
+eq('with a full queue we do not even send the request', window.TaskQueue.addCalls, 0);
 
-console.log('\n=== Prémium sorméret ===');
+console.log('\n=== Premium queue size ===');
 window.Premium.hasBonus = () => true;
 r = await scenario(9, 0, 12, 1);
-eq('prémium: 9 fér be', [r.inGame, r.left], [9, 3]);
+eq('premium: 9 fit', [r.inGame, r.left], [9, 3]);
 window.Premium.hasBonus = () => false;
 
-console.log('\n=== Sorok felszabadulásával minden elindul ===');
+console.log('\n=== Everything starts as slots free up ===');
 window.TaskQueue = makeGame(4, 0);
 extraJobs = mkJobs(10);
 for (let r2 = 0; r2 < 3; r2++) { processing = false; await processQueue(); window.TaskQueue.queue.length = 0; }
-eq('3 kör, közben ürül: 10-ből 10 elindult', extraJobs.length, 0);
+eq('3 rounds, emptying meanwhile: 10 of 10 started', extraJobs.length, 0);
 
 
 
 // ============================================================
-//  Időtartam-értelmezés (a játék tömör alakot használ: "15mp")
+//  Duration parsing (the game uses a compact form: "15mp")
 // ============================================================
 console.log('\n=== parseDurationText ===');
 eval(extract('parseDurationText'));
@@ -144,9 +144,9 @@ for (const [txt, want] of [['15mp',15],['45mp',45],['10p',600],['30p',1800],['1�
     eq(`parseDurationText(${JSON.stringify(txt)})`, parseDurationText(txt), want);
 
 // ============================================================
-//  Tárolás: verziózás, migráció, sérült adat
+//  Storage: versioning, migration, corrupt data
 // ============================================================
-console.log('\n=== Tárolás ===');
+console.log('\n=== Storage ===');
 const store = {};
 global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k,v) => { store[k]=v; }, removeItem: k => { delete store[k]; } };
 CONFIG.STORAGE_VERSION = 2;
@@ -155,31 +155,31 @@ eval([extract('saveStore'), extract('loadStore'), extract('sanitizeJobs')].join(
 const K = 'lisa_extra_queue', LEG = 'lisa_extra_params_v1020';
 
 saveStore(K, [{ jobId: 1 }]);
-eq('mentés/olvasás körbejár', loadStore(K), [{ jobId: 1 }]);
-eq('a burkolat hordozza a verziót', JSON.parse(store[K]).v, 2);
+eq('save/load round-trips', loadStore(K), [{ jobId: 1 }]);
+eq('the wrapper carries the version', JSON.parse(store[K]).v, 2);
 store[K] = JSON.stringify([{ jobId: 9 }]);
-eq('verziózatlan tömb is olvasható', loadStore(K), [{ jobId: 9 }]);
+eq('an unversioned array is readable too', loadStore(K), [{ jobId: 9 }]);
 delete store[K];
-store[LEG] = JSON.stringify([{ jobId: 42, jobName: 'Régi' }]);
-eq('migráció a régi kulcsról', loadStore(K, LEG), [{ jobId: 42, jobName: 'Régi' }]);
-store[K] = '{{{nem json';
-eq('sérült JSON nem dob', loadStore(K), null);
-eq('hiányzó kulcs -> null', loadStore('nincs_ilyen'), null);
-eq('szemét kiszűrve', sanitizeJobs([{jobId:5}, null, {}, {jobId:'abc'}]).length, 1);
+store[LEG] = JSON.stringify([{ jobId: 42, jobName: 'Old' }]);
+eq('migration from the old key', loadStore(K, LEG), [{ jobId: 42, jobName: 'Old' }]);
+store[K] = '{{{not json';
+eq('corrupt JSON does not throw', loadStore(K), null);
+eq('missing key -> null', loadStore('no_such_key'), null);
+eq('junk filtered out', sanitizeJobs([{jobId:5}, null, {}, {jobId:'abc'}]).length, 1);
 const sj = sanitizeJobs([{ jobId: '7', x: '3', duration: 'xx' }])[0];
-eq('számmá alakít', [sj.jobId, sj.x], [7, 3]);
-eq('rossz duration -> default', sj.duration, 900);
-eq('hiányzó név pótolva', sj.jobName, 'Job #7');
-eq('felső korlát', sanitizeJobs(new Array(900).fill({ jobId: 1 })).length, 500);
+eq('coerced to numbers', [sj.jobId, sj.x], [7, 3]);
+eq('bad duration -> default', sj.duration, 900);
+eq('missing name filled in', sj.jobName, 'Job #7');
+eq('upper bound', sanitizeJobs(new Array(900).fill({ jobId: 1 })).length, 500);
 
 
 // ============================================================
-//  Vezetőválasztás: a látható fül soha ne maradjon némán passzív
+//  Leader election: a visible tab must never stay silently passive
 // ============================================================
-console.log('\n=== Vezetőválasztás ===');
+console.log('\n=== Leader election ===');
 CONFIG.STORAGE_LEADER = 'lisa_leader_tab';
 CONFIG.LEADER_TTL = 15000;
-let TAB_ID = 'engem';
+let TAB_ID = 'me';
 let visibility = 'visible';
 global.document = { visibilityState: 'visible' };
 Object.defineProperty(global.document, 'visibilityState', { get: () => visibility });
@@ -190,46 +190,46 @@ const getLeader = () => JSON.parse(store[CONFIG.STORAGE_LEADER] || 'null');
 
 delete store[CONFIG.STORAGE_LEADER];
 isLeaderTab = false; refreshLeadership();
-eq('egyedüli fül vezető lesz', isLeaderTab, true);
+eq('a lone tab becomes the leader', isLeaderTab, true);
 
-// Háttérben lévő vezető + látható fül -> a látható elveszi (ez volt a hiba)
-setLeader({ id: 'masik', ts: Date.now(), visible: false });
+// Background leader + visible tab -> the visible one takes over (this was the bug)
+setLeader({ id: 'other', ts: Date.now(), visible: false });
 isLeaderTab = false; visibility = 'visible'; refreshLeadership();
-eq('látható fül elveszi a háttérfültől', isLeaderTab, true);
-eq('a bejegyzés a miénk lesz', getLeader().id, 'engem');
+eq('a visible tab takes it from a background one', isLeaderTab, true);
+eq('the entry becomes ours', getLeader().id, 'me');
 
-// Látható vezető + látható fül -> nem vesszük el (duplikálás elleni védelem marad)
-setLeader({ id: 'masik', ts: Date.now(), visible: true });
+// Visible leader + visible tab -> we don't take it (the anti-duplication guard stays)
+setLeader({ id: 'other', ts: Date.now(), visible: true });
 isLeaderTab = true; refreshLeadership();
-eq('látható vezetőt nem előzünk meg', isLeaderTab, false);
+eq('we do not overtake a visible leader', isLeaderTab, false);
 
-// Rejtett fül nem veszi el a látható vezetőtől
-setLeader({ id: 'masik', ts: Date.now(), visible: false });
+// A hidden tab does not take it from a visible leader
+setLeader({ id: 'other', ts: Date.now(), visible: false });
 isLeaderTab = false; visibility = 'hidden'; refreshLeadership();
-eq('rejtett fül nem vesz át', isLeaderTab, false);
+eq('a hidden tab does not take over', isLeaderTab, false);
 visibility = 'visible';
 
-// Lejárt bejegyzést bárki átvehet
-setLeader({ id: 'masik', ts: Date.now() - 60000, visible: true });
+// A stale entry can be taken over by anyone
+setLeader({ id: 'other', ts: Date.now() - 60000, visible: true });
 isLeaderTab = false; refreshLeadership();
-eq('lejárt vezetés átvehető', isLeaderTab, true);
+eq('a stale leadership can be taken over', isLeaderTab, true);
 
-// Bezáráskor elengedjük -> a következő fül azonnal átveheti
-setLeader({ id: 'engem', ts: Date.now(), visible: true });
+// We release it on close -> the next tab can take over at once
+setLeader({ id: 'me', ts: Date.now(), visible: true });
 releaseLeadership();
-eq('bezáráskor elengedi a sajátját', getLeader(), null);
-setLeader({ id: 'masik', ts: Date.now(), visible: true });
+eq('on close it releases its own', getLeader(), null);
+setLeader({ id: 'other', ts: Date.now(), visible: true });
 releaseLeadership();
-eq('másét nem törli', getLeader().id, 'masik');
+eq("it does not delete another tab's entry", getLeader().id, 'other');
 
 
 
 // ============================================================
-//  Várható kezdés/befejezés láncolása
+//  Chaining the predicted start/finish times
 // ============================================================
-console.log('\n=== Időpontbecslés ===');
-// A játékban mérve: az idő pontosan lineáris az euklideszi távolsággal,
-// 0.017647 mp/egység. A calcWayTo az AKTUÁLIS pozícióból számol.
+console.log('\n=== Time estimation ===');
+// Measured in the game: the time is exactly linear in euclidean distance,
+// 0.017647 s/unit. calcWayTo computes from the CURRENT position.
 const SEC_PER_UNIT = 0.017647;
 let charPos = { x: 0, y: 0 };
 global.Character = {
@@ -237,77 +237,77 @@ global.Character = {
     calcWayTo: (x, y) => Math.hypot(x - charPos.x, y - charPos.y) * SEC_PER_UNIT,
 };
 window.Character = global.Character;
-// Az alvás hossza élőben számolódik; a munkáké a mentett érték.
+// A sleep's length is computed live; a job's comes from the stored value.
 const estimateSleepSeconds = () => 3600;
 const sleepGoalForTask = () => 100;
 const sleepPerHour = () => 0;
 eval(['secondsPerDistanceUnit','currentPosition','queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta',
       'jobDurationSeconds','msUntilEnergyAtRate'].map(extract).join('\n'));
 
-eq('mp/egység a calcWayTo-ból származik', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
+eq('seconds per unit comes from calcWayTo', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
 
-// Üres játéksor: a lánc mostantól és a karakter pozíciójától indul
+// Empty game queue: the chain starts from now and from the character's position
 window.TaskQueue = { queue: [], limit: { normal: 4, premium: 9 } };
 charPos = { x: 0, y: 0 };
 const t0 = Date.now();
 let etas = computeEtas([
-    { id: 'a', x: 1000, y: 0, duration: 60 },     // 17.647 mp út, 60 mp munka
-    { id: 'b', x: 1000, y: 0, duration: 30 },     // ugyanott: 0 út
+    { id: 'a', x: 1000, y: 0, duration: 60 },     // 17.647 s travel, 60 s of work
+    { id: 'b', x: 1000, y: 0, duration: 30 },     // same spot: no travel
 ]);
-eq('1. munka utazási ideje', Math.round(etas[0].travelMs / 1000), 18);
-eq('1. munka hossza', Math.round((etas[0].finish - etas[0].start) / 1000), 60);
-eq('2. munka az 1. után indul (nincs út)', Math.round((etas[1].start - etas[0].finish) / 1000), 0);
-eq('2. munka hossza', Math.round((etas[1].finish - etas[1].start) / 1000), 30);
+eq('travel time of job 1', Math.round(etas[0].travelMs / 1000), 18);
+eq('length of job 1', Math.round((etas[0].finish - etas[0].start) / 1000), 60);
+eq('job 2 starts after job 1 (no travel)', Math.round((etas[1].start - etas[0].finish) / 1000), 0);
+eq('length of job 2', Math.round((etas[1].finish - etas[1].start) / 1000), 30);
 
-// A távolság az ELŐZŐ munkától számít, nem a karaktertől
+// Distance counts from the PREVIOUS job, not from the character
 etas = computeEtas([
     { id: 'a', x: 1000, y: 0, duration: 0 },
-    { id: 'b', x: 3000, y: 0, duration: 0 },      // 2000 egység az előzőtől
+    { id: 'b', x: 3000, y: 0, duration: 0 },      // 2000 units from the previous one
 ]);
-eq('a 2. utazása az előző helyszínétől', Math.round(etas[1].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
+eq('job 2 travels from the previous location', Math.round(etas[1].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
 
-// Nem üres játéksor: a lánc a LEGKÉSŐBB végző munka után és onnan indul
+// Non-empty game queue: the chain starts after -- and from -- the job finishing LAST
 const future = Date.now() + 600000;
 window.TaskQueue.queue = [
     { data: { date_done: Date.now() + 60000 }, post: { x: 500, y: 0 } },
-    { data: { date_done: future },             post: { x: 2000, y: 0 } },   // ez a "farok"
+    { data: { date_done: future },             post: { x: 2000, y: 0 } },   // this is the "tail"
     { data: { date_done: Date.now() + 120000 }, post: { x: 900, y: 0 } },
 ];
 etas = computeEtas([{ id: 'a', x: 2000, y: 0, duration: 120 }]);
-eq('a lánc a legkésőbbi végénél kezdődik', Math.round((etas[0].start - future) / 1000), 0);
+eq('the chain starts at the latest finish', Math.round((etas[0].start - future) / 1000), 0);
 etas = computeEtas([{ id: 'a', x: 4000, y: 0, duration: 0 }]);
-eq('utazás a farok helyszínéről', Math.round(etas[0].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
+eq('travel from the tail location', Math.round(etas[0].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
 
-// Lejárt sor: a múltbeli date_done nem tolja vissza a becslést
+// Expired queue: a date_done in the past does not pull the estimate back
 window.TaskQueue.queue = [{ data: { date_done: Date.now() - 999999 }, post: { x: 0, y: 0 } }];
 etas = computeEtas([{ id: 'a', x: 0, y: 0, duration: 60 }]);
-eq('múltbeli befejezés nem húz vissza', etas[0].start >= Date.now() - 1000, true);
+eq('a finish in the past does not pull it back', etas[0].start >= Date.now() - 1000, true);
 
-// calcWayTo nélkül is ad becslést, csak utazás nélkül
+// It still gives an estimate without calcWayTo, just with no travel
 const savedChar = global.Character;
 global.Character = undefined; window.Character = undefined;
 window.TaskQueue.queue = [];
 etas = computeEtas([{ id: 'a', x: 9999, y: 9999, duration: 60 }]);
-eq('calcWayTo nélkül nincs utazás', etas[0].travelMs, 0);
-eq('és jelezzük, hogy nem teljes a becslés', etas[0].estimated, false);
+eq('without calcWayTo there is no travel', etas[0].travelMs, 0);
+eq('and we flag the estimate as incomplete', etas[0].estimated, false);
 global.Character = savedChar; window.Character = savedChar;
 
-// Formázás
+// Formatting
 const base = new Date(); base.setHours(9, 5, 0, 0);
-eq('rövid óra:perc alak', formatEta({ start: base.getTime(), finish: base.getTime() + 3600000 }), '09:05→10:05');
+eq('short hh:mm form', formatEta({ start: base.getTime(), finish: base.getTime() + 3600000 }), '09:05→10:05');
 const tomorrow = base.getTime() + 26 * 3600000;
-eq('másnapi vég jelölve', formatEta({ start: base.getTime(), finish: tomorrow }).endsWith('+1'), true);
+eq('a next-day finish is marked', formatEta({ start: base.getTime(), finish: tomorrow }).endsWith('+1'), true);
 
 
 // ============================================================
-//  Külső megszakításra gyors reagálás
+//  Fast reaction to an external cancellation
 // ============================================================
-console.log('\n=== Slot-figyelő ===');
+console.log('\n=== Slot watcher ===');
 CONFIG.SLOT_FREED_DELAY = 1500;
-const updateKeepAwake = () => {};     // ébrentartás: böngészőfüggő, itt nem mérhető
-const cancelSleepIfFull = () => {};   // az alvás megszakítása élő játékállapotot igényel
-const askRunningSleepMode = () => {}; // párbeszédablak kell hozzá
-const patchHotelStart = () => {};     // a hotel ablak csak a játékban létezik
+const updateKeepAwake = () => {};     // keep-awake: browser-dependent, not measurable here
+const cancelSleepIfFull = () => {};   // cancelling a sleep needs live game state
+const askRunningSleepMode = () => {}; // needs a dialog
+const patchHotelStart = () => {};     // the hotel window only exists in the game
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -323,26 +323,26 @@ function watchCase(o) {
     return scheduled;
 }
 
-eq('sor rövidült -> hamarosan indít', watchCase({ len: 3, lastSeen: 4, waiting: 2 }), 1500);
-eq('változatlan sor -> nem piszkál', watchCase({ len: 4, lastSeen: 4, waiting: 2 }), null);
-eq('növekvő sor -> nem piszkál', watchCase({ len: 4, lastSeen: 3, waiting: 2 }), null);
-eq('nincs várakozó munka -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 0 }), null);
-eq('tele a sor -> nem indít', watchCase({ len: 4, lastSeen: 5, waiting: 2 }), null);
-eq('szüneteltetve -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, paused: true }), null);
-eq('passzív fül -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, leader: false }), null);
-eq('épp fut egy kör -> nem indít', watchCase({ len: 3, lastSeen: 4, waiting: 2, processing: true }), null);
-eq('hosszú várakozást megelőz', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 300000 }), 1500);
-eq('közelebbi időzítőt nem tol el', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 500 }), null);
-// Elutasítás után ne kezdjen kétmásodpercenként próbálkozni: második hívás már nem indít
+eq('queue shrank -> starts shortly', watchCase({ len: 3, lastSeen: 4, waiting: 2 }), 1500);
+eq('unchanged queue -> leaves it alone', watchCase({ len: 4, lastSeen: 4, waiting: 2 }), null);
+eq('growing queue -> leaves it alone', watchCase({ len: 4, lastSeen: 3, waiting: 2 }), null);
+eq('no waiting job -> starts nothing', watchCase({ len: 3, lastSeen: 4, waiting: 0 }), null);
+eq('full queue -> starts nothing', watchCase({ len: 4, lastSeen: 5, waiting: 2 }), null);
+eq('paused -> starts nothing', watchCase({ len: 3, lastSeen: 4, waiting: 2, paused: true }), null);
+eq('passive tab -> starts nothing', watchCase({ len: 3, lastSeen: 4, waiting: 2, leader: false }), null);
+eq('a round already running -> starts nothing', watchCase({ len: 3, lastSeen: 4, waiting: 2, processing: true }), null);
+eq('pulls a long wait forward', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 300000 }), 1500);
+eq('does not push out a nearer timer', watchCase({ len: 3, lastSeen: 4, waiting: 2, pendingTimer: true, deadlineInMs: 500 }), null);
+// After a rejection it must not retry every two seconds: the second call starts nothing
 watchCase({ len: 3, lastSeen: 4, waiting: 2 });
-eq('ismételt hívás új csökkenés nélkül csendes', (scheduled = null, watchGameQueue(), scheduled), null);
+eq('a repeat call without a new decrease stays quiet', (scheduled = null, watchGameQueue(), scheduled), null);
 paused = false; isLeaderTab = true; processing = false;
 
 
 // ============================================================
-//  Időtartam a MEGNYOMOTT sávból (magas szintű fiókok)
+//  Duration from the CLICKED bar (high-level accounts)
 // ============================================================
-console.log('\n=== Időtartamsávok ===');
+console.log('\n=== Duration bars ===');
 global.JobList = { getDurations: () => ({ short:{duration:15,requirement:1},
                                           middle:{duration:600,requirement:10},
                                           long:{duration:3600,requirement:20} }) };
@@ -350,7 +350,7 @@ window.JobList = global.JobList;
 jobHistory = [];
 eval([extract('durationFromBar'), extract('parseJobWindow')].join('\n'));
 
-// Minimális DOM-utánzat: csak amit a parseJobWindow használ
+// Minimal DOM imitation: only what parseJobWindow uses
 function mkBar(base, disabled, durText) {
     const bar = { dataset: { base }, disabled,
         querySelector: sel => (sel === '.job_value_duration' && durText) ? { textContent: durText } : null };
@@ -366,46 +366,46 @@ const CLS = 'tw2gui_window job-43879-17869-7';
 
 const barsHigh = [mkBar('short', false, '15mp'), mkBar('middle', false, '10p'), mkBar('long', false, '1ó')];
 const winHigh = mkWindow(barsHigh, CLS);
-eq('short gomb -> 15 mp', parseJobWindow(winHigh, mkBtn(barsHigh[0])).duration, 15);
-eq('middle gomb -> 600 mp', parseJobWindow(winHigh, mkBtn(barsHigh[1])).duration, 600);
-eq('long gomb -> 3600 mp', parseJobWindow(winHigh, mkBtn(barsHigh[2])).duration, 3600);
-eq('koordináták a class-ból', (j => [j.jobId, j.x, j.y])(parseJobWindow(winHigh, mkBtn(barsHigh[2]))), [7, 43879, 17869]);
+eq('short button -> 15 s', parseJobWindow(winHigh, mkBtn(barsHigh[0])).duration, 15);
+eq('middle button -> 600 s', parseJobWindow(winHigh, mkBtn(barsHigh[1])).duration, 600);
+eq('long button -> 3600 s', parseJobWindow(winHigh, mkBtn(barsHigh[2])).duration, 3600);
+eq('coordinates from the class name', (j => [j.jobId, j.x, j.y])(parseJobWindow(winHigh, mkBtn(barsHigh[2]))), [7, 43879, 17869]);
 
-// Alacsony szint: csak a short aktív, a többi letiltott gomb nélkül
+// Low level: only short is active, the others have no disabled button
 const barsLow = [mkBar('short', false, '15mp'), mkBar('middle', true), mkBar('long', true)];
-eq('alacsony szint -> 15 mp', parseJobWindow(mkWindow(barsLow, CLS), mkBtn(barsLow[0])).duration, 15);
+eq('low level -> 15 s', parseJobWindow(mkWindow(barsLow, CLS), mkBtn(barsLow[0])).duration, 15);
 
-// Ismeretlen data-base esetén a szöveg a tartalék
+// With an unknown data-base the text is the fallback
 const oddBar = mkBar(undefined, false, '10p');
-eq('data-base nélkül a szövegből', parseJobWindow(mkWindow([oddBar], CLS), mkBtn(oddBar)).duration, 600);
+eq('no data-base -> from the text', parseJobWindow(mkWindow([oddBar], CLS), mkBtn(oddBar)).duration, 600);
 
-// Se base, se szöveg -> előzmény, majd default
+// Neither base nor text -> history, then the default
 const blank = mkBar(undefined, false, null);
 jobHistory = [{ jobId: 7, duration: 1234 }];
-eq('előzményből pótolva', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, 1234);
+eq('filled in from the history', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, 1234);
 jobHistory = [];
-eq('végső tartalék a default', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, CONFIG.DEFAULT_DURATION);
+eq('last resort is the default', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, CONFIG.DEFAULT_DURATION);
 
-// Gomb nélkül (nem elkapott kattintás) az első aktív sávra esik vissza
-eq('gomb nélkül az első aktív sáv', parseJobWindow(winHigh, null).duration, 15);
-eq('nem munkaablak -> null', parseJobWindow(mkWindow(barsHigh, 'tw2gui_window valami'), null), null);
+// With no button (an uncaught click) it falls back to the first active bar
+eq('with no button, the first active bar', parseJobWindow(winHigh, null).duration, 15);
+eq('not a job window -> null', parseJobWindow(mkWindow(barsHigh, 'tw2gui_window something'), null), null);
 
 // ============================================================
-//  A játék sorában az utazás beleszámít az időbe
+//  In the game's queue the travel is folded into the time
 // ============================================================
-console.log('\n=== Utazás a sorelem idejében ===');
+console.log('\n=== Travel folded into the row time ===');
 eval(extract('formatClock'));
-eq('0 mp út -> csak a munkaidő', formatClock(0 + 15), '00:00:15');
-eq('5 mp út + 15 mp munka', formatClock(5 + 15), '00:00:20');
-eq('29 mp út + 15 mp munka', formatClock(29 + 15), '00:00:44');
-eq('10 perces munka', formatClock(0 + 600), '00:10:00');
-eq('1 órás munka úttal', formatClock(120 + 3600), '01:02:00');
+eq('0 s travel -> just the work time', formatClock(0 + 15), '00:00:15');
+eq('5 s travel + 15 s work', formatClock(5 + 15), '00:00:20');
+eq('29 s travel + 15 s work', formatClock(29 + 15), '00:00:44');
+eq('a 10-minute job', formatClock(0 + 600), '00:10:00');
+eq('a 1-hour job with travel', formatClock(120 + 3600), '01:02:00');
 
 
 // ============================================================
-//  Gyorsindító nyilak: helyszín a legközelebbi munkacsoportból
+//  Quick-start arrows: location from the nearest job group
 // ============================================================
-console.log('\n=== Gyorsindítás ===');
+console.log('\n=== Quick start ===');
 CONFIG.JOBGROUP_MAX_DIST = 200;
 function rectOf(x, y, w = 54, h = 54) {
     return { getBoundingClientRect: () => ({ x: x - w/2, y: y - h/2, width: w, height: h }) };
@@ -417,77 +417,77 @@ let groups = [];
 global.document = { querySelectorAll: sel => (sel === '.jobgroup' ? groups : []) };
 eval(extract('nearestJobGroup'));
 
-// Élesben mért elrendezés: a csoport a szétnyílt kör közepén, a következő 528 px-re
+// Layout measured live: the group at the fanned-out circle's centre, the next one 528 px away
 groups = [mkGroup(41966, 16411, 816, 464), mkGroup(40224, 16507, 816 - 528, 464)];
-eq('a kör közepi csoport nyer', (g => [g.x, g.y])(nearestJobGroup(rectOf(816, 389))), [41966, 16411]);
-eq('szélső ikonnál is ugyanaz', (g => [g.x, g.y])(nearestJobGroup(rectOf(886, 504))), [41966, 16411]);
+eq('the group at the circle centre wins', (g => [g.x, g.y])(nearestJobGroup(rectOf(816, 389))), [41966, 16411]);
+eq('the same for an outer icon', (g => [g.x, g.y])(nearestJobGroup(rectOf(886, 504))), [41966, 16411]);
 
-// Túl messze -> nincs találat, a kattintás a játéké marad
+// Too far -> no match, the click stays the game's
 groups = [mkGroup(41966, 16411, 100, 100)];
-eq('távoli csoportot nem fogadunk el', nearestJobGroup(rectOf(816, 389)), null);
+eq('a distant group is not accepted', nearestJobGroup(rectOf(816, 389)), null);
 groups = [];
-eq('csoport nélkül null', nearestJobGroup(rectOf(816, 389)), null);
+eq('no group -> null', nearestJobGroup(rectOf(816, 389)), null);
 
-// A jobId/base kiolvasás osztálynevekből (a valódi osztályokkal)
+// Reading the jobId/base out of class names (with the real classes)
 const idOf  = cls => (cls.match(/\bjob-(\d+)\b/) || [])[1];
 const baseOf = cls => (cls.match(/instantwork-(short|middle|long)/) || [])[1];
-eq('jobId a .job-128-ból', idOf('job job-128 hasMousePopup'), '128');
-eq('jobgroup nem ad jobId-t', idOf('image x-157 y-64 posx-40224 posy-16507 jobgroup jobgroup-12'), undefined);
-eq('short nyíl', baseOf('instantwork-short'), 'short');
-eq('middle nyíl', baseOf('instantwork-middle'), 'middle');
-eq('long nyíl', baseOf('instantwork-long'), 'long');
-eq('a base időtartamra képez', JobList.getDurations()[baseOf('instantwork-long')].duration, 3600);
+eq('jobId out of .job-128', idOf('job job-128 hasMousePopup'), '128');
+eq('a jobgroup yields no jobId', idOf('image x-157 y-64 posx-40224 posy-16507 jobgroup jobgroup-12'), undefined);
+eq('short arrow', baseOf('instantwork-short'), 'short');
+eq('middle arrow', baseOf('instantwork-middle'), 'middle');
+eq('long arrow', baseOf('instantwork-long'), 'long');
+eq('the base maps to a duration', JobList.getDurations()[baseOf('instantwork-long')].duration, 3600);
 
 // ============================================================
-//  "Összes törlése" csak megerősítés után ürít
+//  "Cancel all" only empties after a confirmation
 // ============================================================
-console.log('\n=== Összes törlése ===');
+console.log('\n=== Cancel all ===');
 let statusText = '';
 const updateUIStatusReal = (t) => { statusText = t; };
 eval(extract('clearExtraAfterCancelAll').replace('updateUIStatus(', 'updateUIStatusReal('));
 extraJobs = mkJobs(5);
 clearExtraAfterCancelAll();
-eq('megerősítés után ürül a lista', extraJobs.length, 0);
-eq('a státusz megmondja, mennyit törölt', /5 várakozó/.test(statusText), true);
+eq('the list empties after the confirmation', extraJobs.length, 0);
+eq('the status says how many were discarded', /5 várakozó/.test(statusText), true);
 statusText = '';
 clearExtraAfterCancelAll();
-eq('üres listánál nincs üzenet', statusText, '');
+eq('no message for an empty list', statusText, '');
 
 // ============================================================
-//  Barátságos időkiírás (a státuszsor korábban "~400 mp"-et mutatott)
+//  Friendly time formatting (the status line used to show "~400 mp")
 // ============================================================
-console.log('\n=== Időtartam-formázás ===');
-// A formatDuration-t a processQueue miatt már fent kiemeltük.
-eq('egy perc alatt másodperc marad', formatDuration(45), '45 mp');
-eq('pont egy perc', formatDuration(60), '1 p');
-eq('400 mp -> felfelé kerekített perc', formatDuration(400), '7 p');
-eq('59 mp-cel több perc is felkerekít', formatDuration(61), '2 p');
-eq('59 perc még perc', formatDuration(3540), '59 p');
-eq('pont egy óra', formatDuration(3600), '1 ó');
-eq('óra és perc', formatDuration(3600 + 400), '1 ó 7 p');
-eq('kerek óra nem ír 0 percet', formatDuration(7200), '2 ó');
-eq('hosszú lista összege', formatDuration(24 * 900), '6 ó');
-eq('nulla', formatDuration(0), '0 mp');
+console.log('\n=== Duration formatting ===');
+// formatDuration was already extracted above, for processQueue.
+eq('under a minute stays in seconds', formatDuration(45), '45 mp');
+eq('exactly one minute', formatDuration(60), '1 p');
+eq('400 s -> minutes, rounded up', formatDuration(400), '7 p');
+eq('61 s rounds up to 2 minutes', formatDuration(61), '2 p');
+eq('59 minutes is still minutes', formatDuration(3540), '59 p');
+eq('exactly one hour', formatDuration(3600), '1 ó');
+eq('hours and minutes', formatDuration(3600 + 400), '1 ó 7 p');
+eq('a whole hour prints no 0 minutes', formatDuration(7200), '2 ó');
+eq('the sum of a long list', formatDuration(24 * 900), '6 ó');
+eq('zero', formatDuration(0), '0 mp');
 
 // ============================================================
-//  A "+N" csempe az utolsó munkahelyre ül (nem külön sorba)
+//  The "+N" tile sits on the last job slot (not on a row of its own)
 // ============================================================
-console.log('\n=== Játékbeli előnézet felosztása ===');
+console.log('\n=== In-game preview split ===');
 eval(extract('previewSplit'));
-eq('kevesebb, mint a keret: minden látszik', previewSplit(3, 6), { shown: 3, hidden: 0 });
-eq('pont annyi: még mindig nincs csempe', previewSplit(6, 6), { shown: 6, hidden: 0 });
-eq('eggyel több: 5 munka + "+2"', previewSplit(7, 6), { shown: 5, hidden: 2 });
-eq('sok munka: 5 munka + "+20"', previewSplit(25, 6), { shown: 5, hidden: 20 });
-eq('a csempe mindig a maradékot mondja',
+eq('fewer than the frame: everything shows', previewSplit(3, 6), { shown: 3, hidden: 0 });
+eq('exactly as many: still no tile', previewSplit(6, 6), { shown: 6, hidden: 0 });
+eq('one more: 5 jobs + "+2"', previewSplit(7, 6), { shown: 5, hidden: 2 });
+eq('many jobs: 5 jobs + "+20"', previewSplit(25, 6), { shown: 5, hidden: 20 });
+eq('the tile always reports the remainder',
    (s => s.shown + s.hidden)(previewSplit(25, 6)), 25);
 
 // ============================================================
-//  A szerver utólagos elutasítása nem veszejtheti el a munkát
+//  A later rejection by the server must not lose the job
 // ============================================================
-// Élesben mért eset: a TaskQueue.add szinkron push-ol, a script elfogadottnak
-// veszi őket, majd a szerver visszautasítja (szintkövetelmény), a játék kiveszi
-// a sorból -- és a munkák a listáról már eltűntek. 8 munka veszett így el.
-console.log('\n=== Szerveroldali elutasítás ===');
+// Case measured live: TaskQueue.add pushes synchronously, the script counts them
+// as accepted, then the server rejects them (level requirement) and the game
+// removes them from the queue -- and they are already gone from the list. 8 jobs were lost this way.
+console.log('\n=== Server-side rejection ===');
 eval([extract('parseBodyParams'), extract('extractTasksFromBody'),
       extract('rejectedFromAddResponse'), extract('addResponseMatchesBatch')].join('\n'));
 global.URLSearchParams = require('url').URLSearchParams;
@@ -496,107 +496,107 @@ const body3 = 'tasks[0][jobId]=129&tasks[0][x]=1&tasks[0][y]=2&tasks[0][duration
             + '&tasks[1][jobId]=127&tasks[1][x]=3&tasks[1][y]=4&tasks[1][duration]=600&tasks[1][taskType]=job'
             + '&tasks[2][jobId]=60&tasks[2][x]=5&tasks[2][y]=6&tasks[2][duration]=3600&tasks[2][taskType]=job';
 const parsed3 = extractTasksFromBody(body3);
-eq('a kérés minden munkája kijön', parsed3.length, 3);
-eq('sorrendhelyesen', parsed3.map(t => t.jobId), [129, 127, 60]);
-eq('az időtartam is megvan', parsed3.map(t => t.duration), [15, 600, 3600]);
-eq('egyetlen munkás kérés is jó', extractTasksFromBody('tasks[0][jobId]=7&tasks[0][duration]=15').length, 1);
-eq('munka nélküli test -> üres', extractTasksFromBody('window=task&action=add').length, 0);
+eq('every job of the request comes out', parsed3.length, 3);
+eq('in the right order', parsed3.map(t => t.jobId), [129, 127, 60]);
+eq('the duration is there too', parsed3.map(t => t.duration), [15, 600, 3600]);
+eq('a single-job request works too', extractTasksFromBody('tasks[0][jobId]=7&tasks[0][duration]=15').length, 1);
+eq('a body with no job -> empty', extractTasksFromBody('window=task&action=add').length, 0);
 
 const b3 = [{ jobId: 129, duration: 15 }, { jobId: 127, duration: 600 }, { jobId: 60, duration: 3600 }];
-eq('a saját kötegünk felismerhető', addResponseMatchesBatch(parsed3, b3), true);
-eq('más hosszúságú köteg nem a miénk', addResponseMatchesBatch(parsed3, b3.slice(0, 2)), false);
-eq('más munka nem a miénk',
+eq('our own batch is recognised', addResponseMatchesBatch(parsed3, b3), true);
+eq('a batch of a different length is not ours', addResponseMatchesBatch(parsed3, b3.slice(0, 2)), false);
+eq('a different job is not ours',
    addResponseMatchesBatch(parsed3, [{ jobId: 1, duration: 15 }, b3[1], b3[2]]), false);
-eq('köteg nélkül nincs párosítás', addResponseMatchesBatch(parsed3, null), false);
+eq('no batch -> no match', addResponseMatchesBatch(parsed3, null), false);
 
-// Az élesben mért válaszalak: tasks[i] vagy {task:{...}}, vagy {error,msg}
+// The response shape measured live: tasks[i] is either {task:{...}} or {error,msg}
 const okEntry = { task: { queue_id: 1, date_done: 1785828704.77 } };
-eq('csupa siker -> nincs visszautasított',
+eq('all successes -> nothing rejected',
    rejectedFromAddResponse(b3, { tasks: [okEntry, okEntry, okEntry] }).length, 0);
 const mixed = rejectedFromAddResponse(b3, {
     tasks: [okEntry, { error: true, msg: 'Legalább a 53 szintet kell elérned' }, okEntry] });
-eq('a hibás elem indexre párosít', mixed.length, 1);
-eq('a megfelelő munka bukott el', mixed[0].job.jobId, 127);
-eq('a szerver üzenete megmarad', /53 szintet/.test(mixed[0].msg), true);
-eq('felső szintű hiba -> az EGÉSZ köteg elbukott',
+eq('the failing element matches by index', mixed.length, 1);
+eq('the right job is the one that failed', mixed[0].job.jobId, 127);
+eq('the server message is kept', /53 szintet/.test(mixed[0].msg), true);
+eq('a top-level error -> the WHOLE batch failed',
    rejectedFromAddResponse(b3, { error: true, msg: 'Nincs elég energiád' }).length, 3);
-eq('hiba nélküli, tasks nélküli válasz nem bukás',
+eq('no error and no tasks is not a failure',
    rejectedFromAddResponse(b3, { energy: 97 }).length, 0);
-eq('a válasznál rövidebb köteg nem indexel túl',
+eq('a batch shorter than the response does not overrun',
    rejectedFromAddResponse([b3[0]], { tasks: [okEntry, { error: true, msg: 'x' }] }).length, 0);
-eq('üres kötegre üres', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
+eq('an empty batch yields empty', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
 
-// A visszatartás duplázódik: az energiahiány órás nagyságrendű, fix 20 mp-es
-// újrapróbálással a munka percek alatt elfogyasztaná a próbálkozásait.
+// The backoff doubles: low energy is an hours-long problem, and with a fixed
+// 20 s retry the job would burn through its attempts in minutes.
 CONFIG.REJECT_BACKOFF_MS = 20000; CONFIG.REJECT_BACKOFF_MAX = 600000; CONFIG.MAX_REJECTIONS = 10;
 eval(extract('rejectBackoffMs'));
-eq('első elutasítás után 20 mp', rejectBackoffMs(1), 20000);
-eq('másodszor duplázva', rejectBackoffMs(2), 40000);
-eq('ötödször 5 perc 20', rejectBackoffMs(5), 320000);
-eq('a felső korlát 10 perc', rejectBackoffMs(9), 600000);
-eq('nulla/hiányzó érték is legalább egy kör', rejectBackoffMs(0), 20000);
-// A tíz próbálkozás összesen több mint egy órát fed le -- egy energiahiányos
-// munka (3 energia/óra regeneráció) így kivárja, amíg indíthatóvá válik.
+eq('20 s after the first rejection', rejectBackoffMs(1), 20000);
+eq('doubled the second time', rejectBackoffMs(2), 40000);
+eq('5 min 20 s the fifth time', rejectBackoffMs(5), 320000);
+eq('the cap is 10 minutes', rejectBackoffMs(9), 600000);
+eq('a zero/missing value still waits one round', rejectBackoffMs(0), 20000);
+// The ten attempts span more than an hour in total -- so a job short on energy
+// (3 energy/hour regen) waits until it becomes startable.
 const totalWait = Array.from({length: CONFIG.MAX_REJECTIONS}, (_, i) => rejectBackoffMs(i + 1))
     .reduce((a, b) => a + b, 0);
-eq('a próbálkozások együtt > 1 óra', totalWait > 3600000, true);
+eq('the attempts together span > 1 hour', totalWait > 3600000, true);
 
 // ============================================================
-//  Energia- és motivációelőrejelzés
+//  Energy and motivation forecast
 // ============================================================
-// Mért játékadatok: a 15 mp-es munka 1 energiába kerül, a motiváció a munka
-// BEFEJEZÉSEKOR csökken ugyanennyivel, az energia viszont már a sorba
-// kerüléskor levonódik. A regeneráció maxEnergy * energyRegen / óra.
-console.log('\n=== Energia és motiváció ===');
+// Measured game data: a 15 s job costs 1 energy, motivation drops by the same
+// amount when the job COMPLETES, whereas the energy is deducted already when it
+// enters the queue. Regeneration is maxEnergy * energyRegen per hour.
+console.log('\n=== Energy and motivation ===');
 CONFIG.MOTIVATION_WARN = 75;
 eval(extract('computeForecast'));
 
 const mkEtas = (n, stepMs) => Array.from({length: n}, (_, i) => ({ start: 1000 + i * stepMs }));
 const flat = (energy) => () => energy;
 
-// Energia: minden munka levon, a regeneráció nélküli eset a legegyszerűbb
+// Energy: every job deducts; the case without regeneration is the simplest
 let fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
     costOf: () => 5, motivationOf: () => 1, energyAt: flat(12),
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('az első munka után 7 marad', [fc[0].energyBefore, fc[0].energyAfter], [12, 7]);
-eq('a második a maradékból indul', [fc[1].energyBefore, fc[1].energyAfter], [7, 2]);
-eq('a harmadikra már nincs fedezet', fc[2].notEnoughEnergy, true);
-eq('a fedezettel bíróknál nincs jelzés', [fc[0].notEnoughEnergy, fc[1].notEnoughEnergy], [false, false]);
+eq('7 left after the first job', [fc[0].energyBefore, fc[0].energyAfter], [12, 7]);
+eq('the second starts from what is left', [fc[1].energyBefore, fc[1].energyAfter], [7, 2]);
+eq('the third is no longer covered', fc[2].notEnoughEnergy, true);
+eq('no flag on the covered ones', [fc[0].notEnoughEnergy, fc[1].notEnoughEnergy], [false, false]);
 
-// A regeneráció beleszámít: ha a jóslás szerint közben töltődik, futja
+// Regeneration counts: if the forecast says it recovers meanwhile, it is enough
 fc = computeForecast(mkJobs(2), mkEtas(2, 60000), {
     costOf: () => 5, motivationOf: () => 1,
-    energyAt: (t) => (t === 1000 ? 5 : 10),          // a második indulásáig töltődik
+    energyAt: (t) => (t === 1000 ? 5 : 10),          // recovers by the second start
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('a regenerálódott energia is számít', fc[1].notEnoughEnergy, false);
+eq('regenerated energy counts too', fc[1].notEnoughEnergy, false);
 
-// Motiváció: minden BEFEJEZETT azonos munka a saját energiaköltségével csökkenti
+// Motivation: every COMPLETED instance of the same job lowers it by its own energy cost
 const same = Array.from({length: 4}, (_, i) => ({ ...mkJobs(1)[0], id: 'm' + i, jobId: 42 }));
 fc = computeForecast(same, mkEtas(4, 0), {
     costOf: () => 1, motivationOf: () => 1, energyAt: flat(100),
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('az első még teljes motivációval indul', fc[0].motivation, 100);
-eq('a negyedik már hárommal kevesebbel', fc[3].motivation, 97);
-eq('100%-nál nincs figyelmeztetés', fc.some(f => f.lowMotivation), false);
+eq('the first still starts at full motivation', fc[0].motivation, 100);
+eq('the fourth starts three lower', fc[3].motivation, 97);
+eq('no warning at 100%', fc.some(f => f.lowMotivation), false);
 
-// A játék sorában álló munkák is csökkentik, mielőtt a mieink sorra kerülnének
+// Jobs in the game's queue lower it too, before ours get their turn
 fc = computeForecast(same, mkEtas(4, 0), {
     costOf: () => 1, motivationOf: () => 0.78, energyAt: flat(100),
     priorMotivationCost: { 42: 2 }, motivationWarn: 75 });
-eq('a játék sorát is beszámítjuk', fc[0].motivation, 76);
-eq('a küszöb alatt figyelmeztetünk', [fc[0].lowMotivation, fc[1].lowMotivation], [false, true]);
-eq('pontosan a küszöbön is figyelmeztetünk', fc[1].motivation, 75);
+eq("the game's queue counts too", fc[0].motivation, 76);
+eq('we warn below the threshold', [fc[0].lowMotivation, fc[1].lowMotivation], [false, true]);
+eq('we warn exactly at the threshold too', fc[1].motivation, 75);
 
-// Amíg nem tudjuk a költséget/motivációt, NEM tippelünk
+// While we don't know the cost/motivation, we do NOT guess
 fc = computeForecast(mkJobs(2), mkEtas(2, 0), {
     costOf: () => null, motivationOf: () => null, energyAt: flat(3),
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('ismeretlen költség -> nincs energiajóslás', [fc[0].energyAfter, fc[0].cost], [null, null]);
-eq('ismeretlen motiváció -> nincs jelzés', [fc[0].motivation, fc[0].lowMotivation], [null, false]);
-eq('ismeretlen költségnél nem állítjuk, hogy kevés', fc[0].notEnoughEnergy, false);
+eq('unknown cost -> no energy forecast', [fc[0].energyAfter, fc[0].cost], [null, null]);
+eq('unknown motivation -> no flag', [fc[0].motivation, fc[0].lowMotivation], [null, false]);
+eq('with an unknown cost we do not claim a shortage', fc[0].notEnoughEnergy, false);
 
-// Az alvás nem fogyaszt, hanem FELTÖLT: utána a szoba célszintjéről megy tovább
-// a számolás, különben a lista végi jóslat örökre negatív maradna.
+// A sleep does not consume but REFILLS: the calculation continues from the room's
+// target level, otherwise the end-of-list forecast would stay negative forever.
 eval(extract('forecastShortageIndex'));
 const withSleep = [
     { ...mkJobs(1)[0], id: 'a' },
@@ -608,294 +608,294 @@ fc = computeForecast(withSleep, mkEtas(4, 0), {
     costOf: (j) => (j.taskType === 'sleep' ? null : 8), motivationOf: () => 1,
     energyAt: flat(10), sleepTargetOf: () => 100,
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('az első munka még belefér', [fc[0].energyBefore, fc[0].energyAfter], [10, 2]);
-eq('az alvás feltölt a szoba szintjére', [fc[1].isSleep, fc[1].energyAfter], [true, 100]);
-eq('utána onnan megy tovább', [fc[2].energyBefore, fc[2].energyAfter], [100, 92]);
-eq('és a következő is', fc[3].energyAfter, 84);
-eq('alvás után nincs energiahiány', fc.some(f => f.notEnoughEnergy), false);
-eq('az alvásra magára nincs figyelmeztetés', [fc[1].lowMotivation, fc[1].notEnoughEnergy], [false, false]);
+eq('the first job still fits', [fc[0].energyBefore, fc[0].energyAfter], [10, 2]);
+eq("the sleep fills up to the room's level", [fc[1].isSleep, fc[1].energyAfter], [true, 100]);
+eq('it carries on from there', [fc[2].energyBefore, fc[2].energyAfter], [100, 92]);
+eq('and so does the next', fc[3].energyAfter, 84);
+eq('no energy shortage after the sleep', fc.some(f => f.notEnoughEnergy), false);
+eq('no warning on the sleep itself', [fc[1].lowMotivation, fc[1].notEnoughEnergy], [false, false]);
 
-// Ha a JÁTÉK sorában van az alvás (kézzel indítva), a mi munkáink utána
-// indulnak: az energia addigra a szoba szintjére töltődik. Élesben ez hiányzott
-// -- 8 energiából 48-at jósoltunk 150 helyett, mert az ébren mért ütemet
-// húztuk végig a nyolcórás alváson.
+// If the sleep is in the GAME's queue (started by hand), our jobs start after
+// it: by then energy has filled to the room's level. This was missing live
+// -- we predicted 48 out of 8 energy instead of 150, because we dragged the
+// awake rate across the whole eight-hour sleep.
 fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
-    initialCarry: 150,                       // a futó alvás a maximumig tölt
+    initialCarry: 150,                       // the running sleep fills to the maximum
     costOf: () => 1, motivationOf: () => 1,
-    energyAt: flat(48),                      // amit a puszta regeneráció mondana
+    energyAt: flat(48),                      // what plain regeneration would say
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('az alvás utáni szintről indulunk', fc[0].energyBefore, 150);
-eq('nem a regenerációból jósolt értékről', fc[0].energyBefore === 48, false);
-eq('utána normálisan fogy', [fc[1].energyBefore, fc[2].energyBefore], [149, 148]);
-eq('gyengébb szoba csak részlegesen tölt', computeForecast(mkJobs(1), mkEtas(1, 0), {
+eq('we start from the post-sleep level', fc[0].energyBefore, 150);
+eq('not from the regeneration-based value', fc[0].energyBefore === 48, false);
+eq('it drains normally afterwards', [fc[1].energyBefore, fc[2].energyBefore], [149, 148]);
+eq('a worse room fills only partially', computeForecast(mkJobs(1), mkEtas(1, 0), {
     initialCarry: 64, costOf: () => 1, motivationOf: () => 1, energyAt: flat(5),
     priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 64);
-eq('alvás nélkül marad a regenerációs jóslat', computeForecast(mkJobs(1), mkEtas(1, 0), {
+eq('with no sleep the regeneration forecast stands', computeForecast(mkJobs(1), mkEtas(1, 0), {
     initialCarry: null, costOf: () => 1, motivationOf: () => 1, energyAt: flat(48),
     priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 48);
 
-// Az alvás oda kerül, AHOL az energia elfogy -- addig a lista simán fut
+// The sleep goes exactly WHERE the energy runs out -- up to there the list runs fine
 fc = computeForecast(mkJobs(4), mkEtas(4, 0), {
     costOf: () => 4, motivationOf: () => 1, energyAt: flat(10),
     priorMotivationCost: {}, motivationWarn: 75 });
-eq('a harmadik munkánál fogy el', forecastShortageIndex(fc), 2);
-eq('bőséges energiánál nincs hiány', forecastShortageIndex(
+eq('it runs out at the third job', forecastShortageIndex(fc), 2);
+eq('no shortage with plenty of energy', forecastShortageIndex(
     computeForecast(mkJobs(2), mkEtas(2, 0), { costOf: () => 1, motivationOf: () => 1,
         energyAt: flat(100), priorMotivationCost: {}, motivationWarn: 75 })), -1);
 
-// A még el NEM kezdődött alvás hosszát nem szabad az ébren mért ütemmel
-// becsülni: a főkarakteren így egy 8 órás alvás "sosem ért véget", és a mögötte
-// álló munkák nyolc órával későbbre csúsztak.
-// (a függvényt már fentebb, az időpontszámításnál kiemeltük)
+// A sleep that has NOT started yet must not have its length estimated with the
+// awake rate: on the main character an 8-hour sleep "never ended" that way, and
+// the jobs behind it slipped eight hours out.
+// (the function was already extracted above, with the ETA calculations)
 window.Character = { energy: 8, maxEnergy: 150 };
 const hours = (ms) => Math.round(ms / 3600000 * 10) / 10;
-eq('ébren 5/óra: 8-ról 150-re ~28,4 óra', hours(msUntilEnergyAtRate(150, 5)), 28.4);
-eq('alvás 18,75/óra: ~7,6 óra', hours(msUntilEnergyAtRate(150, 18.75)), 7.6);
-eq('a maximum fölé nem várakozunk', msUntilEnergyAtRate(999, 5), msUntilEnergyAtRate(150, 5));
-eq('elért szintre nem várunk', msUntilEnergyAtRate(8, 5), 0);
-eq('nulla ütemnél nem pörgünk', msUntilEnergyAtRate(150, 0), CONFIG.MAX_WAIT_MS);
+eq('awake 5/h: 8 to 150 takes ~28.4 h', hours(msUntilEnergyAtRate(150, 5)), 28.4);
+eq('asleep 18.75/h: ~7.6 h', hours(msUntilEnergyAtRate(150, 18.75)), 7.6);
+eq('we never wait for more than the maximum', msUntilEnergyAtRate(999, 5), msUntilEnergyAtRate(150, 5));
+eq('no wait for a level already reached', msUntilEnergyAtRate(8, 5), 0);
+eq('a zero rate does not spin', msUntilEnergyAtRate(150, 0), CONFIG.MAX_WAIT_MS);
 delete window.Character;
 
 // ============================================================
-//  Alvás: meddig aludjunk?
+//  Sleeping: how long should we sleep?
 // ============================================================
-// Két üzemmód, alvásonként külön: 'full' a szoba szintjéig, 'enough' csak addig,
-// amíg a MÖGÖTTE álló munkákhoz elég energia gyűlik. Az 'enough' élőben
-// számolódik, tehát alvás közben hozzáadott munka feljebb tolja a célt.
-console.log('\n=== Meddig aludjunk ===');
+// Two modes, decided per sleep: 'full' up to the room's level, 'enough' only
+// until enough energy has built up for the jobs BEHIND it. 'enough' is computed
+// live, so work added during the sleep pushes the goal up.
+console.log('\n=== How long should we sleep ===');
 let costTable = {};
 jobEnergyCost = (job) => (job.taskType === 'sleep' ? null
     : (costTable[job.jobId] !== undefined ? costTable[job.jobId] : 5));
-const sleepTargetEnergy = () => 150;      // luxusapartman, 150-es maximum
+const sleepTargetEnergy = () => 150;      // luxurious apartment, maximum 150
 eval([extract('energyNeededFrom'), extract('sleepGoalEnergy'), extract('sleepGoalForEntry')].join('\n'));
 
-extraJobs = mkJobs(3);                                     // 3 munka, egyenként 5
-eq('a hátralévő munkák összköltsége', energyNeededFrom(0), 15);
-eq('a második helytől kevesebb kell', energyNeededFrom(1), 10);
-eq('a lista végén már semmi', energyNeededFrom(3), 0);
-eq('teljes alvásnál a szoba szintje a cél', sleepGoalEnergy('full', 'x', 0), 150);
-eq('"amennyi kell" csak a munkákhoz elegendő', sleepGoalEnergy('enough', 'x', 0), 15);
-eq('a szoba szintje a plafon', sleepGoalEnergy('enough', 'x', 0) <= 150, true);
+extraJobs = mkJobs(3);                                     // 3 jobs, 5 energy each
+eq('the total cost of the remaining jobs', energyNeededFrom(0), 15);
+eq('less is needed from the second position', energyNeededFrom(1), 10);
+eq('nothing at the end of the list', energyNeededFrom(3), 0);
+eq("a full sleep targets the room's level", sleepGoalEnergy('full', 'x', 0), 150);
+eq('"enough" only covers the jobs', sleepGoalEnergy('enough', 'x', 0), 15);
+eq("the room's level is the ceiling", sleepGoalEnergy('enough', 'x', 0) <= 150, true);
 
-// Több munka a sorban -> magasabb cél (élő újraszámolás alvás közben)
+// More jobs in the queue -> a higher goal (live recalculation during the sleep)
 extraJobs = mkJobs(40);
-eq('sok munkánál a szoba szintje korlátoz', sleepGoalEnergy('enough', 'x', 0), 150);
+eq("with many jobs the room's level caps it", sleepGoalEnergy('enough', 'x', 0), 150);
 
-// Ismeretlen költségnél nem tippelünk: aludjunk tele
+// With an unknown cost we don't guess: sleep the full length
 extraJobs = mkJobs(2);
 costTable = { 100: undefined };
 jobEnergyCost = (job) => (job.jobId === 100 ? null : 5);
-eq('ismeretlen költség -> nincs becslés', energyNeededFrom(0), null);
-eq('ismeretlen költség -> teljes alvás', sleepGoalEnergy('enough', 'x', 0), 150);
+eq('unknown cost -> no estimate', energyNeededFrom(0), null);
+eq('unknown cost -> full sleep', sleepGoalEnergy('enough', 'x', 0), 150);
 jobEnergyCost = (job) => (job.taskType === 'sleep' ? null : 5);
 
-// A soron következő alvásig számolunk: a következő alvás úgyis újratölt
+// We sum up to the next sleep: that one will refill anyway
 extraJobs = [mkJobs(1)[0], mkJobs(1)[0], { taskType: 'sleep', room: 'x' }, mkJobs(1)[0]];
-eq('a következő alvásig összegzünk', energyNeededFrom(0), 10);
+eq('we sum up to the next sleep', energyNeededFrom(0), 10);
 
-// A bejegyzés célszintje a MÖGÖTTE állókból jön (ezért index+1)
+// An entry's goal comes from what stands BEHIND it (hence index+1)
 extraJobs = [{ taskType: 'sleep', room: 'x', sleepMode: 'enough' }, mkJobs(1)[0], mkJobs(1)[0]];
-eq('az alvás a mögötte állókra gyűjt', sleepGoalForEntry(extraJobs[0], 0), 10);
+eq('the sleep collects for what stands behind it', sleepGoalForEntry(extraJobs[0], 0), 10);
 extraJobs[0].sleepMode = 'full';
-eq('teljes módban a szoba szintjéig', sleepGoalForEntry(extraJobs[0], 0), 150);
+eq("in full mode, up to the room's level", sleepGoalForEntry(extraJobs[0], 0), 150);
 
-// Ha nincs mögötte munka (pl. a felhasználó időközben törölte őket), az
-// 'enough' cél 0 lenne -- olyankor viszont nincs miért ébredni, tehát a
-// teljes alvásra állunk vissza. Enélkül a cél 0, és a script azonnal ébreszt.
+// With no work behind it (e.g. the user removed it meanwhile) the 'enough'
+// goal would be 0 -- but then there is no reason to wake up, so we fall back
+// to the full sleep. Without that the goal is 0 and the script wakes at once.
 extraJobs = [{ taskType: 'sleep', room: 'x', sleepMode: 'enough' }];
-eq('mögötte semmi -> mégis teljes alvás', sleepGoalForEntry(extraJobs[0], 0), 150);
-eq('üres listánál is a szoba szintje', sleepGoalEnergy('enough', 'x', 5), 150);
+eq('nothing behind it -> a full sleep after all', sleepGoalForEntry(extraJobs[0], 0), 150);
+eq("the room's level for an empty list too", sleepGoalEnergy('enough', 'x', 5), 150);
 extraJobs = [];
 
 // ============================================================
-//  Az alvás módja csak akkor öröklődik, ha tényleg VÁLASZTOTTÁK
+//  A sleep's mode is only inherited when it was genuinely CHOSEN
 // ============================================================
-// Élesben: kézzel indított alvás után a script meg sem kérdezte, meddig
-// aludjon, és teljesnek vette -- mert a kézi alvás alapértelmezett 'full'
-// módját is döntésnek hitte, és azt a következő alvásra is átvitte.
-console.log('\n=== Alvásmód öröklése ===');
+// Live: after a manually started sleep the script never asked how long to
+// sleep and took it as full -- because it mistook the manual sleep's default
+// 'full' mode for a decision, and carried it over to the next sleep as well.
+console.log('\n=== Inheriting the sleep mode ===');
 eval(extract('makeSleepEntry'));
 const estimateSleepSecondsOrig = estimateSleepSeconds;
-eq('a felajánlásból választott mód döntés',
+eq('a mode picked from the offer is a decision',
    (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'enough')), ['enough', true]);
-eq('a teljes alvás választása is döntés',
+eq('choosing the full sleep is a decision too',
    (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'full')), ['full', true]);
-eq('a kézi alvásnál nincs döntés, csak alapértelmezés',
+eq('a manual sleep has no decision, only a default',
    (e => [e.sleepMode, e.modeChosen])(makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, undefined)), ['full', false]);
-eq('a döntés nélküli mód nem kerül a névbe',
+eq('a mode with no decision stays out of the name',
    makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, undefined).jobName, 'Alvás – Kamra');
-eq('az "amennyi kell" viszont látszik a néven',
+eq('"enough" does show up in the name',
    makeSleepEntry(1, 'cubby', 'Kamra', 0, 0, 'enough').jobName, 'Alvás – Kamra (amennyi kell)');
 
-// A mentés is megőrzi, hogy volt-e döntés
-eq('a döntés túléli a mentést', sanitizeJobs([
+// The save also preserves whether there was a decision
+eq('the decision survives saving', sanitizeJobs([
     { taskType: 'sleep', townId: 4206, room: 'cubby', sleepMode: 'enough', modeChosen: true },
 ])[0].modeChosen, true);
-eq('a döntés hiánya is túléli', sanitizeJobs([
+eq('the absence of a decision survives too', sanitizeJobs([
     { taskType: 'sleep', townId: 4206, room: 'cubby', sleepMode: 'full' },
 ])[0].modeChosen, false);
 
 // ============================================================
-//  Új munka előrehozza a következő kört
+//  New work pulls the next round forward
 // ============================================================
-// Élesben: a sorba tett alvás "nem csinált semmit", és csak egy oldalfrissítés
-// hozta meg -- mert egy hosszú visszatartás alatt az ensureProcessing nem
-// ütemezett újra.
-console.log('\n=== Új munka és a futó várakozás ===');
+// Live: a sleep added to the queue "did nothing" and only a page reload brought
+// it to life -- because ensureProcessing did not reschedule during a long
+// backoff.
+console.log('\n=== New work and a running wait ===');
 CONFIG.NEW_WORK_DELAY = 500;
 const armed = (deadlineInMs) => { nextJobTimer = 1; nextJobDeadline = Date.now() + deadlineInMs; scheduled = null; };
 
 extraJobs = mkJobs(1); processing = false; paused = false;
-armed(600000);                                   // tízperces visszatartás fut
-ensureProcessing();                              // szívverés: NE nyúljon hozzá
-eq('a szívverés nem rúgja fel a visszatartást', scheduled, null);
-ensureProcessing(CONFIG.NEW_WORK_DELAY);         // új munka érkezett
-eq('új munka viszont előrehozza', scheduled, 500);
+armed(600000);                                   // a ten-minute backoff is running
+ensureProcessing();                              // heartbeat: must NOT touch it
+eq('the heartbeat does not upset the backoff', scheduled, null);
+ensureProcessing(CONFIG.NEW_WORK_DELAY);         // new work arrived
+eq('new work does pull it forward', scheduled, 500);
 
-armed(200);                                      // már amúgy is hamarosan indul
+armed(200);                                      // it is about to start anyway
 ensureProcessing(CONFIG.NEW_WORK_DELAY);
-eq('a közelebbi határidőt nem tolja ki', scheduled, null);
+eq('it does not push out the nearer deadline', scheduled, null);
 
 nextJobTimer = null; scheduled = null;
 ensureProcessing(CONFIG.NEW_WORK_DELAY);
-eq('időzítő nélkül ütemez', scheduled, 500);
+eq('with no timer it schedules', scheduled, 500);
 
 paused = true; scheduled = null; nextJobTimer = null;
 ensureProcessing(CONFIG.NEW_WORK_DELAY);
-eq('szüneteltetve nem indul', scheduled, null);
+eq('paused, it does not start', scheduled, null);
 paused = false;
 extraJobs = []; scheduled = null;
 ensureProcessing(CONFIG.NEW_WORK_DELAY);
-eq('üres listára nem ütemez', scheduled, null);
+eq('it does not schedule for an empty list', scheduled, null);
 
 // ============================================================
-//  Alvás: szobaválasztás és célszint
+//  Sleeping: room choice and goal level
 // ============================================================
-// Élesben mért hoteladat: a szoba "energy" mezője az a szint, ameddig feltölt
-// (kamra 64 ... luxusapartman 100), és a saját városban minden szoba ingyenes.
-console.log('\n=== Alvás ===');
+// Hotel data measured live: a room's "energy" field is the level it fills up to
+// (cubby 64 ... luxurious apartment 100), and every room is free in one's own town.
+console.log('\n=== Sleeping ===');
 eval(extract('bestFreeRoom'));
 const rooms = {
     cubby: { level: 1, energy: 64, name: 'Kamra', available: true, free: true },
     bedroom: { level: 2, energy: 72, name: 'Hálószoba', available: true, free: true },
     luxurious_apartment: { level: 5, energy: 100, name: 'Luxusapartman', available: true, free: true },
 };
-eq('a legjobb ingyenes szoba nyer', bestFreeRoom(rooms).key, 'luxurious_apartment');
-eq('fizetős szobát nem választunk magunktól',
+eq('the best free room wins', bestFreeRoom(rooms).key, 'luxurious_apartment');
+eq('we never pick a paid room on our own',
    bestFreeRoom({ ...rooms, luxurious_apartment: { ...rooms.luxurious_apartment, free: false } }).key, 'bedroom');
-eq('nem elérhető szobát sem',
+eq('nor an unavailable one',
    bestFreeRoom({ cubby: { ...rooms.cubby, available: false }, bedroom: rooms.bedroom }).key, 'bedroom');
-eq('ha egy sem ingyenes, nincs választás',
+eq('if none is free there is no choice',
    bestFreeRoom({ cubby: { ...rooms.cubby, free: false } }), null);
-eq('üres hotel -> nincs választás', bestFreeRoom({}), null);
+eq('an empty hotel -> no choice', bestFreeRoom({}), null);
 
-// A tárolás átvészelése: az alvásnak nincs jobId-je, de a városa és szobája kell
+// Surviving storage: a sleep has no jobId, but its town and room are required
 eval(extract('sanitizeJobs'));
 const stored = sanitizeJobs([
     { taskType: 'sleep', townId: 4206, room: 'luxurious_apartment', jobName: 'Alvás', x: 1, y: 2, duration: 900 },
-    { taskType: 'sleep', townId: 0, room: 'cubby' },          // város nélkül értelmetlen
-    { taskType: 'sleep', townId: 4206 },                      // szoba nélkül is
+    { taskType: 'sleep', townId: 0, room: 'cubby' },          // meaningless without a town
+    { taskType: 'sleep', townId: 4206 },                      // and without a room too
     { jobId: 129, x: 1, y: 2, duration: 15 },
 ]);
-eq('az alvás túléli a mentést', stored.length, 2);
-eq('a város és a szoba megmarad', [stored[0].townId, stored[0].room], [4206, 'luxurious_apartment']);
-eq('a hiányos alvásbejegyzések kiesnek', stored[1].jobId, 129);
+eq('the sleep survives saving', stored.length, 2);
+eq('the town and the room are kept', [stored[0].townId, stored[0].room], [4206, 'luxurious_apartment']);
+eq('incomplete sleep entries are dropped', stored[1].jobId, 129);
 
-// Alvás közben a karaktert nem lehet párbajra hívni, ezért munka híján NEM
-// ébresztünk -- még tele energiával sem. Csak akkor, ha van mit dolgozni.
+// A sleeping character cannot be challenged to a duel, so with no work we do NOT
+// wake up -- not even at full energy. Only when there is something to do.
 eval([extract('hasWorkWaiting'), extract('countWorkWaiting')].join('\n'));
 const setState = (extra, queue) => {
     extraJobs = extra;
     window.TaskQueue = { queue, limit: { normal: 4, premium: 9 } };
 };
 setState([], [{ type: 'sleep' }]);
-eq('üres sor + alvás -> hagyjuk aludni', hasWorkWaiting(), false);
-eq('üres sor + alvás -> 0 munka', countWorkWaiting(), 0);
+eq('empty queue + sleep -> let it sleep', hasWorkWaiting(), false);
+eq('empty queue + sleep -> 0 jobs', countWorkWaiting(), 0);
 setState([{ taskType: 'sleep' }], [{ type: 'sleep' }]);
-eq('csak egy másik alvás vár -> nem ébresztünk', hasWorkWaiting(), false);
+eq('only another sleep waits -> no wake-up', hasWorkWaiting(), false);
 setState(mkJobs(1), [{ type: 'sleep' }]);
-eq('várakozó munka -> ébresztünk', hasWorkWaiting(), true);
+eq('a waiting job -> we wake up', hasWorkWaiting(), true);
 setState([], [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
-eq('a játék sorában álló munka is számít', hasWorkWaiting(), true);
-// A játék sorában a "nem alvás" önmagában kevés: utazás és egyéb szolgálati
-// bejegyzés miatt nem ébresztünk, és a kérdést sem tesszük fel emiatt.
+eq("a job in the game's queue counts too", hasWorkWaiting(), true);
+// In the game's queue "not a sleep" is not enough on its own: we don't wake for
+// travel and other housekeeping entries, and we don't raise the question either.
 setState([], [{ type: 'sleep' }, { type: 'walk', post: { taskType: 'walk' } }]);
-eq('utazás nem munka -> nem kérdezünk', hasWorkWaiting(), false);
+eq('travel is not work -> we do not ask', hasWorkWaiting(), false);
 setState(mkJobs(2), [{ type: 'sleep' }, { type: 'job', post: { jobId: 7 } }]);
-eq('a két forrás összeadódik', countWorkWaiting(), 3);
+eq('the two sources add up', countWorkWaiting(), 3);
 
-// Az alvás ELŐTT futó munkák nem számítanak: azok az alvás előtt befejeződnek,
-// tehát értük nincs értelme korábban ébredni. Élesben ettől jött elő a "meddig
-// aludjak?" kérdés egy olyan alvásnál, ami után egyetlen munka sem következett.
-const alvas = { type: 'sleep', queuePos: 3 };
+// Jobs running BEFORE the sleep don't count: they finish before the sleep, so
+// waking early does nothing for them. Live, this is what raised the "how long
+// should I sleep?" question for a sleep that had no job after it at all.
+const sleepTask = { type: 'sleep', queuePos: 3 };
 setState([], [
     { type: 'job', post: { jobId: 7 } },
     { type: 'job', post: { jobId: 7 } },
     { type: 'job', post: { jobId: 7 } },
-    alvas,
+    sleepTask,
 ]);
-eq('az alvás ELŐTTI munkák nem számítanak', countWorkWaiting(alvas), 0);
-eq('...tehát nincs miért ébredni', hasWorkWaiting(alvas), false);
-eq('alvás megadása nélkül viszont igen', hasWorkWaiting(), true);
-// Ami MÖGÖTTE áll, az továbbra is számít.
+eq('jobs BEFORE the sleep do not count', countWorkWaiting(sleepTask), 0);
+eq('...so there is no reason to wake up', hasWorkWaiting(sleepTask), false);
+eq('without naming a sleep, there is', hasWorkWaiting(), true);
+// What stands BEHIND it still counts.
 window.TaskQueue.queue.push({ type: 'job', post: { jobId: 9 } });
-eq('az alvás MÖGÖTTI munka számít', countWorkWaiting(alvas), 1);
-// A saját listánk mindig az alvás mögött van.
-setState(mkJobs(2), [{ type: 'job', post: { jobId: 7 } }, alvas]);
-eq('a saját listánk mindig mögötte van', countWorkWaiting(alvas), 2);
+eq('a job BEHIND the sleep counts', countWorkWaiting(sleepTask), 1);
+// Our own list is always behind the sleep.
+setState(mkJobs(2), [{ type: 'job', post: { jobId: 7 } }, sleepTask]);
+eq('our own list is always behind it', countWorkWaiting(sleepTask), 2);
 extraJobs = [];
 
 // ============================================================
-//  A játék kliensének megpörgetése (a háttérfül igazi hibája)
+//  Pumping the game client (the background tab's real bug)
 // ============================================================
-// A TaskQueueUi.tick hívásonként EGY lejárt munkát vesz ki a sorból, és rejtett
-// fülön percenként egyszer fut. A sor így a fagyás előtti hosszon ragad, a
-// TaskQueue.add pedig a SAJÁT limitjét erre a hosszra nézi -- vagyis semmit nem
-// tudunk indítani. Ezért annyiszor hívjuk a játék tickjét, ahány lejárt munka van.
-console.log('\n=== A játék kliensének megpörgetése ===');
+// TaskQueueUi.tick retires ONE finished task per call, and in a hidden tab it
+// runs once a minute. So the queue sticks at its pre-freeze length, and
+// TaskQueue.add gates its OWN limit on that length -- meaning we can start
+// nothing at all. So we call the game's tick once per finished task.
+console.log('\n=== Pumping the game client ===');
 eval([extract('gameReady'), extract('gameQueueLength'), extract('gameQueueLimit'),
       extract('pumpGameClient')].join('\n'));
 
-// Négy munka a sorban, mind lejárt: egyetlen ütem alatt mind ki kell jönnie.
+// Four jobs in the queue, all finished: a single tick must bring them all out.
 const mkGameQueue = (n) => {
     const q = [];
     for (let i = 0; i < n; i++) q.push({ type: 'job', queueId: 100 + i, post: { jobId: 7 } });
     return q;
 };
-let energiaPorgetes = 0;
-window.Character = { tick4Character: () => { energiaPorgetes++; } };
+let energyPumps = 0;
+window.Character = { tick4Character: () => { energyPumps++; } };
 window.TaskQueue = { queue: mkGameQueue(4), limit: { normal: 4, premium: 9 }, busy: false };
-// A játék tickje: egy hívás egy lejárt munkát vesz ki.
-let lejart = 4;
-window.TaskQueueUi = { tick: () => { if (lejart > 0) { lejart--; window.TaskQueue.queue.shift(); } } };
+// The game's tick: one call retires one finished task.
+let expired = 4;
+window.TaskQueueUi = { tick: () => { if (expired > 0) { expired--; window.TaskQueue.queue.shift(); } } };
 
-eq('a pörgetés lefutott', pumpGameClient(), true);
-eq('mind a négy lejárt munka kijött', window.TaskQueue.queue.length, 0);
-eq('az energiát is visszaszámoltattuk', energiaPorgetes, 1);
+eq('the pump ran', pumpGameClient(), true);
+eq('all four finished jobs came out', window.TaskQueue.queue.length, 0);
+eq('the energy was recomputed too', energyPumps, 1);
 
-// Ha semmi nem járt le, egyetlen (normál) tick fut, a sor érintetlen marad.
+// If nothing finished, a single (normal) tick runs and the queue stays untouched.
 window.TaskQueue.queue = mkGameQueue(3);
-lejart = 0;
-let tickHivasok = 0;
-window.TaskQueueUi = { tick: () => { tickHivasok++; } };
-eq('lejárt munka nélkül is fut egy kör', pumpGameClient(), true);
-eq('...de csak egy', tickHivasok, 1);
-eq('és a sor érintetlen', window.TaskQueue.queue.length, 3);
+expired = 0;
+let tickCalls = 0;
+window.TaskQueueUi = { tick: () => { tickCalls++; } };
+eq('a round runs even with nothing finished', pumpGameClient(), true);
+eq('...but only one', tickCalls, 1);
+eq('and the queue is untouched', window.TaskQueue.queue.length, 3);
 
-// Folyamatban lévő köteg alatt nem nyúlunk a sorhoz.
+// We don't touch the queue while a batch is in flight.
 window.TaskQueue.busy = true;
-tickHivasok = 0;
-eq('köteg közben nem pörgetünk', pumpGameClient(), true);
-eq('...és a játék tickjét sem hívjuk', tickHivasok, 0);
+tickCalls = 0;
+eq('we do not pump during a batch', pumpGameClient(), true);
+eq("...nor do we call the game's tick", tickCalls, 0);
 window.TaskQueue.busy = false;
 
-// Régi kliens (nincs TaskQueueUi): jelezzük, hogy nem tudtunk pörgetni.
+// Old client (no TaskQueueUi): report that we couldn't pump.
 delete window.TaskQueueUi;
-eq('TaskQueueUi nélkül nincs pörgetés', pumpGameClient(), false);
+eq('no TaskQueueUi -> no pump', pumpGameClient(), false);
 
-// Egy hibás tick nem akaszthatja meg az ütemet.
-window.TaskQueueUi = { tick: () => { throw new Error('bumm'); } };
-eq('a hibás tick nem dob tovább', pumpGameClient(), true);
+// A failing tick must not stall the ticker.
+window.TaskQueueUi = { tick: () => { throw new Error('boom'); } };
+eq('a throwing tick does not propagate', pumpGameClient(), true);
 delete window.TaskQueueUi;
 delete window.Character;
 
