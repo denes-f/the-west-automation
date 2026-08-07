@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 220 assertions, no dependencies.
+  name and runs them against stubs. 239 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,7 +15,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.13.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.14.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -104,7 +104,10 @@ requeue path — its trigger was reproduced live, but the recovery was written a
 watching the first time it fires for real. Also v12.13 itself: the sleep-position fix and the two
 audio fixes have unit tests and were each measured in the page by hand, but the assembled build has
 not run a full game session — check `keepAwakeStatus()` reports `hang: szól` (not `nem töltődött
-be`) once jobs are queued.
+be`) once jobs are queued. **v12.14 (the persistent sleep offer) is in the same state**: 20 unit
+tests cover the state machine, but the collapsed row has never been seen in the game. Worth one
+look — decline an offer and check the row stays, keeps its numbers current, expands on `Alvás…`,
+and disappears by itself once the energy recovers.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -454,6 +457,18 @@ and "Nem" correctly does nothing.
   same reason; and only a **free** room is ever chosen automatically, never one that costs the
   user's money. It is offered, never inserted unasked, and `cancelSleepIfFull` ends it via
   `TaskQueue.cancel(queuePos)` once energy reaches the sleep's **goal**.
+- **A declined offer is silenced, not deleted** (v12.14). Saying "no" used to null `sleepOffer` and
+  go quiet for `SLEEP_DECLINE_MS` (30 min), which left the hotel window as the only way back to a
+  sleep — the user had to leave the panel to change their mind. Now the decline sets
+  `sleepOffer.declined` and the row stays in the panel, **collapsed to a single `Alvás…` button**
+  (`.lisa-offer-quiet`, a muted version of the same row); `reopenSleepOffer` expands it back to the
+  three choices and clears the quiet window. `sleepDeclinedUntil` now gates **only the game's
+  dialog**, so an offer raised inside that window is born collapsed — row yes, modal no.
+  Two rules keep the row honest, both driven by `offerSleepIfForecastRunsOut` every second:
+  `maybeOfferSleep` **refreshes an existing offer's numbers** instead of returning early (the list
+  moves under it, and a stale "3 energy needed" is worse than none), and
+  `clearDeclinedSleepOffer` drops it once the shortage is gone or a sleep is queued/running.
+  A **pending** offer is deliberately never auto-cleared: its dialog is on screen being answered.
 - **How long to sleep is a per-sleep decision**, `sleepMode`: `'full'` fills to the room's level,
   `'enough'` stops as soon as the jobs *behind* that sleep are covered (`energyNeededFrom`, summed
   to the next sleep, ignoring regeneration during those jobs — deliberately conservative). The

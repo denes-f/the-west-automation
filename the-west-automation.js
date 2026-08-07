@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.13)
+// @name         The-West Modular Job Queue (Lisa v12.14)
 // @namespace   http://tampermonkey.net/
-// @version     12.13
+// @version     12.14
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -974,19 +974,37 @@
     }
 
     // Sleeping is automatic, but only after ASKING -- the user decides.
-    // On a "no" we stay quiet for a while so as not to nag.
+    // On a "no" we stay quiet for a while so as not to nag: the game's dialog is
+    // not raised again, but the offer stays in the panel in a collapsed form, so
+    // the user can change their mind at any time without going to the hotel.
     function maybeOfferSleep(neededEnergy, atIndex) {
         if (!CONFIG.AUTO_SLEEP || !canSleep()) return;
-        if (sleepOffer || Date.now() < sleepDeclinedUntil) return;
-        if (isSleeping()) return;
-        if (extraJobs.some(j => j.taskType === 'sleep')) return;
+        if (isSleeping() || extraJobs.some(j => j.taskType === 'sleep')) {
+            // A sleep is already running or queued: there is nothing left to offer.
+            clearDeclinedSleepOffer();
+            return;
+        }
         // The blocked job's OWN cost is misleadingly small ("1 needed") while a lot
         // of work still stands behind it. How long to sleep can only be decided from
         // the remaining list's total energy, so we store that too.
         const at = atIndex || 0;
-        sleepOffer = { needed: neededEnergy, at, total: energyNeededFrom(at) };
+        const total = energyNeededFrom(at);
+        // An offer already on screen -- pending or declined -- is only kept up to
+        // date: the list moves under it, and a stale "3 energy needed" is worse
+        // than none. We never raise the dialog a second time for the same offer.
+        if (sleepOffer) {
+            sleepOffer.needed = neededEnergy;
+            sleepOffer.at = at;
+            sleepOffer.total = total;
+            renderSleepOffer();
+            return;
+        }
+        // Inside the decline window the offer is born collapsed: the row is there,
+        // the dialog is not.
+        const declined = Date.now() < sleepDeclinedUntil;
+        sleepOffer = { needed: neededEnergy, at, total, declined };
         renderSleepOffer();
-        showSleepDialog(sleepOffer);
+        if (!declined) showSleepDialog(sleepOffer);
     }
 
     // How much energy do the remaining jobs need? That number says how long it is
@@ -1063,13 +1081,38 @@
     // solution for it.
     function offerSleepIfForecastRunsOut() {
         const i = forecastShortageIndex(lastForecast);
-        if (i === -1) return;
+        if (i === -1) {
+            // The shortage is gone -- energy recovered, or the jobs were removed.
+            // A collapsed offer has nothing left to offer, so it goes. A PENDING
+            // one is left alone: its dialog is on screen, the user is answering it.
+            clearDeclinedSleepOffer();
+            return;
+        }
         maybeOfferSleep(lastForecast[i].cost, i);
     }
 
+    // A declined offer is not thrown away -- only the nagging stops. The row stays
+    // in the panel, collapsed to a single button, so the user can come back to it
+    // at any time; `sleepDeclinedUntil` keeps the game's dialog away meanwhile.
     function dismissSleepOffer(declined) {
-        sleepOffer = null;
         if (declined) sleepDeclinedUntil = Date.now() + CONFIG.SLEEP_DECLINE_MS;
+        if (declined && sleepOffer) sleepOffer.declined = true;
+        else sleepOffer = null;               // accepted, or nothing left to keep
+        renderSleepOffer();
+    }
+
+    // Reopens a declined offer: the three choices come back, and since the user
+    // asked for them, the decline window ends here too.
+    function reopenSleepOffer() {
+        if (!sleepOffer) return;
+        sleepOffer.declined = false;
+        sleepDeclinedUntil = 0;
+        renderSleepOffer();
+    }
+
+    function clearDeclinedSleepOffer() {
+        if (!sleepOffer || !sleepOffer.declined) return;
+        sleepOffer = null;
         renderSleepOffer();
     }
 
@@ -2597,7 +2640,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.13',
+        version: '12.14',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -2821,6 +2864,10 @@
                 background: rgba(170,90,30,0.18); border: 1px solid #a05a1e; border-radius: 3px;
                 font: 11px Georgia,serif; color: #3b2f1e;
             }
+            /* Declined but still available: same row, no longer shouting. */
+            #lisa-sleep-offer.lisa-offer-quiet {
+                background: rgba(170,90,30,0.07); border-color: #8a7048; color: #5c4a30;
+            }
             #lisa-sleep-offer span { flex: 1 1 auto; }
             #lisa-sleep-offer button {
                 flex: 0 0 auto; font: 10px Georgia,serif; color: #f0e4c6; cursor: pointer;
@@ -2935,20 +2982,37 @@
         if (!sleepOffer) {
             box.style.display = 'none';
             box.textContent = '';
+            box.className = '';
             return;
         }
         box.textContent = '';
         box.style.display = '';
+        // A declined offer stays, but it must not keep shouting: same row, muted.
+        box.className = sleepOffer.declined ? 'lisa-offer-quiet' : '';
         const text = document.createElement('span');
         const at = sleepOffer.at || 0;
         const rest = typeof sleepOffer.total === 'number' && sleepOffer.total > 0
             ? ` (még ${sleepOffer.total} kell)` : '';
+        const question = sleepOffer.declined ? '' : ' Alvás?';
         text.textContent = at > 0
-            ? `A(z) ${at + 1}. munkára elfogy az energia${rest}. Alvás?`
-            : `Kevés az energia${rest || ` (${sleepOffer.needed} kell)`}. Alvás?`;
+            ? `A(z) ${at + 1}. munkára elfogy az energia${rest}.${question}`
+            : `Kevés az energia${rest || ` (${sleepOffer.needed} kell)`}.${question}`;
         text.title = 'A jóslat szerint innentől nem lenne indítható a munka.'
             + (rest ? ` A hátralévő munkák teljes energiaigénye: ${sleepOffer.total}.` : '');
         const where = at > 0 ? `a(z) ${at + 1}. munka elé` : 'a sor elejére';
+
+        // Declined: one button back to the choices. The offer keeps updating in the
+        // background, so whenever the user does come back the numbers are current.
+        if (sleepOffer.declined) {
+            const again = document.createElement('button');
+            again.textContent = 'Alvás…';
+            again.title = `Mégis alszom – az alvás beszúrása ${where}`;
+            again.addEventListener('click', reopenSleepOffer);
+            box.appendChild(text);
+            box.appendChild(again);
+            return;
+        }
+
         const yes = document.createElement('button');
         yes.textContent = 'Teljes';
         yes.title = `Alvás beszúrása ${where}, a szoba teljes szintjéig`;
@@ -3230,5 +3294,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.13 loaded.');
+    console.log('[Lisa] Modular v12.14 loaded.');
 })();

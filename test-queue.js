@@ -899,6 +899,93 @@ eq('a throwing tick does not propagate', pumpGameClient(), true);
 delete window.TaskQueueUi;
 delete window.Character;
 
+// ============================================================
+//  A declined sleep offer stays available
+// ============================================================
+// Saying "no" used to throw the offer away and go quiet for half an hour, so the
+// only way back to a sleep was the hotel window. Now the decline silences the
+// game's DIALOG only: the panel row stays, collapsed to a single button, and
+// keeps its numbers up to date until the shortage itself is gone.
+console.log('\n=== The declined sleep offer ===');
+CONFIG.AUTO_SLEEP = true;
+CONFIG.SLEEP_DECLINE_MS = 1800000;
+let sleepOffer = null, sleepDeclinedUntil = 0, lastForecast = [];
+let renders = 0, dialogs = 0;
+const renderSleepOffer = () => { renders++; };
+const showSleepDialog = () => { dialogs++; return true; };
+const canSleep = () => true;
+isSleeping = () => false;
+jobEnergyCost = (job) => (job.taskType === 'sleep' ? null : 5);
+// These three are `let`/`const` stubs above, so they cannot be redeclared by an
+// eval'd function declaration -- take them as expressions instead.
+const asFn = (name) => eval('(' + extract(name) + ')');
+maybeOfferSleep = asFn('maybeOfferSleep');
+const offerSleepReal = asFn('offerSleepIfForecastRunsOut');
+eval([extract('dismissSleepOffer'), extract('reopenSleepOffer'),
+      extract('clearDeclinedSleepOffer')].join('\n'));
+
+extraJobs = mkJobs(3);
+maybeOfferSleep(5, 1);
+eq('the offer comes up with the dialog', [!!sleepOffer, dialogs], [true, 1]);
+eq('it knows where the energy runs out', [sleepOffer.at, sleepOffer.total], [1, 10]);
+eq('and it is not collapsed yet', !!sleepOffer.declined, false);
+
+// "No": the dialog goes quiet, the row does not go away
+dismissSleepOffer(true);
+eq('a "no" keeps the offer', !!sleepOffer, true);
+eq('...but collapses it', sleepOffer.declined, true);
+eq('...and arms the quiet window', sleepDeclinedUntil > Date.now(), true);
+
+// While declined we neither raise the dialog again nor lose the row
+dialogs = 0;
+maybeOfferSleep(5, 1);
+eq('we do not nag with the dialog again', dialogs, 0);
+eq('the row survives the next round', !!sleepOffer, true);
+
+// The numbers keep following the list, so a reopen is never stale
+extraJobs = mkJobs(6);
+maybeOfferSleep(5, 2);
+eq('a declined offer stays up to date', [sleepOffer.at, sleepOffer.total], [2, 20]);
+
+// Changing their mind: the choices come back and the quiet window ends
+reopenSleepOffer();
+eq('reopening expands the offer', sleepOffer.declined, false);
+eq('...and ends the quiet window', sleepDeclinedUntil, 0);
+
+// Accepting clears it outright
+dismissSleepOffer(false);
+eq('an accepted offer is cleared', sleepOffer, null);
+
+// A new offer raised inside the quiet window is born collapsed: the row is
+// there, the dialog is not.
+sleepDeclinedUntil = Date.now() + CONFIG.SLEEP_DECLINE_MS;
+dialogs = 0;
+maybeOfferSleep(5, 0);
+eq('inside the quiet window it is born collapsed', sleepOffer.declined, true);
+eq('...with no dialog', dialogs, 0);
+
+// The shortage passing is what finally clears it
+lastForecast = [{ notEnoughEnergy: false, cost: 5 }];
+offerSleepReal();
+eq('no shortage -> the collapsed row goes', sleepOffer, null);
+
+// A PENDING offer is left alone: its dialog is on screen, the user is answering
+sleepDeclinedUntil = 0;
+maybeOfferSleep(5, 0);
+offerSleepReal();
+eq('a pending offer is not cleared behind the dialog', !!sleepOffer, true);
+dismissSleepOffer(false);
+
+// A queued sleep takes the offer's job away
+sleepDeclinedUntil = Date.now() + CONFIG.SLEEP_DECLINE_MS;
+maybeOfferSleep(5, 0);
+eq('collapsed again', sleepOffer.declined, true);
+extraJobs = [{ taskType: 'sleep', room: 'x' }, ...mkJobs(2)];
+maybeOfferSleep(5, 0);
+eq('a queued sleep clears the collapsed row', sleepOffer, null);
+eq('and the panel was told to repaint', renders > 0, true);
+extraJobs = [];
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 })();
