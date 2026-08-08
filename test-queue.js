@@ -551,11 +551,16 @@ console.log('\n=== Energy and motivation ===');
 CONFIG.MOTIVATION_WARN = 75;
 eval(extract('computeForecast'));
 
-const mkEtas = (n, stepMs) => Array.from({length: n}, (_, i) => ({ start: 1000 + i * stepMs }));
+// The forecast walks FORWARD IN TIME from `now`, so the fixtures have to sit on
+// the same clock as it -- an ETA in 1970 would look like an hour-long energy wait.
+const NOW = 1700000000000;
+const mkEtas = (n, stepMs) => Array.from({length: n},
+    (_, i) => ({ start: NOW + i * stepMs, finish: NOW + i * stepMs }));
 const flat = (energy) => () => energy;
+const fcast = (jobs, etas, opts) => computeForecast(jobs, etas, Object.assign({ now: NOW }, opts));
 
 // Energy: every job deducts; the case without regeneration is the simplest
-let fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
+let fc = fcast(mkJobs(3), mkEtas(3, 0), {
     costOf: () => 5, motivationOf: () => 1, energyAt: flat(12),
     priorMotivationCost: {}, motivationWarn: 75 });
 eq('7 left after the first job', [fc[0].energyBefore, fc[0].energyAfter], [12, 7]);
@@ -563,16 +568,62 @@ eq('the second starts from what is left', [fc[1].energyBefore, fc[1].energyAfter
 eq('the third is no longer covered', fc[2].notEnoughEnergy, true);
 eq('no flag on the covered ones', [fc[0].notEnoughEnergy, fc[1].notEnoughEnergy], [false, false]);
 
-// Regeneration counts: if the forecast says it recovers meanwhile, it is enough
-fc = computeForecast(mkJobs(2), mkEtas(2, 60000), {
-    costOf: () => 5, motivationOf: () => 1,
-    energyAt: (t) => (t === 1000 ? 5 : 10),          // recovers by the second start
+// Regeneration counts: the second job is an hour out and 5/h brings the energy
+// back in time, so nothing is flagged.
+const HOUR = 3600000;
+fc = fcast(mkJobs(2), mkEtas(2, HOUR), {
+    costOf: () => 5, motivationOf: () => 1, energyAt: flat(5),
+    perHour: 5, maxEnergy: 150,
     priorMotivationCost: {}, motivationWarn: 75 });
 eq('regenerated energy counts too', fc[1].notEnoughEnergy, false);
+eq('and it is the regenerated amount, not more', [fc[1].energyBefore, fc[1].energyAfter], [5, 0]);
+
+// THE BUG THIS MODEL EXISTS FOR (measured live, main account): 6 energy, two
+// 1-hour jobs already in the game's queue, a third 1-hour job (cost 12) waiting in
+// ours. The panel promised "15 at the start, 3 left" -- energy regenerated across
+// the full two hours -- but the game takes the 12 the moment it has them, an hour
+// before the job starts, and the job sets out with nothing left.
+fc = fcast(mkJobs(1), [{ start: NOW + 2 * HOUR, finish: NOW + 3 * HOUR }], {
+    costOf: () => 12, motivationOf: () => 1, energyAt: flat(6),
+    perHour: 4.5, maxEnergy: 150,
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('the cost is paid when the energy reaches it, not at the start',
+    [fc[0].energyBefore, fc[0].energyAfter], [12, 0]);
+eq('...so it is not the value at the start time', fc[0].energyBefore === 15, false);
+eq('the energy still arrives before the queue frees up', fc[0].notEnoughEnergy, false);
+
+// The ceiling is reached on the way, not credited in full and then spent: three
+// 12-cost jobs out of 6 energy at 4.5/h can never bank more than 12 at a time.
+fc = fcast(mkJobs(3), mkEtas(3, 8 * HOUR), {
+    costOf: () => 12, motivationOf: () => 1, energyAt: flat(6),
+    perHour: 4.5, maxEnergy: 150,
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('every job is paid for at exactly its cost',
+    fc.map(f => [f.energyBefore, f.energyAfter]), [[12, 0], [12, 0], [12, 0]]);
+eq('the bar never fills up in between', fc.every(f => f.energyBefore <= 12), true);
+
+// The energy is what holds the list up, and the wait is reported per job.
+fc = fcast(mkJobs(2), mkEtas(2, 60000), {
+    costOf: () => 12, motivationOf: () => 1, energyAt: flat(0),
+    perHour: 6, maxEnergy: 150,
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('the first waits two hours for its 12', [fc[0].waitMs, fc[0].energyBefore], [2 * HOUR, 12]);
+eq('the second waits two more, from its own start', fc[1].waitMs, 4 * HOUR - 60000);
+eq('both are flagged', [fc[0].notEnoughEnergy, fc[1].notEnoughEnergy], [true, true]);
+
+// Without regeneration the energy never gets there: we keep draining into the
+// negative, because the shortfall is the number the sleep offer is sized from.
+fc = fcast(mkJobs(2), mkEtas(2, 0), {
+    costOf: () => 5, motivationOf: () => 1, energyAt: flat(3),
+    perHour: 0, maxEnergy: 150,
+    priorMotivationCost: {}, motivationWarn: 75 });
+eq('no regeneration -> a real shortfall', [fc[0].energyBefore, fc[0].energyAfter], [3, -2]);
+eq('and the wait is endless, not a number', fc[0].waitMs, Infinity);
+eq('the chain carries on downwards', fc[1].energyAfter, -7);
 
 // Motivation: every COMPLETED instance of the same job lowers it by its own energy cost
 const same = Array.from({length: 4}, (_, i) => ({ ...mkJobs(1)[0], id: 'm' + i, jobId: 42 }));
-fc = computeForecast(same, mkEtas(4, 0), {
+fc = fcast(same, mkEtas(4, 0), {
     costOf: () => 1, motivationOf: () => 1, energyAt: flat(100),
     priorMotivationCost: {}, motivationWarn: 75 });
 eq('the first still starts at full motivation', fc[0].motivation, 100);
@@ -580,7 +631,7 @@ eq('the fourth starts three lower', fc[3].motivation, 97);
 eq('no warning at 100%', fc.some(f => f.lowMotivation), false);
 
 // Jobs in the game's queue lower it too, before ours get their turn
-fc = computeForecast(same, mkEtas(4, 0), {
+fc = fcast(same, mkEtas(4, 0), {
     costOf: () => 1, motivationOf: () => 0.78, energyAt: flat(100),
     priorMotivationCost: { 42: 2 }, motivationWarn: 75 });
 eq("the game's queue counts too", fc[0].motivation, 76);
@@ -588,7 +639,7 @@ eq('we warn below the threshold', [fc[0].lowMotivation, fc[1].lowMotivation], [f
 eq('we warn exactly at the threshold too', fc[1].motivation, 75);
 
 // While we don't know the cost/motivation, we do NOT guess
-fc = computeForecast(mkJobs(2), mkEtas(2, 0), {
+fc = fcast(mkJobs(2), mkEtas(2, 0), {
     costOf: () => null, motivationOf: () => null, energyAt: flat(3),
     priorMotivationCost: {}, motivationWarn: 75 });
 eq('unknown cost -> no energy forecast', [fc[0].energyAfter, fc[0].cost], [null, null]);
@@ -604,7 +655,7 @@ const withSleep = [
     { ...mkJobs(1)[0], id: 'b' },
     { ...mkJobs(1)[0], id: 'c' },
 ];
-fc = computeForecast(withSleep, mkEtas(4, 0), {
+fc = fcast(withSleep, mkEtas(4, 0), {
     costOf: (j) => (j.taskType === 'sleep' ? null : 8), motivationOf: () => 1,
     energyAt: flat(10), sleepTargetOf: () => 100,
     priorMotivationCost: {}, motivationWarn: 75 });
@@ -619,7 +670,7 @@ eq('no warning on the sleep itself', [fc[1].lowMotivation, fc[1].notEnoughEnergy
 // it: by then energy has filled to the room's level. This was missing live
 // -- we predicted 48 out of 8 energy instead of 150, because we dragged the
 // awake rate across the whole eight-hour sleep.
-fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
+fc = fcast(mkJobs(3), mkEtas(3, 0), {
     initialCarry: 150,                       // the running sleep fills to the maximum
     costOf: () => 1, motivationOf: () => 1,
     energyAt: flat(48),                      // what plain regeneration would say
@@ -627,21 +678,58 @@ fc = computeForecast(mkJobs(3), mkEtas(3, 0), {
 eq('we start from the post-sleep level', fc[0].energyBefore, 150);
 eq('not from the regeneration-based value', fc[0].energyBefore === 48, false);
 eq('it drains normally afterwards', [fc[1].energyBefore, fc[2].energyBefore], [149, 148]);
-eq('a worse room fills only partially', computeForecast(mkJobs(1), mkEtas(1, 0), {
+eq('a worse room fills only partially', fcast(mkJobs(1), mkEtas(1, 0), {
     initialCarry: 64, costOf: () => 1, motivationOf: () => 1, energyAt: flat(5),
     priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 64);
-eq('with no sleep the regeneration forecast stands', computeForecast(mkJobs(1), mkEtas(1, 0), {
+eq('with no sleep the regeneration forecast stands', fcast(mkJobs(1), mkEtas(1, 0), {
     initialCarry: null, costOf: () => 1, motivationOf: () => 1, energyAt: flat(48),
     priorMotivationCost: {}, motivationWarn: 75 })[0].energyBefore, 48);
 
 // The sleep goes exactly WHERE the energy runs out -- up to there the list runs fine
-fc = computeForecast(mkJobs(4), mkEtas(4, 0), {
+fc = fcast(mkJobs(4), mkEtas(4, 0), {
     costOf: () => 4, motivationOf: () => 1, energyAt: flat(10),
     priorMotivationCost: {}, motivationWarn: 75 });
 eq('it runs out at the third job', forecastShortageIndex(fc), 2);
 eq('no shortage with plenty of energy', forecastShortageIndex(
-    computeForecast(mkJobs(2), mkEtas(2, 0), { costOf: () => 1, motivationOf: () => 1,
+    fcast(mkJobs(2), mkEtas(2, 0), { costOf: () => 1, motivationOf: () => 1,
         energyAt: flat(100), priorMotivationCost: {}, motivationWarn: 75 })), -1);
+
+// A job cannot start before the game has taken it, so an energy wait pushes it --
+// and everything behind it -- out. Otherwise the panel warned about the energy and
+// promised the original start time in the same breath.
+eval(extract('applyEnergyDelays'));
+const mkChain = (n) => Array.from({length: n},
+    (_, i) => ({ id: 'j' + i, start: NOW + i * HOUR, finish: NOW + (i + 1) * HOUR }));
+
+let chain = mkChain(3);
+let plan = [{ waitMs: 0 }, { waitMs: 2 * HOUR }, { waitMs: 0 }];
+let moved = applyEnergyDelays(chain, plan);
+eq('an unaffected job keeps its time', moved[0].start, chain[0].start);
+eq('the waiting one starts when the energy is there', moved[1].start, chain[1].start + 2 * HOUR);
+eq('and the one behind it slips by the same', moved[2].start, chain[2].start + 2 * HOUR);
+eq('the durations are kept', moved[2].finish - moved[2].start, HOUR);
+eq('only the job that waits is flagged', plan.map(f => f.notEnoughEnergy), [false, true, false]);
+eq('the delay it added is recorded', plan[1].energyDelayMs, 2 * HOUR);
+
+// A job behind a delayed one inherits the slip; it is only flagged for the extra
+// wait it adds ON TOP of that, or the ⚠ would spread down the whole list.
+chain = mkChain(3);
+plan = [{ waitMs: 0 }, { waitMs: 2 * HOUR }, { waitMs: 3 * HOUR }];
+moved = applyEnergyDelays(chain, plan);
+eq('the third only adds one more hour', plan[2].energyDelayMs, HOUR);
+eq('so it slips by three in total', moved[2].start, chain[2].start + 3 * HOUR);
+const inherited = [{ waitMs: 2 * HOUR }, { waitMs: HOUR }];
+applyEnergyDelays(mkChain(2), inherited);
+eq('an inherited slip alone is no warning', inherited.map(f => f.notEnoughEnergy), [true, false]);
+
+// An endless wait (no regeneration at all) is a warning but shifts nothing: we
+// have no time to shift it by.
+chain = mkChain(2);
+plan = [{ waitMs: Infinity }, { waitMs: 0 }];
+moved = applyEnergyDelays(chain, plan);
+eq('an unreachable cost still warns', plan[0].notEnoughEnergy, true);
+eq('...but does not move the times', [moved[0].start, moved[1].start],
+    [chain[0].start, chain[1].start]);
 
 // A sleep that has NOT started yet must not have its length estimated with the
 // awake rate: on the main character an 8-hour sleep "never ended" that way, and

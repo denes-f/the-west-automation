@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.14)
+// @name         The-West Modular Job Queue (Lisa v12.15)
 // @namespace   http://tampermonkey.net/
-// @version     12.14
+// @version     12.15
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -523,52 +523,140 @@
         return out;
     }
 
-    // Per-job forecast. Motivation drops by the job's energy cost when the job
-    // COMPLETES, whereas the energy is deducted the moment it enters the game's
-    // queue -- so the two have to be tracked separately.
+    // Per-job forecast. Two quantities move at different moments, so they have to
+    // be walked separately:
+    //   - MOTIVATION drops by the job's energy cost when the job COMPLETES;
+    //   - ENERGY is deducted the moment the job enters the GAME's queue -- and that
+    //     is as soon as a slot is free and the energy covers the cost, which is
+    //     typically well BEFORE the job starts, because the game's queue runs
+    //     sequentially while the hand-over does not wait for it.
+    //
+    // Reading the energy off the predicted START time is what made the panel promise
+    // energy that will already have been spent. Measured live: 6 energy, two 1-hour
+    // jobs in the game's queue and a third 1-hour job (cost 12) waiting in ours. The
+    // panel said "15 at the start, 3 left" -- the energy regenerated over the whole
+    // two hours -- while in truth the game takes the 12 the moment it has them (about
+    // an hour earlier, with nothing to spare) and the job starts with 0 left.
+    //
+    // So we walk the list FORWARD IN TIME, carrying (energy, the moment it belongs
+    // to), and pay each cost at the earliest moment the energy covers it. That also
+    // gets the ceiling right: the old model could credit a full bar and then subtract
+    // the costs from it, when in reality the costs are paid on the way up and the bar
+    // never fills.
     function computeForecast(jobs, etas, opts) {
         const committed = Object.assign({}, opts.priorMotivationCost || {});
-        let energyUsed = 0;
-        // After a sleep we don't carry on from "energy regenerating from now on" but
-        // from the level the sleep fills up to. Further regeneration is ignored here:
-        // that makes the forecast pessimistic rather than untruthful.
-        let carry = (typeof opts.initialCarry === 'number') ? opts.initialCarry : null;
+        const perHour = (typeof opts.perHour === 'number' && opts.perHour > 0) ? opts.perHour : 0;
+        const max = (typeof opts.maxEnergy === 'number') ? opts.maxEnergy : Infinity;
+        const now = (typeof opts.now === 'number') ? opts.now : Date.now();
+
+        // The carried pair: the predicted energy and the moment it belongs to.
+        let energy = opts.energyAt(now);
+        let energyAt = now;
+        // A sleep in the GAME's queue: our first job cannot be handed over before it
+        // ends, and by then the energy stands at the room's level -- not at whatever
+        // the awake regeneration rate would extrapolate to.
+        if (typeof opts.initialCarry === 'number') {
+            energy = opts.initialCarry;
+            energyAt = (etas[0] && etas[0].start) || now;
+        }
+
+        // The game's own regeneration, forward from the carried pair.
+        const levelAt = (ms) => energy === null ? null
+            : Math.min(max, Math.floor(energy + perHour * Math.max(0, ms - energyAt) / 3600000));
+        // The first moment the energy covers `need` -- Infinity if it never does.
+        const readyFor = (need) => {
+            if (energy >= need) return energyAt;
+            if (perHour <= 0 || need > max) return Infinity;
+            return energyAt + Math.ceil((need - energy) / perHour * 3600) * 1000;
+        };
+
         return jobs.map((job, i) => {
-            const start = etas[i] ? etas[i].start : Date.now();
+            const start = (etas[i] && etas[i].start) || now;
             const cost = opts.costOf(job);
             const base = opts.motivationOf(job.jobId);
             const motivation = (typeof base === 'number')
                 ? Math.round(base * 100) - (committed[job.jobId] || 0)
                 : null;
-            const predicted = carry === null ? opts.energyAt(start) : carry;
-            const energyBefore = predicted === null ? null : predicted - energyUsed;
 
-            // A sleep does not consume energy, it refills it.
+            // A sleep does not consume energy, it refills it -- and it does so by the
+            // time it ENDS, so that is where the chain carries on from.
             if (job.taskType === 'sleep') {
                 const target = opts.sleepTargetOf ? opts.sleepTargetOf(job, i) : null;
-                carry = target;
-                energyUsed = 0;
+                const energyBefore = levelAt(Math.max(energyAt, start));
+                energy = target;
+                energyAt = (etas[i] && etas[i].finish) || start;
                 return {
                     id: job.id, cost: null, motivation: null,
-                    energyBefore, energyAfter: target,
+                    energyBefore, energyAfter: target, waitMs: 0,
                     lowMotivation: false, notEnoughEnergy: false, isSleep: true,
                 };
             }
 
-            const energyAfter = (energyBefore === null || cost === null) ? null : energyBefore - cost;
-            if (cost !== null) {
-                energyUsed += cost;
-                committed[job.jobId] = (committed[job.jobId] || 0) + cost;
+            // While we don't know the cost we don't guess -- and we must not move the
+            // chain on either, or the jobs behind it would be forecast off a number
+            // nobody computed.
+            if (energy === null || cost === null) {
+                return {
+                    id: job.id, cost, motivation,
+                    energyBefore: levelAt(Math.max(energyAt, start)), energyAfter: null, waitMs: 0,
+                    lowMotivation: motivation !== null && motivation <= opts.motivationWarn,
+                    notEnoughEnergy: false,
+                };
             }
+
+            const payAt = readyFor(cost);
+            // With no regeneration at all the energy simply never gets there. We keep
+            // draining into the negative rather than stopping: the shortfall is the
+            // useful number to show, and it is what the sleep offer is sized from.
+            const reachable = isFinite(payAt);
+            const energyBefore = levelAt(reachable ? payAt : energyAt);
+            const energyAfter = energyBefore - cost;
+            const waitMs = reachable ? Math.max(0, payAt - start) : Infinity;
+
+            energy = energyAfter;
+            if (reachable) energyAt = payAt;
+            committed[job.jobId] = (committed[job.jobId] || 0) + cost;
+
             return {
                 id: job.id,
                 cost,
                 motivation,
                 energyBefore,
                 energyAfter,
+                // How much later than its queue slot the energy lets it start. The
+                // ETA pass turns this into the actual start time.
+                waitMs,
                 lowMotivation: motivation !== null && motivation <= opts.motivationWarn,
-                notEnoughEnergy: energyBefore !== null && cost !== null && energyBefore < cost,
+                notEnoughEnergy: waitMs > 0,
             };
+        });
+    }
+
+    // A job cannot start before the game has taken it, and the game only takes it
+    // once the energy covers the cost. So an energy wait pushes that job -- and
+    // everything behind it -- out. Without this the panel flagged "there won't be
+    // enough energy" and in the same breath promised the original start time.
+    //
+    // `waitMs` is measured against the unshifted start, so a job only *adds* delay
+    // beyond what it already inherited from the jobs in front of it. That keeps the
+    // ⚠ on the job that actually has to wait, instead of on everything behind it.
+    function applyEnergyDelays(etas, forecast) {
+        let shift = 0;
+        return etas.map((eta, i) => {
+            const f = forecast[i];
+            const wait = (f && isFinite(f.waitMs)) ? f.waitMs : 0;
+            const own = Math.max(0, wait - shift);
+            shift += own;
+            if (f) {
+                f.energyDelayMs = own;
+                f.notEnoughEnergy = own > 0 || (f.waitMs === Infinity);
+            }
+            if (!shift) return eta;
+            return Object.assign({}, eta, {
+                start: eta.start + shift,
+                finish: eta.finish + shift,
+                energyDelayed: own > 0,
+            });
         });
     }
 
@@ -712,8 +800,14 @@
     }
 
     function forecastForExtraQueue(jobs, etas) {
+        const c = window.Character;
         return computeForecast(jobs, etas, {
+            now: Date.now(),
             initialCarry: initialEnergyCarry(),
+            // The rate and the ceiling both come from the game (never hardcoded):
+            // the forecast has to pay each cost at the moment the energy reaches it.
+            perHour: energyPerHour(),
+            maxEnergy: (c && c.maxEnergy) || 100,
             costOf: jobEnergyCost,
             motivationOf: jobMotivation,
             energyAt,
@@ -721,6 +815,17 @@
             priorMotivationCost: motivationAlreadyCommitted(),
             motivationWarn: CONFIG.MOTIVATION_WARN,
         });
+    }
+
+    // ETAs and the energy forecast are computed together: the energy chain does not
+    // depend on the start times (it only depends on the costs and the regeneration),
+    // but the start times DO depend on the energy -- a job that has to wait for it
+    // starts later. So: chain the ETAs, forecast the energy, then push the ETAs out
+    // by whatever the energy delayed.
+    function planExtraQueue(jobs) {
+        const chained = computeEtas(jobs);
+        const forecast = forecastForExtraQueue(jobs, chained);
+        return { etas: applyEnergyDelays(chained, forecast), forecast };
     }
 
     // ------------------------------------------------------------
@@ -1269,12 +1374,23 @@
     // classes and parses the queueId out of the class name. Our rows have no real
     // task behind them, so we let no click travel upwards at all -- without that,
     // one click would cancel a real job.
+    // The energy warning in words. The forecast pays each cost at the moment the
+    // energy reaches it, so "not enough energy" is normally a WAIT, not a shortfall:
+    // the job starts that much later. A real shortfall is only possible when there is
+    // no regeneration at all, or when the cost is above the character's maximum.
+    function energyWarningText(f) {
+        if (!f || !f.notEnoughEnergy) return '';
+        if (f.waitMs === Infinity) return `kevés energia (${f.energyBefore} < ${f.cost})`;
+        return `${f.cost} energiára vár (~${formatDuration((f.energyDelayMs || f.waitMs) / 1000)})`;
+    }
+
     // A forecast row's human-readable warning, or an empty string.
     function forecastWarning(f) {
         if (!f) return '';
         const out = [];
         if (f.lowMotivation) out.push(`motiváció ${f.motivation}%`);
-        if (f.notEnoughEnergy) out.push(`kevés energia (${f.energyBefore} < ${f.cost})`);
+        const energy = energyWarningText(f);
+        if (energy) out.push(energy);
         return out.join(', ');
     }
 
@@ -1485,8 +1601,7 @@
         // our rows disappeared during the game's redraw (self-healing).
         // The warnings are part of the key too: if a job's motivation or energy
         // crosses the threshold, the rows have to be redrawn.
-        const etas = computeEtas(extraJobs);
-        const forecast = forecastForExtraQueue(extraJobs, etas);
+        const forecast = planExtraQueue(extraJobs).forecast;
         const warnKey = forecast.slice(0, shown.length).map(f => (forecastWarning(f) ? '1' : '0')).join('');
         const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}|${warnKey}`;
         if (key === renderedPendingKey && host.querySelector('.lisa-pending-sep')) return;
@@ -2640,7 +2755,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.14',
+        version: '12.15',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -3181,14 +3296,20 @@
 
         const reasons = [];
         if (f.lowMotivation) reasons.push(`motiváció ${f.motivation}% (≤ ${CONFIG.MOTIVATION_WARN}%)`);
-        if (f.notEnoughEnergy) reasons.push(`nem lesz elég energia (${f.energyBefore} < ${f.cost})`);
+        const energyReason = energyWarningText(f);
+        if (energyReason) reasons.push(f.waitMs === Infinity
+            ? `nem lesz elég energia (${f.energyBefore} < ${f.cost})`
+            : `csak ~${formatDuration((f.energyDelayMs || f.waitMs) / 1000)} múlva lesz meg a ${f.cost} energia`);
         warnEl.textContent = reasons.length ? '⚠' : '';
         warnEl.title = reasons.length ? `${job.jobName} – ${reasons.join(', ')}` : '';
         li.classList.toggle('lisa-row-warn', reasons.length > 0);
 
+        // The energy is taken when the job goes INTO the game's queue, not when it
+        // starts running -- saying "induláskor" here promised regeneration that will
+        // already have been spent by then.
         energyEl.textContent = f.energyAfter === null ? '' : `⚡${Math.max(0, f.energyAfter)}`;
         energyEl.title = f.energyAfter === null ? '' :
-            `Induláskor ${f.energyBefore} energia, a munka ${f.cost}-t visz, marad ${f.energyAfter}`
+            `A játék sorába kerülve ${f.energyBefore} energia, a munka ${f.cost}-t visz, marad ${f.energyAfter}`
             + (f.motivation === null ? '' : `\nMotiváció induláskor: ${f.motivation}%`);
         energyEl.classList.toggle('lisa-energy-low', !!f.notEnoughEnergy);
     }
@@ -3199,9 +3320,9 @@
     // character box shows even while the panel is closed or minimized.
     function refreshForecast() {
         refreshJobInfo(extraJobs);
-        const etas = computeEtas(extraJobs);
-        lastForecast = forecastForExtraQueue(extraJobs, etas);
-        return etas;
+        const plan = planExtraQueue(extraJobs);
+        lastForecast = plan.forecast;
+        return plan.etas;
     }
 
     function updateExtraEtas(precomputed) {
@@ -3217,9 +3338,15 @@
             if (!el) return;
             el.textContent = formatEta(eta);
             const job = extraJobs[i];
-            el.title = eta.travelMs >= 1000
+            const f = forecast[i];
+            el.title = (eta.travelMs >= 1000
                 ? `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — út: ${formatDuration(eta.travelMs / 1000)}, munka: ${formatDuration(job.duration)}`
-                : `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — munka: ${formatDuration(job.duration)}`;
+                : `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — munka: ${formatDuration(job.duration)}`)
+                // The energy is what holds it up, not the queue: say so, otherwise the
+                // time above looks like an unexplained slip.
+                + (f && f.energyDelayMs > 0
+                    ? `\nEbből ~${formatDuration(f.energyDelayMs / 1000)} az energiára (${f.cost} kell) való várakozás.`
+                    : '');
             // Flag it as an estimate if the travel time couldn't be computed.
             el.style.opacity = eta.estimated ? '1' : '0.55';
         });
@@ -3294,5 +3421,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.14 loaded.');
+    console.log('[Lisa] Modular v12.15 loaded.');
 })();

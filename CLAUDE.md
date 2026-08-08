@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 239 assertions, no dependencies.
+  name and runs them against stubs. 262 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,7 +15,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.14.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.15.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -24,7 +24,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `200 passed, 0 failed`.
+2. `node test-queue.js` should print `262 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -108,6 +108,12 @@ be`) once jobs are queued. **v12.14 (the persistent sleep offer) is in the same 
 tests cover the state machine, but the collapsed row has never been seen in the game. Worth one
 look — decline an offer and check the row stays, keeps its numbers current, expands on `Alvás…`,
 and disappears by itself once the energy recovers.
+**v12.15 (energy paid at hand-over, ETAs pushed out by the energy wait) is also in this state**: the
+*symptom* was reported live from the main account with exact numbers, and the client-side formula
+was re-read out of the bundle, but the new forecast has only run against unit tests. Worth one look
+at a list the energy can't keep up with — the ⚠ should sit on the first job that has to wait (and on
+that one only), the row tooltip should say how much of the delay is the energy, and the ⚡ figure
+should never promise energy the game will already have taken.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -216,6 +222,17 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   with a 150 max — never hardcode 2 or 3.
 - `Character.levelEnergyFillup` is `true`: **levelling up refills energy completely**, which will
   make any forecast jump. Confirmed live (96 → 97 mid-test).
+- Re-read out of the bundle in v12.15 (`curl https://hu27.the-west.hu/cache/tw2game.hu_HU.js`, no
+  login needed — a fast way to check a game fact without spending a browser session): `maxEnergy *
+  energyRegen` is the **only** energy rate anywhere in the client. `Game.tick4Character` and
+  `WestUi.updateEnergy` both use it verbatim, so the bar the player sees and our forecast cannot
+  disagree. `setEnergy(e, energyDate)` re-anchors `energyDate` to *now* on every actual change (and
+  **returns early without re-anchoring when the value is unchanged**, which is what keeps the
+  accumulation correct); the optional second argument is a **relative offset in seconds**, used only
+  by the chat's user-update path.
+  **Open question:** whether `energyRegen` really stays 0.03 at `maxEnergy` 150 (⇒ 4.5/h) or the
+  server sends a smaller factor to keep 3/h. Reading the live pair on the main account settles it;
+  either way the code is right, because it reads both from the game.
 
 ### Sleeping
 
@@ -428,9 +445,30 @@ and "Nem" correctly does nothing.
 - **Energy and motivation are forecast, never modelled.** `computeForecast` walks the waiting list
   in ETA order: energy comes from the game's own formula, the per-job cost and the motivation from
   the read-only job call. A job is flagged when its predicted motivation at **start** is ≤
-  `MOTIVATION_WARN` (75) or when the energy at that point won't cover its cost — shown as `⚠` on the
-  panel row, on the injected in-game tile, and summarised on the separator. When a value isn't known
-  yet, nothing is guessed and nothing is flagged.
+  `MOTIVATION_WARN` (75) or when the energy makes it start later than its queue slot would — shown
+  as `⚠` on the panel row, on the injected in-game tile, and summarised on the separator. When a
+  value isn't known yet, nothing is guessed and nothing is flagged.
+- **The energy is paid at hand-over, not at the start** (v12.15). The two moments are different and
+  the difference is large: a job enters the game's queue — and is charged — as soon as a slot is
+  free *and* the energy covers it, while it only *starts* once everything in front of it has
+  finished. Reading the energy off the predicted start time therefore credited regeneration that
+  will already have been spent. Measured live on the main account: 6 energy, two 1-hour jobs in the
+  game's queue, a third 1-hour job (cost 12) waiting in ours — the panel promised "15 at the start,
+  3 left", when in truth the game takes the 12 about an hour earlier and the job sets out with 0.
+  So `computeForecast` walks **forward in time**, carrying `(energy, the moment it belongs to)`, and
+  pays each cost at the first moment the energy reaches it. This also fixes the ceiling: the old
+  model could credit a full bar and then subtract the costs from it, when the costs are in fact paid
+  on the way up and the bar never fills. A real *shortfall* (negative energy) is now only possible
+  with no regeneration at all, or a cost above the character's maximum; everything else is a **wait**.
+- **An energy wait moves the ETAs.** The energy chain does not depend on the start times (only on
+  the costs and the regen rate), but the start times depend on the energy — a job the game cannot
+  yet afford starts later, and so does everything behind it. `planExtraQueue` therefore chains the
+  ETAs, forecasts the energy, then pushes the ETAs out by `applyEnergyDelays`. Without it the panel
+  warned "there won't be enough energy" and promised the original start time in the same breath.
+  `waitMs` is measured against the *unshifted* start, so `energyDelayMs` is only the delay a job
+  adds **of its own** — otherwise the ⚠ spread from the one job that waits to everything after it.
+  This matters more than it sounds: a 1-hour job costs 12 energy against ~3–4.5/h of regeneration,
+  so on any long list of long jobs the **energy**, not the queue, is what sets the pace.
   **Known simplification:** motivation regeneration is not modelled (it was not measured; it is
   believed to reset daily, time of day unknown). This needs no correction for *current* values —
   the motivation is re-read from the server every `JOB_INFO_TTL` (5 min), so a reset is picked up
