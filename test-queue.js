@@ -69,9 +69,12 @@ const quiet = () => {};
 const real = console.log;
 console.log = quiet; console.warn = quiet; console.error = quiet;
 
+let handingOver = false;   // set while our own batch is inside TaskQueue.add
+
 eval([
     'gameReady', 'gameQueueLength', 'gameQueueLimit', 'freeSlots', 'nextFreeAtMs',
-    'waitUntilFreeSlotMs', 'startJobsViaGame', 'addExtraJobs', 'formatDuration', 'ensureProcessing',
+    'waitUntilFreeSlotMs', 'buildGameTask', 'startJobsViaGame', 'addExtraJobs',
+    'formatDuration', 'ensureProcessing',
 ].map(extract).join('\n'));
 eval(extract('processQueue'));
 console.log = real;
@@ -241,7 +244,8 @@ window.Character = global.Character;
 const estimateSleepSeconds = () => 3600;
 const sleepGoalForTask = () => 100;
 const sleepPerHour = () => 0;
-eval(['secondsPerDistanceUnit','currentPosition','queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta',
+eval(['secondsPerDistanceUnit','currentPosition','taskFinishAt','queueTailAnchor','computeEtas',
+      'clockHM','dayOffset','formatEta',
       'jobDurationSeconds','msUntilEnergyAtRate'].map(extract).join('\n'));
 
 eq('seconds per unit comes from calcWayTo', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
@@ -308,6 +312,7 @@ const updateKeepAwake = () => {};     // keep-awake: browser-dependent, not meas
 const cancelSleepIfFull = () => {};   // cancelling a sleep needs live game state
 const askRunningSleepMode = () => {}; // needs a dialog
 const patchHotelStart = () => {};     // the hotel window only exists in the game
+const patchTaskQueueAdd = () => {};   // ...and so does TaskQueue
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -482,6 +487,86 @@ eq('the tile always reports the remainder',
    (s => s.shown + s.hidden)(previewSplit(25, 6)), 25);
 
 // ============================================================
+//  The widget must not walk off the top of the screen
+// ============================================================
+// Measured live: #ui_workcontainer is pinned to the BOTTOM of the viewport and
+// grows UPWARD with no limit (max-height:none, no clipping). 15 tiles already put
+// its top at 62 px on a 700 px viewport, and with premium the game alone shows 9 --
+// so a long extra queue simply runs off the top edge. previewForSpace budgets the
+// tiles against the room actually left above the widget.
+console.log('\n=== Preview capped by the space on screen ===');
+global.QUEUE_WIDGET_MARGIN = 8;
+global.QUEUE_SEPARATOR_H = 20;
+eval(extract('previewForSpace'));
+eq('plenty of room: the configured cap wins', previewForSpace(600, 67, 6), 6);
+eq('room for two rows only: four tiles', previewForSpace(2 * 67 + 28, 67, 6), 4);
+eq('room for one row: two tiles', previewForSpace(1 * 67 + 28, 67, 6), 2);
+eq('no room at all: at least the "+N" tile', previewForSpace(10, 67, 6), 1);
+eq('negative top (already off-screen) still yields one', previewForSpace(-200, 67, 6), 1);
+// 300 px of room takes 4 rows of 67 (capped to 6 tiles), but only 2 rows of 130.
+eq('a taller tile fits fewer', previewForSpace(300, 130, 6), 4);
+eq('...where a normal tile would have hit the cap', previewForSpace(300, 67, 6), 6);
+eq('an unmeasurable row height falls back to the cap', previewForSpace(600, 0, 6), 6);
+eq('the cap is never exceeded, however much room there is',
+   previewForSpace(5000, 67, 6), 6);
+
+// ============================================================
+//  Handing #queuedTasks back to the game, rather than un-hiding it
+// ============================================================
+// Measured live: collapsing the widget with the game's own arrow puts an INLINE
+// display:none on #queuedTasks and swaps #ui_workcontainer's class to 'expandable'.
+// So `style.display = ''` wipes the GAME'S hiding along with ours and leaves an
+// empty container sitting on the screen -- the stray empty widget seen live.
+console.log('\n=== Releasing the queue widget ===');
+eval([extract('isOurRow'), extract('queueWidgetCollapsed'),
+      extract('setPendingHostVisible')].join('\n'));
+
+const cls = (...names) => ({ classList: { contains: n => names.includes(n) } });
+const mkHost = (...children) => ({ style: {}, children });
+const withWidget = (widgetClass, fn) => {
+    global.document = { getElementById: id =>
+        (id === 'ui_workcontainer' ? cls(widgetClass) : null) };
+    return fn();
+};
+const ourRow = cls('lisa-pending');
+const realRow = cls('task');
+
+withWidget('expanded', () => {
+    let h = mkHost(realRow);
+    setPendingHostVisible(h, true);
+    eq('we have rows to show: forced visible', h.style.display, 'block');
+
+    h = mkHost(realRow, ourRow);
+    setPendingHostVisible(h, false);
+    eq('a real task is left: the game decides again', h.style.display, '');
+
+    h = mkHost(ourRow);
+    setPendingHostVisible(h, false);
+    eq('only our rows left: put the game\'s own hiding back', h.style.display, 'none');
+
+    h = mkHost();
+    setPendingHostVisible(h, false);
+    eq('nothing left at all: hidden, not blank', h.style.display, 'none');
+});
+
+withWidget('expandable', () => {
+    let h = mkHost(realRow);
+    setPendingHostVisible(h, true);
+    eq('the user folded the widget away: we do not fight it', h.style.display, 'none');
+
+    h = mkHost(realRow, ourRow);
+    setPendingHostVisible(h, false);
+    eq('...and releasing keeps it folded', h.style.display, 'none');
+});
+
+global.document = { getElementById: () => null };
+{
+    const h = mkHost(realRow);
+    setPendingHostVisible(h, true);
+    eq('no widget element at all: still shows our rows', h.style.display, 'block');
+}
+
+// ============================================================
 //  A later rejection by the server must not lose the job
 // ============================================================
 // Case measured live: TaskQueue.add pushes synchronously, the script counts them
@@ -549,7 +634,8 @@ eq('the attempts together span > 1 hour', totalWait > 3600000, true);
 // enters the queue. Regeneration is maxEnergy * energyRegen per hour.
 console.log('\n=== Energy and motivation ===');
 CONFIG.MOTIVATION_WARN = 75;
-eval(extract('computeForecast'));
+eval([extract('makeEnergyClock'), extract('attachEnergyLevels'),
+      extract('computeForecast')].join('\n'));
 
 // The forecast walks FORWARD IN TIME from `now`, so the fixtures have to sit on
 // the same clock as it -- an ETA in 1970 would look like an hour-long energy wait.
@@ -591,6 +677,148 @@ eq('the cost is paid when the energy reaches it, not at the start',
     [fc[0].energyBefore, fc[0].energyAfter], [12, 0]);
 eq('...so it is not the value at the start time', fc[0].energyBefore === 15, false);
 eq('the energy still arrives before the queue frees up', fc[0].notEnoughEnergy, false);
+
+// ...and the OTHER half of the same truth: the cost is gone by the start, but the
+// energy does not stay where the deduction left it. It keeps regenerating while
+// the job waits its turn in the game's queue and while it runs. So the row shows
+// the level at the START and at the FINISH, not the frozen post-deduction figure.
+attachEnergyLevels([{ start: NOW + 2 * HOUR, finish: NOW + 3 * HOUR }], fc);
+eq('paid at 80 min, so by the 2-hour start 40 min have regrown',
+   fc[0].energyAtStart, 3);
+eq('and another hour of running on top of that', fc[0].energyAtFinish, 7);
+eq('neither is the number at the moment of payment', fc[0].energyAfter, 0);
+
+// With the queue fed ahead, the NEXT job's cost is taken while this one is still
+// running -- so "what will I have when this finishes" cannot be read off one row.
+// Two 1-hour jobs, 5 each, plenty of energy: the second is paid for immediately.
+const chainEtas = [{ start: NOW, finish: NOW + HOUR },
+                   { start: NOW + HOUR, finish: NOW + 2 * HOUR }];
+let chainPlan = fcast(mkJobs(2), chainEtas, {
+    costOf: () => 5, motivationOf: () => 1, energyAt: flat(100),
+    perHour: 3, maxEnergy: 150, priorMotivationCost: {}, motivationWarn: 75 });
+attachEnergyLevels(chainEtas, chainPlan);
+eq('both costs are taken up front',
+   [chainPlan[0].energyAfter, chainPlan[1].energyAfter], [95, 90]);
+eq('the first job finishes with the SECOND job\'s cost already gone',
+   chainPlan[0].energyAtFinish, 93);
+eq('...which its own row could never have said', chainPlan[0].energyAfter, 95);
+eq('and the list ends three hours\' regeneration later', chainPlan[1].energyAtFinish, 96);
+
+// REPORTED LIVE (main account, v12.16): the rows read "100 -> 100" on a character
+// with 118 energy and a maximum of 150. The cost is only paid once a slot frees,
+// but nothing said so: when the energy comfortably covers a cost, readyFor()
+// returns the CARRIED moment and the carried moment never advances -- so every
+// job's deduction was stamped on `now`, and the clock reported the whole list as
+// already paid for at time zero (then clipped by the ceiling climbing back up).
+const SLOT_ETAS = Array.from({ length: 6 },
+    (_, i) => ({ start: NOW + i * 600000, finish: NOW + (i + 1) * 600000 }));
+const slotCase = (opts) => {
+    const jobs6 = Array.from({ length: 6 },
+        (_, i) => ({ id: 'j' + i, jobId: 100 + i, duration: 600, taskType: 'job' }));
+    const f = fcast(jobs6, SLOT_ETAS, Object.assign({
+        costOf: () => 5, motivationOf: () => 1, energyAt: flat(118),
+        perHour: 4.5, maxEnergy: 150, priorMotivationCost: {}, motivationWarn: 75 }, opts));
+    attachEnergyLevels(SLOT_ETAS, f);
+    return f;
+};
+
+// The bug lives in WHEN each cost is booked, so that is what to pin. Without slot
+// information all six land on `now`: the clock then says the whole list is paid
+// for before the first job has even started.
+const MIN = 60000;
+const unspaced = slotCase({});
+eq('with no slot information every cost is booked at once',
+   unspaced.energyClock(NOW), 118 - 6 * 5);
+
+// This is exactly the shape the user saw: 118 energy, the entire list deducted up
+// front, and 4.5/h regeneration too slow to move an integer within a short job --
+// so row after row reads the same number for both its start and its finish.
+eq('...which reads as one flat number, repeated',
+   [unspaced.energyClock(NOW), unspaced.energyClock(NOW + 15000)], [88, 88]);
+
+// A full premium queue whose jobs finish every 10 minutes frees one slot at a time,
+// and each of our jobs is handed over -- and charged -- as its slot comes up.
+const QUEUED9 = Array.from({ length: 9 }, (_, i) => NOW + (i + 1) * 10 * MIN);
+const spaced = slotCase({ queueLimit: 9, queuedFinishes: QUEUED9 });
+eq('nothing is paid before the first slot frees', spaced.energyClock(NOW), 118);
+eq('the first slot books exactly one cost', spaced.energyClock(NOW + 10 * MIN), 113);
+eq('the second books the next', spaced.energyClock(NOW + 20 * MIN), 109);
+eq('and by the sixth the whole list is charged', spaced.energyClock(NOW + 60 * MIN), 92);
+eq('the ceiling never produced any of those numbers',
+   [10, 20, 60].every(m => spaced.energyClock(NOW + m * MIN) < 150), true);
+
+// Slots standing free right now mean the job really is handed over immediately.
+const roomNow = slotCase({ queueLimit: 9, queuedFinishes: [] });
+eq('with the queue empty the jobs that fit go in at once',
+   roomNow.energyClock(NOW), 118 - 6 * 5);
+
+// The slot never contributes to the ETA shift -- that is the energy's job alone.
+eq('a freeing slot adds no energy wait', spaced.map(f => f.waitMs), [0, 0, 0, 0, 0, 0]);
+eq('...and flags nothing', spaced.some(f => f.notEnoughEnergy), false);
+
+// A running sleep always carries an 8-hour date_done, but we cancel it once its
+// goal is met. taskFinishAt is shared by the ETA chain and by the slot times, so
+// the costs cannot be booked eight hours after the times say the jobs run.
+{
+    const t0 = 1000000;
+    const EIGHT_H = 8 * 3600000;
+    // Built with its dependencies injected: the harness holds them as const for
+    // the other sections, so they cannot be reassigned here.
+    const finishAt = new Function(
+        'sleepGoalForTask', 'sleepPerHour', 'msUntilEnergyAtRate',
+        extract('taskFinishAt') + '\nreturn taskFinishAt;')(
+            () => 100,                                   // goal: 100 energy
+            () => 50,                                    // asleep: 50/h => 2 hours
+            (target, perHour) => Math.ceil(target / perHour * 3600) * 1000);
+    eq('a sleep is clamped to the predicted wake-up, not its 8-hour slot',
+       finishAt({ type: 'sleep', data: { date_done: t0 + EIGHT_H } }, t0), t0 + 2 * 3600000);
+    eq('an ordinary job is taken at face value',
+       finishAt({ type: 'job', data: { date_done: t0 + 60000 } }, t0), t0 + 60000);
+    eq('a sleep already ending sooner than the goal keeps its own time',
+       finishAt({ type: 'sleep', data: { date_done: t0 + 60000 } }, t0), t0 + 60000);
+    eq('an entry with no date_done has no finish', finishAt({ type: 'job', data: {} }, t0), null);
+}
+
+// REPORTED LIVE, and NOT a bug -- pinned here because it twice looked like one.
+// Main account, Faúsztatás, 15 s jobs costing 1, queue limit 4 (no automation
+// bonus), the game's queue full. The panel's own tooltips gave the ground truth:
+// the pay chain ran 108->107 ... 101->100 correctly, while the displayed pair went
+// 105->104, 104->103, 103->102, 102->101 and then sat at 101->101.
+//
+// That is what actually happens. A job is handed over -- and charged -- as soon as
+// a slot frees, i.e. `limit` jobs before it runs. So for the LAST `limit` jobs
+// there is nothing left in the list to charge, and only regeneration moves the
+// figure: 4.5/h is 0.075 a minute, invisible across a 15-second job.
+{
+    const QUEUED4 = [15, 30, 45, 60].map(s => NOW + s * 1000);
+    const tailEtas = Array.from({ length: 10 }, (_, i) => ({
+        start: NOW + (60 + i * 15) * 1000, finish: NOW + (60 + (i + 1) * 15) * 1000 }));
+    const tailJobs = Array.from({ length: 10 },
+        (_, i) => ({ id: 't' + i, jobId: 46, duration: 15 }));
+    const tail = fcast(tailJobs, tailEtas, {
+        perHour: 4.5, maxEnergy: 150, queueLimit: 4, queuedFinishes: QUEUED4,
+        costOf: () => 1, motivationOf: () => 0.88, energyAt: flat(108),
+        priorMotivationCost: {}, motivationWarn: 75 });
+    attachEnergyLevels(tailEtas, tail);
+
+    eq('the pay chain charges one job at a time, all the way down',
+       tail.map(f => f.energyAfter), [107, 106, 105, 104, 103, 102, 101, 100, 99, 98]);
+    eq('the displayed level lags it by the queue depth',
+       tail.map(f => f.energyAtStart), [104, 103, 102, 101, 100, 99, 98, 98, 98, 98]);
+    eq('...and the last `limit` jobs are flat, having nothing left to pay for',
+       tail.slice(-4).every(f => f.energyAtStart === f.energyAtFinish), true);
+    eq('the flat value is the whole list paid for, not a clamp',
+       tail[9].energyAtStart, 108 - 10);
+    eq('nothing here is the ceiling', tail.every(f => f.energyAtStart < 150), true);
+}
+
+// The ceiling holds in the replay too.
+const longEtas = [{ start: NOW, finish: NOW + 100 * HOUR }];
+chainPlan = fcast(mkJobs(1), longEtas, {
+    costOf: () => 5, motivationOf: () => 1, energyAt: flat(100),
+    perHour: 3, maxEnergy: 150, priorMotivationCost: {}, motivationWarn: 75 });
+attachEnergyLevels(longEtas, chainPlan);
+eq('a very long job still cannot pass the maximum', chainPlan[0].energyAtFinish, 150);
 
 // The ceiling is reached on the way, not credited in full and then spent: three
 // 12-cost jobs out of 6 energy at 4.5/h can never bank more than 12 at a time.
@@ -888,6 +1116,80 @@ const stored = sanitizeJobs([
 eq('the sleep survives saving', stored.length, 2);
 eq('the town and the room are kept', [stored[0].townId, stored[0].room], [4206, 'luxurious_apartment']);
 eq('incomplete sleep entries are dropped', stored[1].jobId, 129);
+
+// ============================================================
+//  Walking: what the game would have thrown away
+// ============================================================
+// TaskQueue.add truncates silently when the queue is full -- read out of the
+// bundle -- so a walk started on a full queue simply vanished. Measured shape of
+// an unqueued TaskWalk: post = {taskType:'walk', type, unitId, x, y} (x/y absent
+// on the Guidepost path) and getDuration() === 0, the whole length being travel.
+console.log('\n=== Walking ===');
+eval([extract('overflowOfBatch'), extract('makeWalkEntry'),
+      extract('walkDisplayName'), extract('divertibleEntry')].join('\n'));
+const DIVERTIBLE = { walk: true };
+
+eq('everything fits: nothing overflows', overflowOfBatch([1, 2], 1, 4).length, 0);
+eq('exactly fills the queue: still nothing', overflowOfBatch([1, 2, 3], 1, 4).length, 0);
+eq('one too many: the last one overflows', overflowOfBatch([1, 2, 3, 4], 1, 4), [4]);
+eq('a full queue overflows the whole batch', overflowOfBatch([1, 2], 4, 4), [1, 2]);
+eq('an over-full queue does not slice from the front', overflowOfBatch([1, 2], 9, 4), [1, 2]);
+eq('premium leaves room for more', overflowOfBatch([1, 2, 3], 7, 9), [3]);
+
+const walk = makeWalkEntry({ taskType: 'walk', type: 'fort', unitId: 77, x: 100, y: 200 },
+                           'Séta ide: erőd');
+eq('a walk is stored as its own task type', walk.taskType, 'walk');
+eq('the target is what identifies it', [walk.walkType, walk.unitId], ['fort', 77]);
+eq('the coordinates come along for the ETA chain', [walk.x, walk.y], [100, 200]);
+eq('a walk has no length of its own -- it is all travel', walk.duration, 0);
+eq('and no job id', walk.jobId, 0);
+
+// The Guidepost path passes only (id, type). Inventing a position would make the
+// ETA chain teleport every following job to (0,0).
+const blind = makeWalkEntry({ taskType: 'walk', type: 'fair', unitId: null }, 'Séta');
+eq('no coordinates stays unknown, not zero', [blind.x, blind.y], [null, null]);
+eq('a missing unitId is kept as null', blind.unitId, null);
+
+eq('a walk is diverted', divertibleEntry({ post: { taskType: 'walk', type: 'fort' } }).taskType, 'walk');
+eq('a duel is not something we can rebuild',
+   divertibleEntry({ post: { taskType: 'duel', playerId: 5 } }), null);
+eq('a task with no post at all is not diverted', divertibleEntry({}), null);
+
+const walkStored = sanitizeJobs([
+    { taskType: 'walk', walkType: 'fort', unitId: 77, x: 100, y: 200, jobName: 'Séta ide: erőd' },
+    { taskType: 'walk', walkType: 'fair', unitId: null },     // no coordinates: still valid
+    { taskType: 'walk', unitId: 3 },                          // no target: meaningless
+]);
+eq('walks survive storage', walkStored.length, 2);
+eq('...with their target intact', [walkStored[0].walkType, walkStored[0].unitId], ['fort', 77]);
+eq('...and zero length, not the 15-minute default', walkStored[0].duration, 0);
+eq('a coordinate-less walk stays coordinate-less', [walkStored[1].x, walkStored[1].y], [null, null]);
+eq('a walk with no target is dropped', walkStored.every(w => !!w.walkType), true);
+
+// A walk with no coordinates has no knowable length: the server resolves the
+// target. Rendering it as 00:00:00 would claim it is instantaneous -- and would
+// also make every ETA behind it look earlier than it will be.
+eval([extract('durationUnknown'), extract('formatEta')].join('\n'));
+eq('a walk without coordinates has an unknown length',
+   durationUnknown({ taskType: 'walk', x: null }), true);
+eq('...but one with them does not',
+   durationUnknown({ taskType: 'walk', x: 100, y: 200 }), false);
+eq('an ordinary job is never unknown', durationUnknown({ taskType: 'job', x: 1, y: 2 }), false);
+eq('and neither is a sleep', durationUnknown({ taskType: 'sleep', x: 0, y: 0 }), false);
+eq('an unknown length shows a question mark, not a finish time',
+   formatEta({ start: 0, finish: 0 }, true), `${clockHM(0)}→?`);
+eq('a known one still shows both ends',
+   formatEta({ start: 0, finish: 3600000 }, false), `${clockHM(0)}→${clockHM(3600000)}`);
+
+// A null cost would read as "not known yet" and stop the whole energy chain behind
+// it, so a walk has to say zero out loud.
+// Built under its own name: `jobEnergyCost` is a stub the other sections reassign,
+// so extracting it into this scope would clobber them.
+const realJobEnergyCost = new Function('jobInfoCache',
+    extract('jobEnergyCost') + '\nreturn jobEnergyCost;')(new Map());
+eq('walking costs no energy', realJobEnergyCost({ taskType: 'walk', jobId: 0 }), 0);
+eq('an unknown job cost is still unknown',
+   realJobEnergyCost({ taskType: 'job', jobId: 9, duration: 15 }), null);
 
 // A sleeping character cannot be challenged to a duel, so with no work we do NOT
 // wake up -- not even at full energy. Only when there is something to do.

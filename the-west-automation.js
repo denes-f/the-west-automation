@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.15)
+// @name         The-West Modular Job Queue (Lisa v12.16)
 // @namespace   http://tampermonkey.net/
-// @version     12.15
+// @version     12.16
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -88,6 +88,7 @@
     let dialogCloseTimer = null;
     let lastSeenQueueLen = 0;
     let inFlightBatch = null;        // what we just handed to the game, until the response
+    let handingOver = false;         // our own TaskQueue.add is in flight -- don't divert it
     let lastForecast = [];           // per-job energy/motivation forecast
     let renderedPendingKey = '';
     let pendingObserver = null;
@@ -323,19 +324,28 @@
     // The game's queue is sequential: extra jobs run after the one that finishes
     // LAST, not at the first free slot. The chain starts there, where that job
     // ends -- which is why its location matters too, for the travel time.
+    // When a queue entry really finishes. A sleep always goes in as 8 hours, but we
+    // cancel it as soon as its goal is met -- so the PREDICTED wake-up is the honest
+    // answer, otherwise everything behind it slips eight hours out. Shared by the
+    // ETA chain and by the slot times the forecast books its costs against: if those
+    // two disagreed, the energy would be shown as spent at a different moment from
+    // the one the times imply.
+    function taskFinishAt(e, now) {
+        let done = e && e.data && e.data.date_done;
+        if (typeof done !== 'number') return null;
+        if (e.type === 'sleep') {
+            const wake = now + msUntilEnergyAtRate(sleepGoalForTask(e), sleepPerHour(e));
+            done = Math.min(done, wake);
+        }
+        return done;
+    }
+
     function queueTailAnchor() {
         const now = Date.now();
         let tail = null;
         if (gameReady()) {
             for (const e of window.TaskQueue.queue) {
-                let done = e && e.data && e.data.date_done;
-                // A sleep always goes in as 8 hours, but we cancel it as soon as the
-                // energy is full -- so we anchor the chain to the PREDICTED wake-up,
-                // otherwise every job behind it would slip eight hours out.
-                if (e && e.type === 'sleep' && typeof done === 'number') {
-                    const wake = now + msUntilEnergyAtRate(sleepGoalForTask(e), sleepPerHour(e));
-                    done = Math.min(done, wake);
-                }
+                const done = taskFinishAt(e, now);
                 if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
                     // For a sleep the coordinates live in data, not in post.
                     const p = (e.post && typeof e.post.x === 'number') ? e.post
@@ -463,6 +473,10 @@
     }
 
     function jobEnergyCost(job) {
+        // Walking costs nothing -- it is pure travel. Saying so explicitly matters:
+        // a null here would be read as "we don't know yet" and would stop the whole
+        // energy chain behind it.
+        if (job.taskType === 'walk') return 0;
         const info = jobInfoCache.get(job.jobId);
         const cost = info && info.costs ? info.costs[job.duration] : undefined;
         return typeof cost === 'number' ? cost : null;   // until we know it, we don't guess
@@ -570,7 +584,43 @@
             return energyAt + Math.ceil((need - energy) / perHour * 3600) * 1000;
         };
 
-        return jobs.map((job, i) => {
+        // The energy alone does not say WHEN a job is handed over: it also needs a
+        // free slot in the game's queue. Without this the whole list's costs land on
+        // the same instant whenever the energy is comfortable -- readyFor() returns
+        // the carried moment and the carried moment never moves -- and the energy
+        // clock then reports every job as already paid for at time zero. Measured
+        // symptom on the main account: rows reading "100 -> 100" at 118 energy,
+        // which is the entire list's cost taken up front and then clipped by the
+        // ceiling on the way back up.
+        //
+        // Slots free in a known order: the ones free right now, then the jobs
+        // already in the game's queue as they finish, then our own. So the (i+1)-th
+        // slot to free is what job i goes into.
+        const limit = (typeof opts.queueLimit === 'number' && opts.queueLimit > 0)
+            ? opts.queueLimit : null;
+        const queued = Array.isArray(opts.queuedFinishes) ? opts.queuedFinishes : [];
+        const immediate = limit === null ? Infinity : Math.max(0, limit - queued.length);
+        const slotFreeAt = (i) => {
+            if (i < immediate) return now;                       // a slot is already free
+            const k = i - immediate;
+            if (k < queued.length) return queued[k];             // a game job frees it
+            // ...beyond that, our own jobs free the slots. i - limit < i always, so
+            // this can never depend on the job itself.
+            const own = etas[i - limit];
+            return (own && own.finish) || now;
+        };
+
+        // Every moment energy actually changes hands, in time order. The row-by-row
+        // walk below cannot answer "what will I have when THIS job finishes",
+        // because with the queue fed ahead the NEXT job's cost is typically taken
+        // while this one is still running. So we record the events and replay them
+        // afterwards (attachEnergyLevels).
+        const events = [];
+        // Set the moment a cost we cannot know breaks the chain; nothing after that
+        // point may be presented as a number.
+        let chainBroken = false;
+
+        const out = jobs.map((job, i) => {
             const start = (etas[i] && etas[i].start) || now;
             const cost = opts.costOf(job);
             const base = opts.motivationOf(job.jobId);
@@ -583,8 +633,12 @@
             if (job.taskType === 'sleep') {
                 const target = opts.sleepTargetOf ? opts.sleepTargetOf(job, i) : null;
                 const energyBefore = levelAt(Math.max(energyAt, start));
+                const wakesAt = (etas[i] && etas[i].finish) || start;
+                // A sleep does not pay a cost, it SETS the level -- so the replay
+                // needs it as an absolute reading, not as a subtraction.
+                if (typeof target === 'number') events.push({ at: wakesAt, set: target });
                 energy = target;
-                energyAt = (etas[i] && etas[i].finish) || start;
+                energyAt = wakesAt;
                 return {
                     id: job.id, cost: null, motivation: null,
                     energyBefore, energyAfter: target, waitMs: 0,
@@ -595,26 +649,49 @@
             // While we don't know the cost we don't guess -- and we must not move the
             // chain on either, or the jobs behind it would be forecast off a number
             // nobody computed.
+            //
+            // From here on the energy clock is BLIND: it will book no further costs,
+            // so every later reading is the last known level, unchanged, and it looks
+            // like a confident flat number. v12.15 showed nothing for such a row and
+            // that was right; `chainBroken` restores it, for this row and all behind
+            // it (attachEnergyLevels stops here).
             if (energy === null || cost === null) {
+                chainBroken = true;
                 return {
-                    id: job.id, cost, motivation,
+                    id: job.id, cost, motivation, chainBroken: true,
                     energyBefore: levelAt(Math.max(energyAt, start)), energyAfter: null, waitMs: 0,
                     lowMotivation: motivation !== null && motivation <= opts.motivationWarn,
                     notEnoughEnergy: false,
                 };
             }
+            if (chainBroken) {
+                return {
+                    id: job.id, cost, motivation, chainBroken: true,
+                    energyBefore: null, energyAfter: null, waitMs: 0,
+                    lowMotivation: motivation !== null && motivation <= opts.motivationWarn,
+                    notEnoughEnergy: false,
+                };
+            }
 
-            const payAt = readyFor(cost);
+            // Handed over when BOTH are true: the energy covers it and a slot is
+            // free. A slot always frees no later than the job could start, so this
+            // never adds to waitMs -- it only puts the deduction at the right moment.
+            const readyAt = readyFor(cost);
+            const payAt = isFinite(readyAt) ? Math.max(readyAt, slotFreeAt(i)) : readyAt;
             // With no regeneration at all the energy simply never gets there. We keep
             // draining into the negative rather than stopping: the shortfall is the
             // useful number to show, and it is what the sleep offer is sized from.
             const reachable = isFinite(payAt);
             const energyBefore = levelAt(reachable ? payAt : energyAt);
             const energyAfter = energyBefore - cost;
-            const waitMs = reachable ? Math.max(0, payAt - start) : Infinity;
+            // Measured against the ENERGY's readiness only, never the slot's: waiting
+            // for a slot is what the queue does anyway and is already in the ETAs, so
+            // counting it here would push every start time out a second time.
+            const waitMs = reachable ? Math.max(0, readyAt - start) : Infinity;
 
             energy = energyAfter;
             if (reachable) energyAt = payAt;
+            if (reachable) events.push({ at: payAt, cost });
             committed[job.jobId] = (committed[job.jobId] || 0) + cost;
 
             return {
@@ -630,6 +707,61 @@
                 notEnoughEnergy: waitMs > 0,
             };
         });
+
+        // The clock travels with the forecast rather than being recomputed later,
+        // because only this pass knows the starting pair and every payment moment.
+        // Non-enumerable so it stays out of comparisons and of anything serialised.
+        Object.defineProperty(out, 'energyClock', {
+            value: makeEnergyClock(opts.energyAt(now), now, perHour, max, events, opts.initialCarry,
+                                   (etas[0] && etas[0].start) || now),
+        });
+        return out;
+    }
+
+    // Energy at an ARBITRARY moment, replaying every change in time order.
+    //
+    // This is what the panel shows, and it is not derivable from a single row: the
+    // cost is taken when the game accepts the job, which -- because the queue is fed
+    // ahead -- is typically while the PREVIOUS job is still running. So by the time
+    // a job finishes, the next one's cost may already be gone. Conversely, energy
+    // keeps regenerating after a cost is paid, so a row that reads "0 left" at
+    // hand-over is not still 0 an hour later when the job actually ends.
+    function makeEnergyClock(startEnergy, startAt, perHour, max, events, initialCarry, carryAt) {
+        let base = startEnergy, baseAt = startAt;
+        if (typeof initialCarry === 'number') { base = initialCarry; baseAt = carryAt; }
+        const sorted = events.slice().filter(e => isFinite(e.at)).sort((a, b) => a.at - b.at);
+        return (ms) => {
+            if (base === null || typeof ms !== 'number' || !isFinite(ms)) return null;
+            let e = base, at = baseAt;
+            for (const ev of sorted) {
+                if (ev.at > ms) break;
+                // A sleep sets the level outright; a job subtracts its cost.
+                e = (typeof ev.set === 'number')
+                    ? ev.set
+                    : Math.min(max, e + perHour * Math.max(0, ev.at - at) / 3600000) - ev.cost;
+                at = ev.at;
+            }
+            return Math.floor(Math.min(max, e + perHour * Math.max(0, ms - at) / 3600000));
+        };
+    }
+
+    // "What will I have while this job runs": the level when it starts and when it
+    // finishes, with everything paid in between already taken off. Attached after
+    // the ETAs have been pushed out by the energy waits, so the times are final.
+    function attachEnergyLevels(etas, forecast) {
+        const clock = forecast.energyClock;
+        if (typeof clock !== 'function') return forecast;
+        for (let i = 0; i < forecast.length; i++) {
+            const f = forecast[i];
+            // Past the first unknown cost the clock books nothing more, so it would
+            // keep returning the same level for every remaining row -- a flat pair
+            // that looks like a prediction but is only the last thing we knew.
+            if (!f || f.chainBroken) break;
+            if (!etas[i]) continue;
+            f.energyAtStart = clock(etas[i].start);
+            f.energyAtFinish = clock(etas[i].finish);
+        }
+        return forecast;
     }
 
     // A job cannot start before the game has taken it, and the game only takes it
@@ -673,6 +805,13 @@
     // offset. The formula was read out of the game (WestUi.updateEnergy), so our
     // own bar looks pixel-identical -- only fainter, because it is a prediction.
     const ENERGY_BAR_WIDTH = 137;
+
+    // Queue widget geometry, all measured live: a tile is 112x67 and they wrap two
+    // per row, our separator is one thin line, and we keep the widget off the very
+    // top edge of the screen.
+    const QUEUE_TILE_HEIGHT = 67;
+    const QUEUE_SEPARATOR_H = 20;
+    const QUEUE_WIDGET_MARGIN = 8;
 
     function energySpriteY() {
         try {
@@ -752,8 +891,12 @@
         const width = (real && real.offsetWidth) || ENERGY_BAR_WIDTH;
         const c = window.Character;
         const max = (c && c.maxEnergy) || 100;
+        // "At the end of the list" means when the last job FINISHES -- not the moment
+        // its cost was taken, which is typically a whole job-length earlier. Reading
+        // energyAfter here made the bar undershoot by exactly that much regeneration.
         const last = lastForecast.length ? lastForecast[lastForecast.length - 1] : null;
-        const value = last && typeof last.energyAfter === 'number' ? last.energyAfter : null;
+        const value = last && typeof last.energyAtFinish === 'number' ? last.energyAtFinish
+                    : (last && typeof last.energyAfter === 'number' ? last.energyAfter : null);
 
         // Nothing to predict with an empty list or an unknown cost.
         if (value === null || !extraJobs.length) {
@@ -799,6 +942,19 @@
         fetchHotelRooms(townId, () => {});
     }
 
+    // When each task already in the game's queue finishes, ascending. Every one of
+    // them frees a slot, which is what lets the next of our jobs be handed over --
+    // and therefore when its energy is actually spent. date_done is in
+    // MILLISECONDS on a queue entry (the add response uses seconds; don't mix them).
+    function gameQueueFinishes() {
+        if (!gameReady()) return [];
+        const now = Date.now();
+        return window.TaskQueue.queue
+            .map(t => taskFinishAt(t, now))
+            .filter(v => typeof v === 'number' && v > 0)
+            .sort((a, b) => a - b);
+    }
+
     function forecastForExtraQueue(jobs, etas) {
         const c = window.Character;
         return computeForecast(jobs, etas, {
@@ -808,6 +964,10 @@
             // the forecast has to pay each cost at the moment the energy reaches it.
             perHour: energyPerHour(),
             maxEnergy: (c && c.maxEnergy) || 100,
+            // ...and only once a slot frees for it, which is what spaces the
+            // deductions out over time instead of stacking them all on `now`.
+            queueLimit: gameQueueLimit(),
+            queuedFinishes: gameQueueFinishes(),
             costOf: jobEnergyCost,
             motivationOf: jobMotivation,
             energyAt,
@@ -822,10 +982,14 @@
     // but the start times DO depend on the energy -- a job that has to wait for it
     // starts later. So: chain the ETAs, forecast the energy, then push the ETAs out
     // by whatever the energy delayed.
+    // ...and only then can the levels the panel shows be read off, because they are
+    // levels at the FINAL start and finish times.
     function planExtraQueue(jobs) {
         const chained = computeEtas(jobs);
         const forecast = forecastForExtraQueue(jobs, chained);
-        return { etas: applyEnergyDelays(chained, forecast), forecast };
+        const etas = applyEnergyDelays(chained, forecast);
+        attachEnergyLevels(etas, forecast);
+        return { etas, forecast };
     }
 
     // ------------------------------------------------------------
@@ -1010,6 +1174,40 @@
             // Starting value only: the actual length is computed live.
             duration: estimateSleepSeconds(room, sleepMode, 0),
         };
+    }
+
+    // ------------------------------------------------------------
+    //  Walking
+    // ------------------------------------------------------------
+    // Walking to a fort, a quest giver or the county fair is a queue entry of its
+    // own (TaskWalk), added through the very same TaskQueue.add -- so a full queue
+    // discards it silently, exactly like a job. Measured shape of an unqueued one:
+    //   post = {taskType:'walk', type, unitId, x, y}   (x/y absent on some paths)
+    //   getDuration() === 0  -- a walk's whole length IS the travel
+    // so it rebuilds exactly, and computeEtas already turns the coordinates into
+    // the time it takes. Zero duration is right, not a placeholder.
+    function makeWalkEntry(post, displayName) {
+        const hasPos = typeof post.x === 'number' && typeof post.y === 'number';
+        return {
+            id: generateId(), retries: 0, deferrals: 0, rejections: 0,
+            taskType: 'walk',
+            walkType: post.type || '',
+            unitId: (post.unitId === null || post.unitId === undefined) ? null : post.unitId,
+            jobName: displayName || 'Séta',
+            jobId: 0,
+            // Without coordinates we must NOT invent a position: computeEtas would
+            // chain every following job off a made-up place. x:null leaves the
+            // character where it was, which only costs us the travel estimate.
+            x: hasPos ? post.x : null,
+            y: hasPos ? post.y : null,
+            duration: 0,
+        };
+    }
+
+    function walkDisplayName(post) {
+        const names = { fort: 'erőd', questgiver: 'küldetésadó', fair: 'megyei vásár', town: 'város' };
+        const what = names[post && post.type] || (post && post.type) || '';
+        return what ? `Séta ide: ${what}` : 'Séta';
     }
 
     // The hotel window's start button calls HotelWindow.start (read out of the
@@ -1302,7 +1500,10 @@
     // the "how long should I sleep?" question for a sleep that had no job after
     // it at all.
     function countWorkWaiting(sleepTask) {
-        let n = extraJobs.filter(j => j && j.taskType !== 'sleep').length;
+        // A walk is not work either: it costs no energy, so cutting a sleep short
+        // for one gains nothing. The game-queue side below already excludes them,
+        // because a walk's post carries no jobId.
+        let n = extraJobs.filter(j => j && j.taskType !== 'sleep' && j.taskType !== 'walk').length;
         if (gameReady()) {
             const q = window.TaskQueue.queue;
             const after = sleepTask ? q.indexOf(sleepTask) : -1;
@@ -1358,8 +1559,19 @@
         return days > 0 ? `+${days}` : '';
     }
 
-    function formatEta(eta) {
-        return `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
+    // A walk's length IS its travel, so without the target's coordinates we simply
+    // do not know how long it takes -- the Guidepost path passes only (id, type)
+    // and the server resolves the rest. Rendering that as 00:00:00 would claim the
+    // walk is instantaneous, which is worse than admitting we don't know: it also
+    // makes every ETA behind it look earlier than it will be.
+    function durationUnknown(job) {
+        return !!job && job.taskType === 'walk' && typeof job.x !== 'number';
+    }
+
+    function formatEta(eta, unknownLength) {
+        return unknownLength
+            ? `${clockHM(eta.start)}→?`
+            : `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
     }
 
     // ------------------------------------------------------------
@@ -1397,9 +1609,9 @@
     function pendingIconUrl(job) {
         try {
             if (!gameReady()) return null;
-            const probe = job.taskType === 'sleep'
-                ? new window.TaskSleep(job.townId, job.room)
-                : new window.TaskJob(job.jobId, job.x, job.y, job.duration);
+            // Measured: an UNQUEUED task already answers getIcon(), for a walk too
+            // (it returns the game's own walk.png).
+            const probe = buildGameTask(job);
             const icon = typeof probe.getIcon === 'function' ? probe.getIcon() : null;
             return (typeof icon === 'string' && icon) ? icon : null;
         } catch(e) { return null; }
@@ -1471,19 +1683,77 @@
         return (q && q.isConnected) ? q : null;
     }
 
+    function isOurRow(el) {
+        return el.classList.contains('lisa-pending')
+            || el.classList.contains('lisa-pending-sep')
+            || el.classList.contains('lisa-pending-more');
+    }
+
     function clearPendingRows(host) {
         host.querySelectorAll('.lisa-pending, .lisa-pending-sep, .lisa-pending-more')
             .forEach(el => el.remove());
     }
 
+    // The user can fold the whole queue widget away with the game's own arrow
+    // (#toggleTaskQueue). Measured live: collapsing puts an INLINE display:none on
+    // #queuedTasks and swaps #ui_workcontainer's class from 'expanded' to
+    // 'expandable'; expanding clears the inline style again. The class is therefore
+    // the only way to tell "the game hid it because it is empty" apart from "the
+    // user folded it away" -- and the second one we must not fight.
+    function queueWidgetCollapsed() {
+        const w = document.getElementById('ui_workcontainer');
+        return !!(w && w.classList.contains('expandable'));
+    }
+
     // The game hides #queuedTasks when nothing but the RUNNING task is in the
-    // queue -- and our waiting rows vanish with it. This used to be rare, but
-    // since we stopped feeding the game's queue during a sleep it is the typical
-    // state: one running sleep with our list behind it. If we have something to
-    // show, we override it. When empty we hand control back to the game -- an
-    // empty container with no children takes no space, so it isn't visible.
+    // queue -- and our waiting rows vanish with it. Since we stopped feeding the
+    // game's queue during a sleep that became the typical state: one running sleep
+    // with our list behind it. So we override it while we have something to show.
+    //
+    // Releasing it is NOT the same as clearing our inline style. The game's own
+    // hiding is an inline display:none too (jQuery slideUp), so `style.display = ''`
+    // wipes THE GAME'S state along with ours and leaves an empty container sitting
+    // on screen -- the stray empty widget seen live. So we put back the value the
+    // game itself would be holding: hidden when no real task is left, untouched
+    // when one is.
     function setPendingHostVisible(host, visible) {
-        host.style.display = visible ? 'block' : '';
+        if (queueWidgetCollapsed()) { host.style.display = 'none'; return; }
+        if (visible) { host.style.display = 'block'; return; }
+        const realTask = [...host.children].some(el => !isOurRow(el));
+        host.style.display = realTask ? '' : 'none';
+    }
+
+    // How many tiles the screen can actually take. Measured live: the widget is
+    // pinned to the BOTTOM of the viewport and grows UPWARD with no limit at all
+    // (#ui_workcontainer is max-height:none and does not clip), so a long list
+    // simply walks off the top of the screen -- 15 tiles already put its top at
+    // 62 px on a 700 px viewport, and with premium the game alone shows 9 of them.
+    // Pure arithmetic, kept apart from the measuring so it can be tested.
+    function previewForSpace(topPx, rowH, cap) {
+        if (!(rowH > 0)) return cap;
+        const room = topPx - QUEUE_WIDGET_MARGIN - QUEUE_SEPARATOR_H;
+        const rows = Math.floor(room / rowH);
+        if (rows < 1) return 1;                 // at worst only the "+N" tile
+        return Math.max(1, Math.min(cap, rows * 2));   // tiles wrap two per row
+    }
+
+    // Our own rows are already pushing the widget up, so their height has to be
+    // added back before budgeting -- otherwise the cap creeps down a little every
+    // round, the same trap as positioning the forecast bar. The separator carries
+    // clear:both, so our rows are one contiguous block at the end of the container.
+    function fittingPreview() {
+        const cap = CONFIG.GAME_QUEUE_PREVIEW;
+        const w = document.getElementById('ui_workcontainer');
+        const host = pendingHost();
+        if (!w || !host || typeof w.getBoundingClientRect !== 'function') return cap;
+        const ours = [...host.children].filter(isOurRow);
+        const ourHeight = ours.length
+            ? Math.max(0, ours[ours.length - 1].getBoundingClientRect().bottom
+                        - ours[0].getBoundingClientRect().top)
+            : 0;
+        const real = [...host.children].find(el => !isOurRow(el));
+        const rowH = (real && real.getBoundingClientRect().height) || QUEUE_TILE_HEIGHT;
+        return previewForSpace(w.getBoundingClientRect().top + ourHeight, rowH, cap);
     }
 
     // The game rebuilds the contents of #queuedTasks on every queue change, and
@@ -1508,7 +1778,8 @@
     }
 
     function buildPendingItem(job, eta, forecast) {
-        const item = document.createElement('span');
+        // A DIV, not a span -- see the "+N" tile below for why the game cares.
+        const item = document.createElement('div');
         item.className = 'task lisa-pending';   // 'task' brings the game's styling
         item.dataset.id = job.id;
 
@@ -1517,10 +1788,13 @@
         // starting with 5 s of travel shows as 00:00:20. We do the same, so where
         // there is no change of location only the job time shows, by itself.
         const travelSec = eta ? Math.round(eta.travelMs / 1000) : 0;
+        const noLength = durationUnknown(job);
         const time = document.createElement('div');
         time.className = 'taskTime';
         const p = document.createElement('p');
-        p.textContent = formatClock(travelSec + jobDurationSeconds(job, extraJobs.indexOf(job)));
+        p.textContent = noLength
+            ? '?'
+            : formatClock(travelSec + jobDurationSeconds(job, extraJobs.indexOf(job)));
         time.appendChild(p);
 
         const btns = document.createElement('div');
@@ -1555,11 +1829,13 @@
             item.dataset.warn = warnText;
         }
 
-        item.title = eta
-            ? (travelSec > 0
-                ? `${job.jobName} — út: ${formatDuration(travelSec)} + munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
-                : `${job.jobName} — munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`)
-            : `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`;
+        item.title = !eta
+            ? `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`
+            : noLength
+                ? `${job.jobName} — indulás: ${clockHM(eta.start)}, a hossza a célponttól függ`
+                : travelSec > 0
+                    ? `${job.jobName} — út: ${formatDuration(travelSec)} + munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
+                    : `${job.jobName} — munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`;
         if (warnText) item.title += `\n⚠ ${warnText}`;
 
         item.addEventListener('click', (e) => {
@@ -1594,16 +1870,20 @@
         }
         setPendingHostVisible(host, true);
 
-        const split = previewSplit(extraJobs.length, CONFIG.GAME_QUEUE_PREVIEW);
+        const preview = fittingPreview();
+        const split = previewSplit(extraJobs.length, preview);
         const shown = extraJobs.slice(0, split.shown);
         const hidden = split.hidden;
         // The watcher calls every 2 s. We only rebuild when the list changed, or when
         // our rows disappeared during the game's redraw (self-healing).
         // The warnings are part of the key too: if a job's motivation or energy
-        // crosses the threshold, the rows have to be redrawn.
-        const forecast = planExtraQueue(extraJobs).forecast;
+        // crosses the threshold, the rows have to be redrawn. So is the preview
+        // count, which shrinks when the window does.
+        const plan = planExtraQueue(extraJobs);
+        const forecast = plan.forecast;
+        const etas = plan.etas;
         const warnKey = forecast.slice(0, shown.length).map(f => (forecastWarning(f) ? '1' : '0')).join('');
-        const key = `${extraJobs.length}|${shown.map(j => j.id).join(',')}|${warnKey}`;
+        const key = `${extraJobs.length}|${preview}|${shown.map(j => j.id).join(',')}|${warnKey}`;
         if (key === renderedPendingKey && host.querySelector('.lisa-pending-sep')) return;
         renderedPendingKey = key;
 
@@ -1619,7 +1899,11 @@
         shown.forEach((job, i) => host.appendChild(buildPendingItem(job, etas[i], forecast[i])));
 
         if (hidden > 0) {
-            const more = document.createElement('span');
+            // A DIV, not a span: TaskQueueUi.taskCancelling decides the widget is
+            // empty with $('#queuedTasks span').length, so our tiles being spans
+            // made the game think a task was still there. Measured: div.task and
+            // span.task render identically (112x67, same icon box).
+            const more = document.createElement('div');
             // 'task' brings the game's tile size so the "+N" sits exactly on one job
             // slot. Clicking it raises our own panel -- the full list is there.
             more.className = 'task lisa-pending lisa-pending-more';
@@ -1649,20 +1933,107 @@
     // queue. If we didn't put them back, the jobs would be lost SILENTLY -- which
     // is exactly what happened live with 8 jobs. So we remember what we handed
     // over and, from the response, put the rejected ones back at the front.
+    function buildGameTask(j) {
+        if (j.taskType === 'sleep') return new window.TaskSleep(j.townId, j.room);
+        if (j.taskType === 'walk') {
+            return (typeof j.x === 'number' && typeof j.y === 'number')
+                ? new window.TaskWalk(j.unitId, j.walkType, j.x, j.y)
+                : new window.TaskWalk(j.unitId, j.walkType);
+        }
+        return new window.TaskJob(j.jobId, j.x, j.y, j.duration);
+    }
+
     function startJobsViaGame(jobs) {
         if (!gameReady() || !jobs.length) return 0;
         const before = gameQueueLength();
         try {
-            window.TaskQueue.add(jobs.map(j => j.taskType === 'sleep'
-                ? new window.TaskSleep(j.townId, j.room)
-                : new window.TaskJob(j.jobId, j.x, j.y, j.duration)));
+            handingOver = true;
+            window.TaskQueue.add(jobs.map(buildGameTask));
         } catch(e) {
             console.error('[Lisa] TaskQueue.add failed:', e);
             return 0;
+        } finally {
+            handingOver = false;
         }
         const accepted = Math.max(0, gameQueueLength() - before);
         inFlightBatch = accepted > 0 ? { jobs: jobs.slice(0, accepted), at: Date.now() } : null;
         return accepted;
+    }
+
+    // ============================================================
+    //  4b. CATCHING WHAT THE GAME WOULD THROW AWAY
+    // ============================================================
+    // TaskQueue.add TRUNCATES silently when the queue is full. Read out of the
+    // bundle, verbatim:
+    //     if (taskLimit < obj.queue.length + tasks.length)
+    //         limitedTasks = tasks.slice(0, taskLimit - obj.queue.length);
+    // The sliced-off tasks are simply gone: no request, no message, no error. For
+    // jobs we never hit this, because we hand over exactly what fits -- but every
+    // OTHER way the game queues something goes straight through it. Reported live:
+    // starting a walk on a full queue and having it vanish.
+    //
+    // So we wrap add(), let the game do its own thing with what fits, and keep the
+    // overflow in our list instead of letting it evaporate. Only task types we can
+    // rebuild exactly are diverted; anything else is left to the game's behaviour,
+    // but at least said out loud instead of disappearing.
+    const DIVERTIBLE = { walk: true };
+
+    function divertibleEntry(task) {
+        const post = task && task.post;
+        if (!post || !DIVERTIBLE[post.taskType]) return null;
+        if (post.taskType === 'walk') return makeWalkEntry(post, walkDisplayName(post));
+        return null;
+    }
+
+    // What the game will drop out of this batch, by its own arithmetic.
+    function overflowOfBatch(tasks, queueLength, limit) {
+        const free = Math.max(0, limit - queueLength);
+        return tasks.length > free ? tasks.slice(free) : [];
+    }
+
+    function patchTaskQueueAdd() {
+        const tq = window.TaskQueue;
+        if (!tq || tq.__lisaAddPatched || typeof tq.add !== 'function') return;
+        const origAdd = tq.add.bind(tq);
+        tq.__lisaAddPatched = true;
+        tq.add = function(tasks) {
+            // Our own hand-over already sized itself to the free slots, and it needs
+            // the raw return value -- never divert our own batch back into our list.
+            if (handingOver) return origAdd(tasks);
+
+            const list = Array.isArray(tasks) ? tasks : [tasks];
+            const over = overflowOfBatch(list, gameQueueLength(), gameQueueLimit());
+            if (!over.length) return origAdd(tasks);
+
+            const kept = list.slice(0, list.length - over.length);
+            const diverted = [];
+            const lost = [];
+            over.forEach(t => {
+                const entry = divertibleEntry(t);
+                if (entry && extraJobs.length < CONFIG.MAX_EXTRA_QUEUE) diverted.push(entry);
+                else lost.push(t);
+            });
+
+            if (diverted.length) {
+                extraJobs.push(...diverted);
+                saveExtraQueueToStorage();
+                console.log(`[Lisa] The queue was full: ${diverted.length} task(s) moved into the`
+                    + ` extra queue instead of being discarded (${extraJobs.length} in total).`);
+                updateUI();
+                updateUIStatus(`${diverted.length} feladat a várólistára került `
+                    + `(${extraJobs.length} várakozik).`);
+                ensureProcessing(CONFIG.NEW_WORK_DELAY);
+            }
+            if (lost.length) {
+                console.warn(`[Lisa] The game is dropping ${lost.length} task(s) it has no room for`
+                    + ` (${lost.map(t => (t.post && t.post.taskType) || t.type).join(', ')})`
+                    + ' -- this type cannot be re-queued.');
+            }
+            // Hand the game only what it would have kept anyway, so it does not
+            // truncate a second time.
+            return origAdd(kept);
+        };
+        console.log('[Lisa] TaskQueue.add is watched: a full queue no longer discards tasks.');
     }
 
     // ============================================================
@@ -2369,11 +2740,18 @@
     }
 
     function sanitizeJobs(list) {
+        const usable = j => {
+            if (!j) return false;
+            if (j.taskType === 'sleep') return parseInt(j.townId, 10) > 0 && !!j.room;
+            // A walk is identified by its target, not by a job id. Without a type
+            // the game could not be told where to go, so such an entry is dropped.
+            if (j.taskType === 'walk') return !!j.walkType;
+            return j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10));
+        };
         return list
-            .filter(j => j && (j.taskType === 'sleep'
-                ? (parseInt(j.townId, 10) > 0 && !!j.room)
-                : (j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10)))))
+            .filter(usable)
             .map(j => {
+                const isWalk = j.taskType === 'walk';
                 const base = {
                     id: j.id || generateId(),
                     retries: parseInt(j.retries, 10) || 0,
@@ -2383,7 +2761,10 @@
                     jobId: parseInt(j.jobId, 10) || 0,
                     x: parseInt(j.x, 10) || 0,
                     y: parseInt(j.y, 10) || 0,
-                    duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION,
+                    // A walk's length IS its travel, so zero is the right stored
+                    // value -- the usual DEFAULT_DURATION fallback would invent
+                    // fifteen minutes of standing still.
+                    duration: isWalk ? 0 : (parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION),
                     taskType: j.taskType || 'job',
                 };
                 // A sleep has no job id; the town and the room describe it.
@@ -2393,16 +2774,44 @@
                     base.sleepMode = j.sleepMode === 'enough' ? 'enough' : 'full';
                     base.modeChosen = !!j.modeChosen;
                 }
+                if (isWalk) {
+                    base.walkType = j.walkType;
+                    base.unitId = (j.unitId === null || j.unitId === undefined) ? null : j.unitId;
+                    // No coordinates is a real state, not a zero: it means "we don't
+                    // know where this ends", and the ETA chain has to leave the
+                    // character where it was rather than teleport it to (0,0).
+                    const hasPos = typeof j.x === 'number' && typeof j.y === 'number';
+                    base.x = hasPos ? j.x : null;
+                    base.y = hasPos ? j.y : null;
+                }
                 return base;
             })
             .slice(0, CONFIG.MAX_EXTRA_QUEUE);
     }
 
+    // Everything sanitizeJobs needs to accept the entry back has to be written --
+    // it filters a sleep on townId and a walk on walkType, so an entry saved
+    // without them is silently dropped on the next load. That is how a queued
+    // sleep used to disappear across a reload.
     function saveExtraQueueToStorage() {
-        saveStore(CONFIG.STORAGE_EXTRA_QUEUE, extraJobs.map(j => ({
-            id: j.id, retries: j.retries, deferrals: j.deferrals || 0, jobName: j.jobName,
-            jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
-        })));
+        saveStore(CONFIG.STORAGE_EXTRA_QUEUE, extraJobs.map(j => {
+            const out = {
+                id: j.id, retries: j.retries, deferrals: j.deferrals || 0,
+                rejections: j.rejections || 0, jobName: j.jobName,
+                jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
+            };
+            if (j.taskType === 'sleep') {
+                out.townId = j.townId;
+                out.room = j.room;
+                out.sleepMode = j.sleepMode;
+                out.modeChosen = !!j.modeChosen;
+            }
+            if (j.taskType === 'walk') {
+                out.walkType = j.walkType;
+                out.unitId = j.unitId;
+            }
+            return out;
+        }));
     }
 
     function loadExtraQueueFromStorage() {
@@ -2755,7 +3164,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.15',
+        version: '12.16',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -2824,6 +3233,7 @@
     function watchGameQueue() {
         ensureMenuButton();
         patchHotelStart();      // the hotel window may load later too
+        patchTaskQueueAdd();    // ...and so may TaskQueue itself
         updateQueueBadge();
         updateExtraEtas(refreshForecast());
         updateEnergyForecastBar();
@@ -3304,12 +3714,34 @@
         warnEl.title = reasons.length ? `${job.jobName} – ${reasons.join(', ')}` : '';
         li.classList.toggle('lisa-row-warn', reasons.length > 0);
 
-        // The energy is taken when the job goes INTO the game's queue, not when it
-        // starts running -- saying "induláskor" here promised regeneration that will
-        // already have been spent by then.
-        energyEl.textContent = f.energyAfter === null ? '' : `⚡${Math.max(0, f.energyAfter)}`;
-        energyEl.title = f.energyAfter === null ? '' :
-            `A játék sorába kerülve ${f.energyBefore} energia, a munka ${f.cost}-t visz, marad ${f.energyAfter}`
+        // What the row shows is the energy WHILE THIS JOB RUNS: the level when it
+        // starts and when it finishes. The cost itself is taken earlier, when the
+        // game accepts the job -- that belongs in the tooltip, not in the headline
+        // number. Showing the post-deduction figure as if it were frozen was wrong
+        // in the other direction: energy keeps regenerating both while the job waits
+        // in the game's queue and while it runs.
+        // The energy LEFT once this job is paid for. This is the pay chain, and it is
+        // the only reading that carries a signal on every row: it steps down by the
+        // job's own cost (and back up wherever regeneration outpaces the costs).
+        //
+        // The obvious-looking alternative -- the level while the job actually RUNS --
+        // was tried and taken out again. The game is fed `limit` jobs ahead, so a
+        // job's energy is gone long before it starts, and the last `limit` rows of
+        // every list came out identical. Truthful, but flat exactly where the list
+        // gets interesting. It stays in the tooltip.
+        const left = f.energyAfter;
+        const known = typeof left === 'number';
+        energyEl.textContent = known ? `⚡${Math.max(0, left)}` : '';
+        const running = (typeof f.energyAtStart === 'number' && typeof f.energyAtFinish === 'number')
+            ? `\nMire elindul, a mögötte lévők energiája is lement:`
+              + ` induláskor ${f.energyAtStart}, a végén ${f.energyAtFinish}.`
+            : '';
+        energyEl.title = !known ? '' :
+            (f.cost === null || f.energyBefore === null
+                ? `Várható energia: ${left}`
+                : `A munka energiáját a játék már a sorba kerüléskor levonja:`
+                  + ` akkor ${f.energyBefore} energia van, ${f.cost} fogy, marad ${left}.`)
+            + running
             + (f.motivation === null ? '' : `\nMotiváció induláskor: ${f.motivation}%`);
         energyEl.classList.toggle('lisa-energy-low', !!f.notEnoughEnergy);
     }
@@ -3336,10 +3768,14 @@
             paintForecastRow(li, extraJobs[i], forecast[i]);
             const el = li.querySelector('.lisa-eta');
             if (!el) return;
-            el.textContent = formatEta(eta);
             const job = extraJobs[i];
             const f = forecast[i];
-            el.title = (eta.travelMs >= 1000
+            const noLength = durationUnknown(job);
+            el.textContent = formatEta(eta, noLength);
+            el.title = (noLength
+                ? `Indulás ${clockHM(eta.start)} — a séta hossza csak a célpont ismeretében derül ki,`
+                  + ` ezért a mögötte lévő időpontok is korábbiak a valósnál`
+                : eta.travelMs >= 1000
                 ? `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — út: ${formatDuration(eta.travelMs / 1000)}, munka: ${formatDuration(job.duration)}`
                 : `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — munka: ${formatDuration(job.duration)}`)
                 // The energy is what holds it up, not the queue: say so, otherwise the
@@ -3421,5 +3857,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.15 loaded.');
+    console.log('[Lisa] Modular v12.16 loaded.');
 })();

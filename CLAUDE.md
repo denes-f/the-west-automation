@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 262 assertions, no dependencies.
+  name and runs them against stubs. 334 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,7 +15,7 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.15.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.16.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
 
 ## Picking up a new session
@@ -24,7 +24,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `262 passed, 0 failed`.
+2. `node test-queue.js` should print `334 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -114,6 +114,22 @@ was re-read out of the bundle, but the new forecast has only run against unit te
 at a list the energy can't keep up with — the ⚠ should sit on the first job that has to wait (and on
 that one only), the row tooltip should say how much of the delay is the energy, and the ⚡ figure
 should never promise energy the game will already have taken.
+
+**Verified live in the game, v12.16** (hu27, installed build, one session, 5 energy net):
+the walk diversion (queue at 4/4, `TaskQueue.add(new TaskWalk(...))` → the game's queue stayed at 4
+and the walk appeared in our list instead of vanishing); our tiles being `<div>`s, so
+`$('#queuedTasks span').length` returned only the game's own 4; the collapse fix (after
+`TaskQueueUi.toggleTasks()` the widget stayed folded through 5 s of watcher ticks — it used to be
+forced back open every second); the release path with real tasks still queued (inline style handed
+back, `(unset)`) and with the queue emptied (no stray element, everything at zero height); and the
+new `⚡A → B` row.
+
+**A caveat about testing the toggle**: `$('#toggleTaskQueue').click()` does *not* reach the handler.
+Call `TaskQueueUi.toggleTasks()` instead — that is the function the arrow ends up in.
+
+Still verified **only by unit tests** after v12.16: the space-budgeted preview (`previewForSpace`)
+was never seen against a list long enough to hit the cap, since the test character has 4 slots and
+no premium. That one needs the main account.
 
 Not measured, deliberately: motivation regeneration (believed to reset daily, hour unknown — the
 5-minute re-read makes this self-correcting; see the note under the architecture section).
@@ -233,6 +249,27 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   **Open question:** whether `energyRegen` really stays 0.03 at `maxEnergy` 150 (⇒ 4.5/h) or the
   server sends a smaller factor to keep 3/h. Reading the live pair on the main account settles it;
   either way the code is right, because it reads both from the game.
+- **Measured against the SERVER, v12.16** (hu27, level 10, max 100, `energyRegen` 0.03). The client
+  is only ever an extrapolation from `energyDate`, so the authoritative value has to come off the
+  wire — the add response carries a **fractional** `energy`, which is the only high-resolution
+  reading available (`Ajax.remoteCallMode("job","job",…)` carries none, and a job **completing**
+  sends no energy field and does **not** re-anchor `energyDate`).
+
+  | | |
+  | --- | --- |
+  | server energy at the anchor | 80.00004 |
+  | 19.87 min later, after paying 1 for a new job | 79.9938 |
+  | ⇒ observed | 0.9938 in 19.87 min = **3.001/h** |
+  | client claimed | **3.00/h** |
+
+  Two conclusions. **Energy regenerates while the character is working, at the full rate** — jobs
+  ran for the entire 19.87 minutes. And the **server agrees with the client's formula to three
+  decimals**, so the rate is not somewhere a wrong forecast can come from. If a forecast looks too
+  generous on the main account, check `energyRegen` × `maxEnergy` there first: 0.03 at 150 really is
+  4.5/h, i.e. half again the test character's rate.
+  Method, for repeating it: record `energy` out of every XHR response that carries one, anchor on an
+  add response, wait, then start one 15 s job and read the next add response. Two fractional values
+  and the known cost in between give the rate outright — no hour-long observation needed.
 
 ### Sleeping
 
@@ -260,6 +297,55 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   `HotelWindow.townid` (null until the window is opened). Wrapping that one function is how a
   manual sleep is routed into our own queue — locale-independent, and far safer than guessing the
   button out of the DOM.
+
+### Walking (TaskWalk)
+
+Walking to a fort, a quest giver or the county fair is a **queue entry of its own**, added through
+the very same `TaskQueue.add` — so a full queue discards it exactly the way it discards a job.
+Reported live: starting a walk with four jobs queued and having it vanish.
+
+- Call sites in the bundle: `Guidepost.start_walk(id, type)` (guidepost dialog, fort battle
+  notifications, the fair) and `QuestEmployerWindow.startWalk(employer)`. Note the Guidepost path
+  passes **no coordinates** — the server resolves the target from `(unitId, type)`.
+- `new TaskWalk(unitId, type, x, y)`. Measured on an **unqueued** instance:
+  `post = {taskType:'walk', type, unitId, x, y}` (x/y simply absent when not passed),
+  `getDuration()` → **0** — a walk's whole length *is* the travel — and `getIcon()` already answers
+  (`.../images/jobs/walk.png`). So it rebuilds exactly from `post`, and the existing ETA chain turns
+  the coordinates into the time it takes. Zero duration is correct, not a placeholder: never let the
+  `DEFAULT_DURATION` fallback invent 15 minutes of standing still.
+- Without coordinates the entry keeps `x: null` rather than `0`. Inventing a position would make
+  every following job's ETA chain from a place the character never goes.
+- **A coordinate-less walk therefore has no knowable length**, and it must not be drawn as
+  `00:00:00` — that claims it is instantaneous. `durationUnknown()` makes the panel show `→?` and
+  the in-game tile `?`, with a tooltip saying the times behind it are earlier than they will be.
+  **Known limitation**: those following ETAs really are optimistic, and there is no client-side fix
+  — the server resolves the target. If it ever matters, `Guidepost.show(id, x, y, type)` *does*
+  receive the coordinates and runs before `start_walk`, so caching `(id,type) → (x,y)` there would
+  cover the guidepost case (but not `start_walk(null,'fair')`, which has none anywhere).
+- A walk costs **no energy and no motivation**. `jobEnergyCost` must return `0` for it explicitly —
+  a `null` reads as "not known yet" and stops the whole energy chain behind it. It is also not
+  "work" for the sleep question: cutting a sleep short for a walk gains nothing.
+
+### The silent truncation in `TaskQueue.add`
+
+Read out of the bundle, verbatim:
+
+```js
+if (taskLimit < obj.queue.length + tasks.length)
+    limitedTasks = tasks.slice(0, taskLimit - obj.queue.length);
+```
+
+The sliced-off tasks are **gone**: no request, no message, no error. Our own job starts never hit
+this because we hand over exactly what fits — but *every other way the game queues something* goes
+straight through it. `patchTaskQueueAdd` wraps `add`, lets the game keep what fits, and diverts the
+overflow into `extraJobs` instead of letting it evaporate.
+
+- Only task types we can rebuild exactly are diverted (`DIVERTIBLE`; `walk` today). Anything else is
+  left to the game's own behaviour but **logged**, rather than disappearing silently.
+- `handingOver` guards our own `startJobsViaGame` batch from being diverted back into our own list.
+- Everything `sanitizeJobs` needs to accept an entry back must actually be **written** by
+  `saveExtraQueueToStorage`. It filters a sleep on `townId` and a walk on `walkType`, and the save
+  used to omit both — which is how a queued sleep silently disappeared across a reload.
 
 ### Travel time
 
@@ -309,10 +395,35 @@ energy = min(maxEnergy, floor(energy + maxEnergy * energyRegen * (serverTime - e
   `#ui_workcontainer` is `display:none` when the queue is empty — injected rows are then invisible.
   This used to be an accepted limitation, but since the script stops feeding the game's queue while
   the character sleeps, "one running task and nothing behind it" became the *normal* state and the
-  waiting list vanished from the widget. `setPendingHostVisible` now forces `#queuedTasks` visible
-  while we have rows and hands control back (inline style cleared) when we don't — an empty
-  container has no children and so takes no space. **`#ui_workcontainer` is deliberately left
-  alone**: forcing that one would draw the game's empty queue frame.
+  waiting list vanished from the widget. `setPendingHostVisible` forces `#queuedTasks` visible
+  while we have rows. **`#ui_workcontainer` is deliberately left alone**: forcing that one would
+  draw the game's empty queue frame.
+- **Releasing that override is not the same as clearing our inline style.** The game's own hiding
+  is *also* an inline `display:none` (jQuery `slideUp`), so `style.display = ''` wipes the game's
+  state along with ours and leaves an empty container sitting on screen — reported live as a "small
+  empty UI element" after the list emptied. Put back what the game would be holding instead: hidden
+  when no real task is left in the container, `''` when one is.
+- **The widget has a collapse toggle and the script has to respect it.** `#toggleTaskQueue` (the
+  little arrow) swaps `#ui_workcontainer`'s class between `expanded` and `expandable`. Measured:
+
+  | state | `#queuedTasks` inline style | `#ui_workcontainer` class |
+  | --- | --- | --- |
+  | expanded | *unset* | `expanded` |
+  | collapsed | `display:none` | `expandable` |
+
+  The class is the only way to tell "the game hid it because it is empty" from "the user folded it
+  away". Forcing `display:block` regardless is how our rows used to reappear after the user
+  deliberately collapsed the widget.
+- **`#ui_workcontainer` is pinned to the bottom of the viewport and grows UPWARD without limit** —
+  `max-height:none`, no clipping, `bottom:0`. Measured: 15 tiles put its top at **62 px** on a
+  700 px viewport, and a few more take it negative, i.e. off the top of the screen. This is why the
+  problem only showed on the *main* account: premium alone shows 9 real tiles (5 rows) before ours
+  are added. `previewForSpace` therefore budgets our tiles against the room actually left above the
+  widget, and `GAME_QUEUE_PREVIEW` is a **maximum**, not a fixed count.
+- **`TaskQueueUi.taskCancelling` counts `$('#queuedTasks span').length`** to decide the widget is
+  empty. Our injected tiles used to be `<span>`s and were counted, so the game thought a task was
+  still there. Measured: `div.task` renders identically to `span.task` (112×67, same icon box), so
+  our rows are `<div>`s — the separator already was one.
 - The queue background is **light parchment**, so overlay text must be dark (`#4a3b28`), not cream.
 
 ### The character's status bars
@@ -469,6 +580,60 @@ and "Nem" correctly does nothing.
   adds **of its own** — otherwise the ⚠ spread from the one job that waits to everything after it.
   This matters more than it sounds: a 1-hour job costs 12 energy against ~3–4.5/h of regeneration,
   so on any long list of long jobs the **energy**, not the queue, is what sets the pace.
+- **When the cost is paid and what the player is shown are two different questions** (v12.16). Both
+  halves of the truth have now been got wrong once: v12.14 read the energy at the start (crediting
+  regeneration already spent), and v12.15 then displayed the post-deduction figure *as if frozen* —
+  but energy keeps regenerating while the job waits its turn in the game's queue and while it runs.
+  A row reading "0 left" at hand-over is not still 0 an hour later when the job actually ends.
+  So a row shows `⚡A → B`: the level when the job **starts** and when it **finishes**. The pay
+  moment moved to the tooltip, and the ⚠ / wait logic still keys on it — that is what decides
+  whether the job can be handed over at all.
+  This cannot be read off a single row: with the queue fed ahead, the *next* job's cost is typically
+  taken while this one is still running, so a naive "start + regeneration" over-promises.
+  `computeForecast` therefore records every moment energy changes hands (a job **subtracts** its
+  cost, a sleep **sets** the level outright) and `makeEnergyClock` replays them in time order, which
+  `attachEnergyLevels` then evaluates at the **final** start/finish times — after `applyEnergyDelays`
+  has moved them. The forecast bar uses the same clock at the last job's *finish*, which is what its
+  label ("a lista végén") always claimed; reading `energyAfter` there made it undershoot by roughly
+  one job-length of regeneration.
+- **A cost is booked when a SLOT frees, not merely when the energy covers it.** Both conditions have
+  to hold, and forgetting the slot is not a rounding error: when the energy comfortably covers a
+  cost, `readyFor()` returns the *carried* moment and the carried moment never advances — so every
+  job's deduction was stamped on `now`, and the clock reported the whole list as already paid for
+  before the first job had started. Reported live on the main account as rows reading **`100 → 100`**
+  at 118 energy with a maximum of 150: 118 − 18 (the list's whole cost) = 100, and at 4.5/h
+  regeneration an integer does not move within a short job, so row after row printed the same flat
+  pair. **No ceiling was involved** — worth remembering, because a repeated round number looks
+  exactly like a clamp and sends you hunting for one.
+  Slots free in a known order, which is what `slotFreeAt(i)` walks: the ones already free, then the
+  tasks in the game's queue as they finish (`gameQueueFinishes()`, `data.date_done` in
+  **milliseconds**), then our own jobs. The (i+1)-th slot to free is the one job *i* goes into, and
+  `i - limit < i` always, so a job can never gate on itself.
+  `waitMs` deliberately measures against the **energy's** readiness only, never the slot's: waiting
+  for a slot is what the queue does anyway and is already in the ETAs, so counting it there would
+  push every start time out a second time.
+- **A flat tail on the list is CORRECT, not a stuck value.** This was reported as a bug twice and
+  chased twice; it is neither a clamp nor a broken chain. A job is handed over — and charged —
+  as soon as a slot frees, i.e. `limit` jobs *before* it runs. Two consequences that look wrong and
+  are not: a row's displayed start is **lower** than the same tooltip's "marad" figure (the jobs
+  behind it were charged in the meantime), and the **last `limit` rows are flat**, because by then
+  every cost in the list has been taken and only regeneration moves the number — 4.5/h is 0.075 per
+  minute, invisible across a 15-second job. Measured live and reproduced exactly (the test under
+  "REPORTED LIVE, and NOT a bug" carries the real numbers: pay chain 108→…→100, displayed
+  105→…→101-flat, limit 4).
+  **Do not "fix" the arithmetic here** — check against the tooltip's pay chain first.
+- **The row shows the energy LEFT once the job is paid for** (`energyAfter`, the pay chain) — one
+  number, stepping down by the job's own cost and back up wherever regeneration outpaces them.
+  Showing the level while the job *runs* was tried in v12.16 and taken out again: it is truthful,
+  but because the game is fed `limit` jobs ahead it goes flat for the last `limit` rows of every
+  list, i.e. exactly where a long list gets interesting. It survives in the tooltip. This was
+  settled by the user after seeing both against real data — don't re-litigate it without new
+  evidence.
+- **Past the first unknown cost the chain is blind.** `computeForecast` deliberately does not advance
+  when `costOf` returns null, so the clock books nothing further and returns the *same* level for
+  every remaining row — a confident-looking flat pair that is only the last thing we knew. v12.15
+  rendered nothing in that case and that was right; `chainBroken` marks the row and everything behind
+  it, and `attachEnergyLevels` stops there.
   **Known simplification:** motivation regeneration is not modelled (it was not measured; it is
   believed to reset daily, time of day unknown). This needs no correction for *current* values —
   the motivation is re-read from the server every `JOB_INFO_TTL` (5 min), so a reset is picked up
@@ -672,8 +837,11 @@ and "Nem" correctly does nothing.
   for the in-game UI: panel texts and tooltips, `west.gui` dialogs, `updateUIStatus` lines, the
   injected queue rows and the `@description` header. `lisaDiag()`'s keys and values are English, with
   one deliberate exception — `keepAwake` carries `keepAwakeStatus()`, which is also rendered as the
-  panel status line's tooltip, so it (and `tickHealthText()`) stays Hungarian. Commit messages are
-  Hungarian too. (This was translated wholesale after v12.13; before that everything was Hungarian.)
+  panel status line's tooltip, so it (and `tickHealthText()`) stays Hungarian.
+  **The test is "does the player read this in the game?"** If not, it is English — that includes
+  commit messages, this file, and anything else outside the running UI. The code was translated
+  wholesale after v12.13, and the history was rewritten to English in the same session; nothing
+  Hungarian should reappear outside the in-game strings listed above.
 - Comments explain *why*, especially where a subtle game behaviour forced the design. Keep them.
 - Bump `@name`, `@version` and the boot `console.log` together on every release — and the release
   number plus the assertion count at the top of this file.
