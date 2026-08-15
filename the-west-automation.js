@@ -81,7 +81,7 @@
     let nextJobTimer = null;
     let nextJobDeadline = 0;
     let isLeaderTab = true;
-    let dialogCloseTimer = null;
+    let cancelDialogClose = null;    // pollFor's canceller, so a new click supersedes the old watch
     let lastSeenQueueLen = 0;
     let inFlightBatch = null;        // what we just handed to the game, until the response
     let handingOver = false;         // our own TaskQueue.add is in flight -- don't divert it
@@ -222,6 +222,52 @@
         const len = gameQueueLength(), lim = gameQueueLimit();
         uiQueueStatus.textContent = `Sor: ${len}/${lim}`;
         uiQueueStatus.style.color = len >= lim ? '#c88a5a' : '#c8a96e';
+    }
+
+    // Repeat `fn` until it returns true or the tries run out. Three hand-rolled
+    // copies of this loop had grown up separately (the "more jobs?" dialog, the
+    // cancel-all confirmation, waiting for the game's UI at boot); they only ever
+    // differed in the interval and the number of tries.
+    function pollFor(fn, everyMs, maxTicks, onGiveUp) {
+        let ticks = 0;
+        const timer = setInterval(() => {
+            ticks++;
+            let done = false;
+            try { done = !!fn(ticks); } catch(e) { done = true; }
+            if (!done && ticks < maxTicks) return;
+            clearInterval(timer);
+            if (!done && onGiveUp) onGiveUp();
+        }, everyMs);
+        return () => clearInterval(timer);
+    }
+
+    // Committing a change to extraJobs. Every path that touches the list owes the
+    // same three or four steps, and a missing one is invisible until much later:
+    // an unsaved list is lost on the next reload, and a missing ensureProcessing
+    // leaves new work sitting until some unrelated timer happens to fire -- which
+    // is exactly how a sleep queued by hand came to "do nothing" until a reload.
+    // Pass pullInMs only where NEW work arrived; the heartbeat and boot must not
+    // pull a deliberate wait (a full queue, a rejection backoff) forward.
+    function queueChanged(status, pullInMs) {
+        saveExtraQueueToStorage();
+        updateUI();
+        if (status) updateUIStatus(status);
+        if (typeof pullInMs === 'number') ensureProcessing(pullInMs);
+    }
+
+    // A west.gui.Dialog closed with the ✕ fires no button callback at all, so any
+    // pending flag behind it would never clear. The game offers no event for it
+    // either -- the only signal is the dialog's main div being detached, so we
+    // watch for that. Both of our question dialogs need it.
+    function onDialogDismissed(dlg, cb) {
+        const main = (dlg && typeof dlg.getMainDiv === 'function') ? dlg.getMainDiv() : null;
+        const el = main && main.jquery ? main[0] : main;
+        if (!el) return;
+        const timer = setInterval(() => {
+            if (el.isConnected) return;
+            clearInterval(timer);
+            cb();
+        }, 1000);
     }
 
     // ============================================================
@@ -1220,10 +1266,8 @@
                     ? Character.homeTown : currentPosition() || { x: 0, y: 0 };
                 const entry = makeSleepEntry(townId, room, info && info.name, pos.x, pos.y);
                 extraJobs.push(entry);
-                saveExtraQueueToStorage();
-                updateUI();
-                updateUIStatus(`Alvás sorba állítva (${extraJobs.length} várakozik).`);
-                ensureProcessing(CONFIG.NEW_WORK_DELAY);
+                queueChanged(`Alvás sorba állítva (${extraJobs.length} várakozik).`,
+                             CONFIG.NEW_WORK_DELAY);
 
                 // The room data is needed for cancelling too (what level it fills to),
                 // not just for the name. Fetch it now if we don't have it yet.
@@ -1233,8 +1277,7 @@
                         if (!r) return;
                         entry.jobName = `Alvás – ${r.name || room}`;
                         entry.duration = estimateSleepSeconds(room);
-                        saveExtraQueueToStorage();
-                        updateUI();
+                        queueChanged();
                     });
                 }
             } catch(e) {
@@ -1258,12 +1301,10 @@
             }
             const pos = Math.max(0, Math.min(extraJobs.length, atIndex || 0));
             extraJobs.splice(pos, 0, makeSleepEntry(town.town_id, room.key, room.name, town.x, town.y, mode));
-            saveExtraQueueToStorage();
-            updateUI();
-            updateUIStatus(pos === 0
+            queueChanged(pos === 0
                 ? `Alvás beszúrva a sor elejére (${room.name || room.key}).`
-                : `Alvás beszúrva a(z) ${pos + 1}. helyre (${room.name || room.key}).`);
-            ensureProcessing(CONFIG.NEW_WORK_DELAY);
+                : `Alvás beszúrva a(z) ${pos + 1}. helyre (${room.name || room.key}).`,
+                CONFIG.NEW_WORK_DELAY);
         });
     }
 
@@ -1351,17 +1392,8 @@
             offer.dialogShown = true;
 
             // Closing with the ✕ must not go unanswered either: otherwise the offer
-            // would stay "pending" forever and we would never ask again. We detect
-            // the close from the element being detached.
-            const main = typeof dlg.getMainDiv === 'function' ? dlg.getMainDiv() : null;
-            const el = main && main.jquery ? main[0] : main;
-            if (el) {
-                const timer = setInterval(() => {
-                    if (el.isConnected) return;
-                    clearInterval(timer);
-                    if (!answered) dismissSleepOffer(true);
-                }, 1000);
-            }
+            // would stay "pending" forever and we would never ask again.
+            onDialogDismissed(dlg, () => { if (!answered) dismissSleepOffer(true); });
             return true;
         } catch(e) {
             console.warn('[Lisa] The sleep dialog did not come up, falling back to the panel question:', e);
@@ -1457,15 +1489,7 @@
                 .show();
             // The ✕ would close without an answer here too: the safe default is the
             // full sleep, because a sleeping character cannot be duelled.
-            const main = typeof dlg.getMainDiv === 'function' ? dlg.getMainDiv() : null;
-            const el = main && main.jquery ? main[0] : main;
-            if (el) {
-                const timer = setInterval(() => {
-                    if (el.isConnected) return;
-                    clearInterval(timer);
-                    if (!answered) finish('full');
-                }, 1000);
-            }
+            onDialogDismissed(dlg, () => { if (!answered) finish('full'); });
         } catch(e) {
             sleepModeAsked = false;
             saveSleepDecision(task.queueId, 'full');
@@ -1570,24 +1594,39 @@
             : `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
     }
 
-    // The energy warning in words. The forecast pays each cost at the moment the
-    // energy reaches it, so "not enough energy" is normally a WAIT, not a shortfall:
-    // the job starts that much later. A real shortfall is only possible when there is
-    // no regeneration at all, or when the cost is above the character's maximum.
-    function energyWarningText(f) {
-        if (!f || !f.notEnoughEnergy) return '';
-        if (f.waitMs === Infinity) return `kevés energia (${f.energyBefore} < ${f.cost})`;
-        return `${f.cost} energiára vár (~${formatDuration((f.energyDelayMs || f.waitMs) / 1000)})`;
+    // Why a row is flagged, worded for both places at once: `short` goes on the
+    // in-game tile, where it shares a tooltip with the job's own line, and `long`
+    // into the panel row, which has the room to explain itself. The two used to
+    // decide separately whether a job is flagged at all, off the same fields --
+    // one condition edited and only one of the two displays would have followed.
+    //
+    // On the energy wording: the forecast pays each cost at the moment the energy
+    // reaches it, so "not enough energy" is normally a WAIT, not a shortfall -- the
+    // job simply starts that much later. A real shortfall needs no regeneration at
+    // all, or a cost above the character's maximum.
+    function forecastReasons(f) {
+        const short = [], long = [];
+        if (!f) return { short, long };
+        if (f.lowMotivation) {
+            short.push(`motiváció ${f.motivation}%`);
+            long.push(`motiváció ${f.motivation}% (≤ ${CONFIG.MOTIVATION_WARN}%)`);
+        }
+        if (f.notEnoughEnergy) {
+            if (f.waitMs === Infinity) {
+                short.push(`kevés energia (${f.energyBefore} < ${f.cost})`);
+                long.push(`nem lesz elég energia (${f.energyBefore} < ${f.cost})`);
+            } else {
+                const wait = formatDuration((f.energyDelayMs || f.waitMs) / 1000);
+                short.push(`${f.cost} energiára vár (~${wait})`);
+                long.push(`csak ~${wait} múlva lesz meg a ${f.cost} energia`);
+            }
+        }
+        return { short, long };
     }
 
-    // A forecast row's human-readable warning, or an empty string.
+    // A forecast row's human-readable warning for the tile, or an empty string.
     function forecastWarning(f) {
-        if (!f) return '';
-        const out = [];
-        if (f.lowMotivation) out.push(`motiváció ${f.motivation}%`);
-        const energy = energyWarningText(f);
-        if (energy) out.push(energy);
-        return out.join(', ');
+        return forecastReasons(f).short.join(', ');
     }
 
     // ============================================================
@@ -2015,13 +2054,10 @@
 
             if (diverted.length) {
                 extraJobs.push(...diverted);
-                saveExtraQueueToStorage();
                 console.log(`[Lisa] The queue was full: ${diverted.length} task(s) moved into the`
                     + ` extra queue instead of being discarded (${extraJobs.length} in total).`);
-                updateUI();
-                updateUIStatus(`${diverted.length} feladat a várólistára került `
-                    + `(${extraJobs.length} várakozik).`);
-                ensureProcessing(CONFIG.NEW_WORK_DELAY);
+                queueChanged(`${diverted.length} feladat a várólistára került `
+                    + `(${extraJobs.length} várakozik).`, CONFIG.NEW_WORK_DELAY);
             }
             if (lost.length) {
                 console.warn(`[Lisa] The game is dropping ${lost.length} task(s) it has no room for`
@@ -2092,16 +2128,8 @@
 
     function scheduleDialogClose() {
         // Rapid consecutive clicks used to leave several watchers spinning at once.
-        if (dialogCloseTimer) clearInterval(dialogCloseTimer);
-        let attempts = 0;
-        const maxAttempts = 10;
-        dialogCloseTimer = setInterval(() => {
-            if (closeMoreJobsDialog() || attempts >= maxAttempts) {
-                clearInterval(dialogCloseTimer);
-                dialogCloseTimer = null;
-            }
-            attempts++;
-        }, 200);
+        if (cancelDialogClose) cancelDialogClose();
+        cancelDialogClose = pollFor(closeMoreJobsDialog, 200, 11);   // ~2 s
     }
 
     // ============================================================
@@ -2209,9 +2237,8 @@
 
         const name = jobName || `Job #${jobData.jobId}`;
         const added = addExtraJobs(jobData, amount, name);
-        updateUI();
-        updateUIStatus(`${added} munka sorba állítva (${extraJobs.length} várakozik).`);
-        ensureProcessing(CONFIG.NEW_WORK_DELAY);
+        queueChanged(`${added} munka sorba állítva (${extraJobs.length} várakozik).`,
+                     CONFIG.NEW_WORK_DELAY);
     }, true);
 
     // ------------------------------------------------------------
@@ -2277,9 +2304,8 @@
 
         const jobData = { jobId, x: spot.x, y: spot.y, duration, taskType: 'job' };
         addExtraJobs(jobData, 1, name);
-        updateUI();
-        updateUIStatus(`${name} sorba állítva (${extraJobs.length} várakozik).`);
-        ensureProcessing(CONFIG.NEW_WORK_DELAY);
+        queueChanged(`${name} sorba állítva (${extraJobs.length} várakozik).`,
+                     CONFIG.NEW_WORK_DELAY);
     }, true);
 
     // ------------------------------------------------------------
@@ -2298,38 +2324,27 @@
         if (!extraJobs.length) return;
         const count = extraJobs.length;
         extraJobs = [];
-        saveExtraQueueToStorage();
-        updateUI();
-        updateUIStatus(`Minden munka törölve – ${count} várakozó is.`);
+        queueChanged(`Minden munka törölve – ${count} várakozó is.`);
         console.log(`[Lisa] Cancel-all confirmed: ${count} waiting jobs discarded.`);
     }
 
     function watchCancelAllConfirm() {
-        let waited = 0;
-        const findDialog = setInterval(() => {
-            waited++;
+        pollFor(() => {
             const dlg = document.querySelector('.tw2gui_dialog');
-            if (!dlg) {
-                if (waited > 15) clearInterval(findDialog);
-                return;
-            }
-            clearInterval(findDialog);
+            if (!dlg) return false;
             dlg.addEventListener('click', (ev) => {
                 if (!ev.target.closest('.tw2gui_button')) return;
-                const before = gameQueueLength();
-                if (!before) return;
-                let ticks = 0;
-                const confirmed = setInterval(() => {
-                    ticks++;
-                    if (gameQueueLength() === 0) {
-                        clearInterval(confirmed);
-                        clearExtraAfterCancelAll();
-                    } else if (ticks > 15) {
-                        clearInterval(confirmed);   // "Nem" -- the queue survived
-                    }
-                }, 200);
+                if (!gameQueueLength()) return;
+                // Whichever button was pressed, the verdict is the queue itself
+                // reaching zero. Giving up after ~3 s means "Nem" -- it survived.
+                pollFor(() => {
+                    if (gameQueueLength() !== 0) return false;
+                    clearExtraAfterCancelAll();
+                    return true;
+                }, 200, 16);
             }, true);
-        }, 200);
+            return true;
+        }, 200, 16);
     }
 
     document.addEventListener('click', function(e) {
@@ -2367,8 +2382,7 @@
         dropped.forEach(job => console.error(
             `[Lisa] Job given up after ${CONFIG.MAX_REJECTIONS} server-side rejections: ${job.jobName} -- ${job.lastRejectMsg}`));
 
-        saveExtraQueueToStorage();
-        updateUI();
+        queueChanged();
 
         const first = rejected[0];
         const reason = (first.msg || 'a szerver nem fogadta el').replace(/<[^>]*>/g, '').slice(0, 90);
@@ -2440,9 +2454,8 @@
                     console.log(`[Lisa] Game-initiated start: asked ${pendingJobAmount}, accepted ${added}, left over ${remaining}`);
                     if (remaining > 0) {
                         const queued = addExtraJobs(task, remaining, jobName);
-                        updateUI();
-                        updateUIStatus(`${queued} maradék munka az extra sorba helyezve.`);
-                        ensureProcessing(CONFIG.NEW_WORK_DELAY);
+                        queueChanged(`${queued} maradék munka az extra sorba helyezve.`,
+                                     CONFIG.NEW_WORK_DELAY);
                     }
                 }
 
@@ -2469,6 +2482,10 @@
     // ============================================================
     // Batched add: a single localStorage write instead of N. Adding 99 jobs used
     // to mean 99 synchronous stringify+write cycles.
+    //
+    // It only grows the list and returns how many fitted -- committing is the
+    // caller's queueChanged(), which every one of them was already calling right
+    // afterwards. Saving here as well meant writing the whole list twice per add.
     function addExtraJobs(params, count, displayName) {
         const wanted = Math.max(0, Math.min(parseInt(count, 10) || 0, CONFIG.MAX_AMOUNT));
         const room = Math.max(0, CONFIG.MAX_EXTRA_QUEUE - extraJobs.length);
@@ -2488,7 +2505,6 @@
                 taskType: params.taskType || 'job',
             });
         }
-        saveExtraQueueToStorage();
 
         if (n < wanted) {
             console.warn(`[Lisa] Extra queue is full (${CONFIG.MAX_EXTRA_QUEUE}), ${wanted - n} job(s) did not fit.`);
@@ -2628,8 +2644,7 @@
                 // hand has no decision behind it; we'll ask about that one later.
                 const startedSleep = started.find(j => j.taskType === 'sleep' && j.modeChosen);
                 if (startedSleep) pendingSleepMode = startedSleep.sleepMode || 'full';
-                saveExtraQueueToStorage();
-                updateUI();
+                queueChanged();
                 console.log(`[Lisa] Accepted ${accepted} job(s) (queue: ${gameQueueLength()}/${gameQueueLimit()})`);
 
                 if (extraJobs.length === 0) {
@@ -3583,8 +3598,7 @@
         const idx = extraJobs.findIndex(j => j.id === id);
         if (idx === -1) return;
         extraJobs.splice(idx, 1);
-        saveExtraQueueToStorage();
-        updateExtraList();
+        queueChanged();
     }
 
     // Rows are bound by id, not by array index: the processor can take a job off
@@ -3662,12 +3676,7 @@
         const energyEl = li.querySelector('.lisa-energy');
         if (!warnEl || !energyEl) return;
 
-        const reasons = [];
-        if (f.lowMotivation) reasons.push(`motiváció ${f.motivation}% (≤ ${CONFIG.MOTIVATION_WARN}%)`);
-        const energyReason = energyWarningText(f);
-        if (energyReason) reasons.push(f.waitMs === Infinity
-            ? `nem lesz elég energia (${f.energyBefore} < ${f.cost})`
-            : `csak ~${formatDuration((f.energyDelayMs || f.waitMs) / 1000)} múlva lesz meg a ${f.cost} energia`);
+        const reasons = forecastReasons(f).long;
         warnEl.textContent = reasons.length ? '⚠' : '';
         warnEl.title = reasons.length ? `${job.jobName} – ${reasons.join(', ')}` : '';
         li.classList.toggle('lisa-row-warn', reasons.length > 0);
@@ -3754,9 +3763,7 @@
 
     function clearExtraQueue() {
         extraJobs = [];
-        saveExtraQueueToStorage();
-        updateUI();
-        updateUIStatus('Extra sor törölve.');
+        queueChanged('Extra sor törölve.');
     }
 
     // ============================================================
@@ -3789,18 +3796,15 @@
     }
 
     function onDOMReady() {
-        let attempts = 0;
-        const checkDOM = setInterval(() => {
-            attempts++;
-            if (document.querySelector('#ui_workcontainer') || document.querySelector('#ui_bottomright')) {
-                clearInterval(checkDOM);
-                boot();
-            } else if (attempts >= CONFIG.BOOT_MAX_ATTEMPTS) {
-                // Without this the poll ran for the page's lifetime if the UI never appeared.
-                clearInterval(checkDOM);
-                console.warn('[Lisa] The game UI never showed up, the script will not start.');
-            }
-        }, 1000);
+        pollFor(() => {
+            if (!document.querySelector('#ui_workcontainer')
+                && !document.querySelector('#ui_bottomright')) return false;
+            boot();
+            return true;
+        }, 1000, CONFIG.BOOT_MAX_ATTEMPTS,
+            // Without a give-up the poll ran for the page's lifetime if the UI
+            // never appeared.
+            () => console.warn('[Lisa] The game UI never showed up, the script will not start.'));
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);

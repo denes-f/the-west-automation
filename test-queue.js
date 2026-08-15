@@ -52,6 +52,9 @@ let maybeOfferSleep = () => {};
 let scheduled = null;
 const rand = (a) => a;
 const saveExtraQueueToStorage = () => {};
+// The one commit path for extraJobs (save + repaint + optional status/reschedule).
+// The real one is browser-only; here we only need it not to throw.
+const queueChanged = () => {};
 const updateUI = () => {};
 const updateExtraList = () => {};
 const updateUIStatus = () => {};
@@ -443,8 +446,10 @@ eq('the base maps to a duration', JobList.getDurations()[baseOf('instantwork-lon
 // ============================================================
 console.log('\n=== Cancel all ===');
 let statusText = '';
-const updateUIStatusReal = (t) => { statusText = t; };
-eval(extract('clearExtraAfterCancelAll').replace('updateUIStatus(', 'updateUIStatusReal('));
+// The status now travels as queueChanged's first argument, so that is what we
+// capture. (It used to call updateUIStatus directly.)
+const queueChangedReal = (status) => { statusText = status || ''; };
+eval(extract('clearExtraAfterCancelAll').replace('queueChanged(', 'queueChangedReal('));
 extraJobs = mkJobs(5);
 clearExtraAfterCancelAll();
 eq('the list empties after the confirmation', extraJobs.length, 0);
@@ -468,6 +473,53 @@ eq('hours and minutes', formatDuration(3600 + 400), '1 ó 7 p');
 eq('a whole hour prints no 0 minutes', formatDuration(7200), '2 ó');
 eq('the sum of a long list', formatDuration(24 * 900), '6 ó');
 eq('zero', formatDuration(0), '0 mp');
+
+// ============================================================
+//  Why a row is flagged -- one decision, two wordings
+// ============================================================
+// The tile and the panel used to work this out separately from the same fields,
+// so a change to one condition could leave the two displays disagreeing about
+// whether a job is flagged at all. forecastReasons answers both at once: `short`
+// for the tile, `long` for the panel row. The WORDING differs on purpose; the set
+// of reasons must not.
+console.log('\n=== Flagging a forecast row ===');
+CONFIG.MOTIVATION_WARN = 75;
+eval([extract('forecastReasons'), extract('forecastWarning')].join('\n'));
+
+eq('nothing wrong -> no reason', forecastReasons({}).short, []);
+eq('no forecast at all -> no reason', forecastReasons(null).long, []);
+eq('an empty reason list is an empty warning', forecastWarning({}), '');
+
+const lowMot = { lowMotivation: true, motivation: 70 };
+eq('low motivation, tile', forecastReasons(lowMot).short, ['motiváció 70%']);
+eq('low motivation, panel spells out the threshold',
+   forecastReasons(lowMot).long, ['motiváció 70% (≤ 75%)']);
+
+// A real shortfall: no regeneration at all, or a cost above the maximum.
+const short = { notEnoughEnergy: true, waitMs: Infinity, energyBefore: 3, cost: 12 };
+eq('unreachable energy, tile', forecastReasons(short).short, ['kevés energia (3 < 12)']);
+eq('unreachable energy, panel', forecastReasons(short).long, ['nem lesz elég energia (3 < 12)']);
+
+// The normal case: the energy arrives, the job just starts later.
+const waits = { notEnoughEnergy: true, waitMs: 7200000, energyDelayMs: 3600000, cost: 12 };
+eq('a wait quotes the OWN delay, not the inherited one',
+   forecastReasons(waits).short, ['12 energiára vár (~1 ó)']);
+eq('...and the panel says it the long way',
+   forecastReasons(waits).long, ['csak ~1 ó múlva lesz meg a 12 energia']);
+eq('with no own delay it falls back to waitMs',
+   forecastReasons({ notEnoughEnergy: true, waitMs: 1800000, cost: 5 }).short,
+   ['5 energiára vár (~30 p)']);
+
+// Both at once, and both displays agree that the row is flagged.
+const both = { lowMotivation: true, motivation: 60, notEnoughEnergy: true,
+               waitMs: 600000, energyDelayMs: 600000, cost: 4 };
+eq('both reasons, in the same order', forecastReasons(both).short.length, 2);
+eq('the tile joins them with a comma',
+   forecastWarning(both), 'motiváció 60%, 4 energiára vár (~10 p)');
+eq('the panel flags exactly when the tile does',
+   forecastReasons(both).long.length > 0, forecastWarning(both).length > 0);
+eq('...and stays silent exactly when the tile does',
+   forecastReasons({}).long.length > 0, forecastWarning({}).length > 0);
 
 // ============================================================
 //  The "+N" tile sits on the last job slot (not on a row of its own)
