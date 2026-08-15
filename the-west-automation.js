@@ -31,12 +31,10 @@
         // Version-independent keys: the version lives in the content, not in the key,
         // otherwise every release would orphan the user's saved queue.
         STORAGE_EXTRA_QUEUE: 'lisa_extra_queue',
-        STORAGE_HISTORY: 'lisa_history',
         STORAGE_LEADER: 'lisa_leader_tab',
         STORAGE_SLEEP_MODE: 'lisa_sleep_mode',
         STORAGE_VERSION: 2,
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
-        LEGACY_HISTORY: 'lisa_modular_history_v97',
         MIN_SEND_GAP: 2000,          // between two consecutive sends
         WATCH_INTERVAL: 1000,        // how often we look at the game's queue and the ETAs
         TICK_STALL_WARN: 5000,       // a tick gap larger than this gets logged
@@ -49,7 +47,6 @@
         TIMER_CHUNK: 60000,          // long waits are woken in chunks this size
         LEADER_HEARTBEAT: 5000,
         LEADER_TTL: 15000,           // after this long without a heartbeat, processing is takeable
-        MAX_HISTORY: 60,
         BOOT_MAX_ATTEMPTS: 60,
         WINDOW_ID: 'lisaExtraQueue',
         PANEL_WIDTH: 320,
@@ -59,7 +56,7 @@
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_QUEUE_LIMIT: 4,     // only if the game's TaskQueue is unreachable
-        DEFAULT_DURATION: 900,       // only if neither the DOM nor the history reveals it
+        DEFAULT_DURATION: 900,       // only if the job window's own bars reveal nothing
         MAX_EXTRA_QUEUE: 500,
         KEEP_AWAKE: true,            // guards against screen sleep and tab freezing
         MOTIVATION_WARN: 75,         // we warn at or below this motivation
@@ -76,7 +73,6 @@
     //  2. INTERNAL STATE
     // ============================================================
     let extraJobs = [];
-    let jobHistory = [];
     let paused = false;
     let pendingJobName = null;
     let pendingJobAmount = 0;
@@ -2163,9 +2159,11 @@
             || durationFromBar(windowEl.querySelector('.job_durationbar:not(.disabled)'));
 
         if (!duration) {
-            // A value the server confirmed earlier is more reliable than a blind default.
-            const known = jobHistory.find(j => j.jobId === jobId);
-            duration = known ? known.duration : CONFIG.DEFAULT_DURATION;
+            // Both readings failed: the bar's data-base did not resolve through
+            // JobList.getDurations() and its text was unparseable. That means the job
+            // window is not the shape we know, so there is nothing left to read -- we
+            // guess, and say so loudly.
+            duration = CONFIG.DEFAULT_DURATION;
             console.warn(`[Lisa] Could not read the duration (job #${jobId}), using: ${duration}s`);
         }
         return { jobId, x, y, duration, taskType: 'job' };
@@ -2211,7 +2209,6 @@
 
         const name = jobName || `Job #${jobData.jobId}`;
         const added = addExtraJobs(jobData, amount, name);
-        addJobToHistory({ ...jobData, jobName: name });
         updateUI();
         updateUIStatus(`${added} munka sorba állítva (${extraJobs.length} várakozik).`);
         ensureProcessing(CONFIG.NEW_WORK_DELAY);
@@ -2280,7 +2277,6 @@
 
         const jobData = { jobId, x: spot.x, y: spot.y, duration, taskType: 'job' };
         addExtraJobs(jobData, 1, name);
-        addJobToHistory({ ...jobData, jobName: name });
         updateUI();
         updateUIStatus(`${name} sorba állítva (${extraJobs.length} várakozik).`);
         ensureProcessing(CONFIG.NEW_WORK_DELAY);
@@ -2434,10 +2430,9 @@
                 // (there pendingJobAmount is 0, since there was no intercepted click).
                 const task = extractTaskFromBody(reqBody);
                 if (!task) return;
-                const jobName = pendingJobName || `Job #${task.jobId}`;
-                addJobToHistory({ ...task, jobName });
 
                 if (pendingJobAmount > 0) {
+                    const jobName = pendingJobName || `Job #${task.jobId}`;
                     // The game updates TaskQueue BEFORE sending the request, so by the
                     // time the response arrives the live queue length is the real state.
                     const added = Math.max(0, gameQueueLength() - pendingQueueLengthBefore);
@@ -2468,34 +2463,6 @@
         InterceptedXHR[k] = OriginalXHR[k];
     });
     window.XMLHttpRequest = InterceptedXHR;
-
-    function addJobToHistory(jobData) {
-        const existingIndex = jobHistory.findIndex(j =>
-            j.jobId === jobData.jobId && j.duration === jobData.duration && j.x === jobData.x && j.y === jobData.y
-        );
-        if (existingIndex !== -1) {
-            const storedName = jobHistory[existingIndex].jobName;
-            if (storedName.startsWith('Job #') && !jobData.jobName.startsWith('Job #')) {
-                jobHistory[existingIndex].jobName = jobData.jobName;
-                jobHistory[existingIndex].timestamp = Date.now();
-                jobHistory.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-                saveHistoryToStorage();
-            }
-            return;
-        }
-        jobHistory.unshift({
-            id: generateId(),
-            jobId: jobData.jobId,
-            x: jobData.x,
-            y: jobData.y,
-            duration: jobData.duration,
-            taskType: jobData.taskType || 'job',
-            jobName: jobData.jobName,
-            timestamp: Date.now(),
-        });
-        if (jobHistory.length > CONFIG.MAX_HISTORY) jobHistory.length = CONFIG.MAX_HISTORY;
-        saveHistoryToStorage();
-    }
 
     // ============================================================
     //  19. MANAGING THE EXTRA QUEUE
@@ -2831,19 +2798,6 @@
         // write it back, so the stored state is always valid.
         saveExtraQueueToStorage();
     }
-    function saveHistoryToStorage() {
-        saveStore(CONFIG.STORAGE_HISTORY, jobHistory);
-    }
-
-    function loadHistoryFromStorage() {
-        const data = loadStore(CONFIG.STORAGE_HISTORY, CONFIG.LEGACY_HISTORY);
-        if (!data) return;
-        jobHistory = data
-            .filter(j => j && j.jobId !== undefined)
-            .map(j => ({ ...j, id: j.id || generateId(), duration: parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION }))
-            .slice(0, CONFIG.MAX_HISTORY);
-    }
-
     // ============================================================
     //  22. KEEP-AWAKE (for multi-hour queues)
     // ============================================================
@@ -3314,17 +3268,12 @@
         // foreign change. Every tab reloads -- the leader too, otherwise its next
         // save would overwrite work added in a passive tab.
         window.addEventListener('storage', (e) => {
-            if (!e.key) return;
-            if (e.key === CONFIG.STORAGE_EXTRA_QUEUE) {
-                const data = loadStore(CONFIG.STORAGE_EXTRA_QUEUE);
-                if (data) {
-                    extraJobs = sanitizeJobs(data);
-                    updateExtraList();
-                    ensureProcessing(CONFIG.NEW_WORK_DELAY);
-                }
-            } else if (e.key === CONFIG.STORAGE_HISTORY) {
-                loadHistoryFromStorage();
-            }
+            if (e.key !== CONFIG.STORAGE_EXTRA_QUEUE) return;
+            const data = loadStore(CONFIG.STORAGE_EXTRA_QUEUE);
+            if (!data) return;
+            extraJobs = sanitizeJobs(data);
+            updateExtraList();
+            ensureProcessing(CONFIG.NEW_WORK_DELAY);
         });
     }
 
@@ -3818,11 +3767,7 @@
         // sending straight away.
         initTabSync();
         loadExtraQueueFromStorage();
-        loadHistoryFromStorage();
         loadSleepDecision();
-        // Write back to the new key, otherwise we would migrate from the old one on
-        // every start and the normalized form would never settle.
-        saveHistoryToStorage();
         ensurePanel();
         ensureMenuButton();
         updateUI();

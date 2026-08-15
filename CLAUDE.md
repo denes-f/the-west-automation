@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 334 assertions, no dependencies.
+  name and runs them against stubs. 333 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -24,7 +24,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `334 passed, 0 failed`.
+2. `node test-queue.js` should print `333 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -827,8 +827,13 @@ and "Nem" correctly does nothing.
   background tab silently paralyses the tab the user is looking at.
 - **Storage** is versioned in the *content*, not the key, with one-time migration from the old keys.
   Never version the key — that orphans the user's saved queue on every release.
-- `jobHistory` has no UI any more (the Előzmények tab was removed once starting was wired into the
-  game's own UI). It is kept only as a duration fallback in `parseJobWindow`.
+- `jobHistory` **is gone** (removed in the v12.17 cleanup). It had lost its UI when the Előzmények
+  tab went, and survived only as a third-tier duration fallback in `parseJobWindow` — a whole
+  subsystem (state, two storage functions, the `lisa_history` and `lisa_modular_history_v97` keys,
+  a legacy migration, a storage-event branch, three call sites) feeding one line. `parseJobWindow`
+  now reads `data-base` through `JobList.getDurations()`, then the bar's text, then warns and uses
+  `DEFAULT_DURATION`. The user's old `lisa_history` key is deliberately left in localStorage
+  untouched: it is inert, and deleting it would be a write with no upside.
 
 ## Conventions
 

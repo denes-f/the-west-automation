@@ -153,7 +153,6 @@ console.log('\n=== Storage ===');
 const store = {};
 global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k,v) => { store[k]=v; }, removeItem: k => { delete store[k]; } };
 CONFIG.STORAGE_VERSION = 2;
-CONFIG.MAX_HISTORY = 60;
 eval([extract('saveStore'), extract('loadStore'), extract('sanitizeJobs')].join('\n'));
 const K = 'lisa_extra_queue', LEG = 'lisa_extra_params_v1020';
 
@@ -352,7 +351,6 @@ global.JobList = { getDurations: () => ({ short:{duration:15,requirement:1},
                                           middle:{duration:600,requirement:10},
                                           long:{duration:3600,requirement:20} }) };
 window.JobList = global.JobList;
-jobHistory = [];
 eval([extract('durationFromBar'), extract('parseJobWindow')].join('\n'));
 
 // Minimal DOM imitation: only what parseJobWindow uses
@@ -384,11 +382,8 @@ eq('low level -> 15 s', parseJobWindow(mkWindow(barsLow, CLS), mkBtn(barsLow[0])
 const oddBar = mkBar(undefined, false, '10p');
 eq('no data-base -> from the text', parseJobWindow(mkWindow([oddBar], CLS), mkBtn(oddBar)).duration, 600);
 
-// Neither base nor text -> history, then the default
+// Neither base nor text -> the default, and nothing else
 const blank = mkBar(undefined, false, null);
-jobHistory = [{ jobId: 7, duration: 1234 }];
-eq('filled in from the history', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, 1234);
-jobHistory = [];
 eq('last resort is the default', parseJobWindow(mkWindow([blank], CLS), mkBtn(blank)).duration, CONFIG.DEFAULT_DURATION);
 
 // With no button (an uncaught click) it falls back to the first active bar
