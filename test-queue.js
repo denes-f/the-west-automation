@@ -69,7 +69,8 @@ const updateExtraList = () => {};
 const updateUIStatus = () => {};
 const updateQueueBadge = () => {};
 const updateExtraEtas = () => {};
-const refreshForecast = () => [];          // forecast: needs live game state
+const currentPlan = () => ({ etas: [], forecast: [] });  // needs live game state
+const invalidatePlan = () => {};
 const updateEnergyForecastBar = () => {};  // the character box's bar likewise
 const offerSleepIfForecastRunsOut = () => {};
 const renderPendingInGameQueue = () => {};
@@ -1498,6 +1499,54 @@ maybeOfferSleep(5, 0);
 eq('a queued sleep clears the collapsed row', sleepOffer, null);
 eq('and the panel was told to repaint', renders > 0, true);
 extraJobs = [];
+
+// ============================================================
+//  One plan per tick
+// ============================================================
+// The ETAs and the energy forecast used to be recomputed by each display that
+// wanted them -- four full walks of the list a second, with nothing in the code
+// saying which answer was authoritative. currentPlan caches one per tick. Two
+// separate things can invalidate it and both matter: the LIST changing (exact --
+// every mutation path saves, and the save invalidates) and the WORLD moving on
+// (the TTL -- the game's queue drains, energy regenerates, the clock advances).
+console.log('\n=== Plan cache ===');
+CONFIG.PLAN_TTL = 250;
+let planCache = null;
+let plans = 0;
+let planNow = 1000000;
+const refreshJobInfo = () => {};
+const planExtraQueue = () => { plans++; return { etas: [`etas${plans}`], forecast: [`f${plans}`] }; };
+const realNow = Date.now;
+Date.now = () => planNow;
+eval(extract('invalidatePlan').replace('function invalidatePlan', 'global.invalidatePlanReal = function'));
+eval(extract('currentPlan').replace('function currentPlan', 'global.currentPlanReal = function'));
+
+eq('the first call computes', currentPlanReal().etas, ['etas1']);
+eq('a second call in the same tick reuses it', currentPlanReal().etas, ['etas1']);
+eq('...and did not recompute', plans, 1);
+eq('it publishes lastForecast', lastForecast, ['f1']);
+
+planNow += 100;                       // still inside the TTL
+currentPlanReal();
+eq('100 ms later is still the same plan', plans, 1);
+
+planNow += 200;                       // 300 ms total: past it
+eq('past the TTL it recomputes', currentPlanReal().etas, ['etas2']);
+eq('...and republishes lastForecast', lastForecast, ['f2']);
+
+// A list change must not wait out the TTL: the plan describes the old list.
+invalidatePlanReal();
+eq('an invalidation recomputes at once', currentPlanReal().etas, ['etas3']);
+eq('...even though no time passed', plans, 3);
+
+// The TTL is shorter than the tick, so a tick computes exactly once however many
+// displays ask -- which is the whole point.
+plans = 0;
+planNow += 1000;
+currentPlanReal(); currentPlanReal(); currentPlanReal(); currentPlanReal();
+eq('four askers in one tick, one computation', plans, 1);
+
+Date.now = realNow;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

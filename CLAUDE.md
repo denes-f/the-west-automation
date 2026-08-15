@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 358 assertions, no dependencies.
+  name and runs them against stubs. 368 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,8 +15,16 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.16.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.17.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.17 is a pure cleanup release — no feature, no behaviour change.** Five commits: dead code and
+stale comments out plus sections renumbered 1–26; `jobHistory` removed; four helpers replacing four
+kinds of copy-paste (`pollFor`, `onDialogDismissed`, `queueChanged`, `forecastReasons`);
+`ENTRY_FIELDS` making the storage round-trip undriftable; and one plan per tick (`currentPlan`).
+Executable lines 2636 → 2558, assertions 334 → 368. **It has not been run in the game**, so it is
+worth one session confirming the panel, the injected tiles and a sleep offer all still behave — the
+suite covers the logic, not the DOM.
 
 ## Picking up a new session
 
@@ -24,7 +32,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `358 passed, 0 failed`.
+2. `node test-queue.js` should print `368 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -566,6 +574,29 @@ and "Nem" correctly does nothing.
   `MOTIVATION_WARN` (75) or when the energy makes it start later than its queue slot would — shown
   as `⚠` on the panel row, on the injected in-game tile, and summarised on the separator. When a
   value isn't known yet, nothing is guessed and nothing is flagged.
+  **Both displays get their reasons from one function** (`forecastReasons` → `{short, long}`,
+  v12.17). The tile and the panel used to work the conditions out separately from the same fields,
+  so editing one could leave the two disagreeing about whether a job is flagged at all. The
+  *wording* still differs deliberately — the tile shares a tooltip, the panel has room to explain.
+- **One plan per tick** (`currentPlan`, v12.17). The ETAs and the forecast are wanted by four
+  displays — the panel rows, the forecast bar, the sleep offer and the injected tiles — and each
+  used to compute its own, so the whole list was walked four times a second with nothing saying
+  which answer was authoritative. `currentPlan` caches one and publishes `lastForecast` from there.
+  Two different things invalidate it: the **list** changing is exact (`saveExtraQueueToStorage`
+  calls `invalidatePlan`, and every mutation path saves — the one exception, the `storage` event,
+  invalidates by hand because it deliberately must not echo another tab's write back), while the
+  **world** moving on is what `PLAN_TTL` (250 ms) covers. The TTL is deliberately shorter than the
+  tick, so a tick computes exactly once however many displays ask, and the `MutationObserver` —
+  which re-renders tiles outside the tick — never works from a noticeably stale plan.
+  Note `renderPendingInGameQueue` **cannot** check its render key before asking for the plan: the
+  warnings are part of that key. Sharing the plan is what makes it cheap, not reordering.
+- **The panel is not repainted while nobody can see it** (v12.17). `updateExtraEtas` calls
+  `currentPlan()` first — the forecast bar and the sleep offer read `lastForecast` and must keep
+  working with the panel closed — and only then bails on `panelVisible()`. `offsetParent` is the
+  test because it answers minimized (wman fades the main div out), closed (wman destroys it, so our
+  reference is detached) and any hidden ancestor at once; the list element is never
+  `position: fixed`, which is the one case where a visible element reports a null `offsetParent`.
+  After reopening a minimized panel the times can be up to one tick stale, which the next tick fixes.
 - **The energy is paid at hand-over, not at the start** (v12.15). The two moments are different and
   the difference is large: a job enters the game's queue — and is charged — as soon as a slot is
   free *and* the energy covers it, while it only *starts* once everything in front of it has
@@ -826,6 +857,13 @@ and "Nem" correctly does nothing.
   during a ten-minute backoff sits idle until that backoff expires. Live symptom: a sleep queued
   by hand "did nothing" and only a page reload started it. Every user-facing add path passes
   `CONFIG.NEW_WORK_DELAY`; the heartbeat and boot deliberately do not.
+  **Since v12.17 that is `queueChanged(status, pullInMs)`** — the single commit path for a change
+  to `extraJobs`: save, repaint, optional status line, optional `ensureProcessing`. Nine sites used
+  to do some subset of those four by hand, and a forgotten one is invisible until much later (an
+  unsaved list is lost on reload; a missing `ensureProcessing` leaves work sitting). Pass
+  `pullInMs` only where NEW work arrived. `addExtraJobs` no longer saves internally, because all
+  three of its callers commit immediately afterwards — that used to write the whole list twice per
+  add.
 - **`watchGameQueue`** every 1 s: refreshes the badge and ETAs, re-injects in-game rows, and on a
   **decrease** in queue length starts the next job within 0.4 s. Keying on the decrease (not on
   "free slots exist") is deliberate — otherwise a refusal would retry every 2 s forever.

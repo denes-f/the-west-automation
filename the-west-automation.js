@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.16)
+// @name         The-West Modular Job Queue (Lisa v12.17)
 // @namespace   http://tampermonkey.net/
-// @version     12.16
+// @version     12.17
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -61,6 +61,7 @@
         KEEP_AWAKE: true,            // guards against screen sleep and tab freezing
         MOTIVATION_WARN: 75,         // we warn at or below this motivation
         JOB_INFO_TTL: 300000,        // how long a motivation/energy-cost read stays valid
+        PLAN_TTL: 250,               // one ETA+forecast pass per tick, shared by every display
         AUTO_SLEEP: true,            // offer sleeping when energy runs short
         QUEUE_MANUAL_SLEEP: true,    // sleep started in the hotel also goes into our own queue
         SLEEP_DECLINE_MS: 1800000,   // after a "No" we don't ask again for this long
@@ -1029,6 +1030,34 @@
         return { etas, forecast };
     }
 
+    // The plan is wanted several times within the same tick -- by the panel's rows,
+    // by the forecast bar, by the sleep offer and by the tiles injected into the
+    // game's queue widget. Each of them used to compute its own, so a full walk of
+    // the list ran four times a second and nothing in the code said which answer was
+    // the authoritative one. Now there is one per tick, and `lastForecast` is
+    // published from here rather than by whoever happened to ask first.
+    //
+    // Two things can make the cached answer wrong, and they are handled differently:
+    // the LIST changing is exact (saveExtraQueueToStorage invalidates, and every
+    // mutation path saves), while the world moving on -- the game's queue draining,
+    // energy regenerating, the clock advancing -- is what the TTL is for. It is much
+    // shorter than the tick so that each tick recomputes exactly once, and so that
+    // the MutationObserver, which re-renders the tiles outside the tick whenever the
+    // game rebuilds #queuedTasks, never works from a noticeably stale plan.
+    let planCache = null;               // { at, plan }
+
+    function invalidatePlan() { planCache = null; }
+
+    function currentPlan() {
+        const now = Date.now();
+        if (planCache && now - planCache.at < CONFIG.PLAN_TTL) return planCache.plan;
+        refreshJobInfo(extraJobs);
+        const plan = planExtraQueue(extraJobs);
+        lastForecast = plan.forecast;
+        planCache = { at: now, plan };
+        return plan;
+    }
+
     // ============================================================
     //  8. SLEEPING
     // ============================================================
@@ -1914,7 +1943,11 @@
         // The warnings are part of the key too: if a job's motivation or energy
         // crosses the threshold, the rows have to be redrawn. So is the preview
         // count, which shrinks when the window does.
-        const plan = planExtraQueue(extraJobs);
+        // The key cannot be built without the forecast -- the warnings are part of
+        // it -- so there is no checking it first and computing later. What makes
+        // this cheap is that the tick has already asked for the plan and this is
+        // the same one.
+        const plan = currentPlan();
         const forecast = plan.forecast;
         const etas = plan.etas;
         const warnKey = forecast.slice(0, shown.length).map(f => (forecastWarning(f) ? '1' : '0')).join('');
@@ -2815,6 +2848,9 @@
     // entry is written as undefined, JSON drops it, and the loader coerces it to
     // its default -- the same answer the old hand-written `|| 0` gave.
     function saveExtraQueueToStorage() {
+        // Every path that changes the list saves it, so this is the one place that
+        // reliably knows the cached plan no longer describes reality.
+        invalidatePlan();
         saveStore(CONFIG.STORAGE_EXTRA_QUEUE, extraJobs.map(j => {
             const out = {};
             for (const key in entryFields(j.taskType || 'job')) out[key] = j[key];
@@ -3159,7 +3195,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.16',
+        version: '12.17',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -3230,7 +3266,10 @@
         patchHotelStart();      // the hotel window may load later too
         patchTaskQueueAdd();    // ...and so may TaskQueue itself
         updateQueueBadge();
-        updateExtraEtas(refreshForecast());
+        // This is the tick's one call to currentPlan(), so it must come before the
+        // two readers of lastForecast below. Everything else this second -- the
+        // injected tiles, a panel repaint -- reuses that same plan.
+        updateExtraEtas();
         updateEnergyForecastBar();
         offerSleepIfForecastRunsOut();
         updateKeepAwake();
@@ -3303,6 +3342,9 @@
             const data = loadStore(CONFIG.STORAGE_EXTRA_QUEUE);
             if (!data) return;
             extraJobs = sanitizeJobs(data);
+            // The only mutation that deliberately does NOT save (we must not echo
+            // another tab's write back), so it invalidates the plan itself.
+            invalidatePlan();
             updateExtraList();
             ensureProcessing(CONFIG.NEW_WORK_DELAY);
         });
@@ -3725,18 +3767,26 @@
 
     // Rewrites only the time strings, it doesn't rebuild the rows: so it can
     // refresh many times a minute without constantly redrawing the list.
-    // The forecast refreshes INDEPENDENTLY of the panel: the energy bar in the
-    // character box shows even while the panel is closed or minimized.
-    function refreshForecast() {
-        refreshJobInfo(extraJobs);
-        const plan = planExtraQueue(extraJobs);
-        lastForecast = plan.forecast;
-        return plan.etas;
+    //
+    // The forecast itself is refreshed INDEPENDENTLY of the panel -- the energy bar
+    // in the character box, and the sleep offer, both read `lastForecast` and have
+    // to keep working while the panel is closed or minimized. So currentPlan() is
+    // called before, never after, the visibility check.
+    //
+    // Painting, on the other hand, is pointless when nobody can see it: rewriting
+    // every row's text and both tooltips once a second behind a hidden window is
+    // pure waste. offsetParent is the right test because it answers all three ways
+    // the panel can be invisible at once -- minimized (wman fades the main div out),
+    // closed (wman destroys it, leaving our reference detached) and any ancestor
+    // hidden. The element is never position:fixed, which is the one case where a
+    // visible element reports a null offsetParent.
+    function panelVisible() {
+        return !!(uiExtraList && uiExtraList.offsetParent);
     }
 
-    function updateExtraEtas(precomputed) {
-        const etas = precomputed || refreshForecast();
-        if (!uiExtraList) return;
+    function updateExtraEtas() {
+        const etas = currentPlan().etas;
+        if (!panelVisible()) return;
         const forecast = lastForecast;
         updateTotalEta(etas);
         etas.forEach((eta, i) => {
@@ -3826,5 +3876,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.16 loaded.');
+    console.log('[Lisa] Modular v12.17 loaded.');
 })();
