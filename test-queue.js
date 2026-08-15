@@ -7,6 +7,15 @@ function extract(name) {
     if (start === -1) { const a = src.indexOf(`async function ${name}(`); if (a === -1) throw new Error(name); return extractAt(a); }
     return extractAt(start);
 }
+// ENTRY_FIELDS and ENTRY_USABLE are const objects, not functions, so extract()
+// cannot see them. `const` declared inside an eval stays inside that eval, so the
+// declaration is rewritten to a global assignment to make it stick -- function
+// declarations leak out on their own, const ones do not.
+function extractGlobalConst(name) {
+    const start = src.indexOf(`const ${name} = {`);
+    if (start === -1) throw new Error(name);
+    return extractAt(start).replace(`const ${name} =`, `global.${name} =`);
+}
 function extractAt(start) {
     let i = src.indexOf('{', start), depth = 0;
     for (let j = i; j < src.length; j++) {
@@ -156,7 +165,14 @@ console.log('\n=== Storage ===');
 const store = {};
 global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k,v) => { store[k]=v; }, removeItem: k => { delete store[k]; } };
 CONFIG.STORAGE_VERSION = 2;
-eval([extract('saveStore'), extract('loadStore'), extract('sanitizeJobs')].join('\n'));
+eval(extractGlobalConst('ENTRY_FIELDS'));
+eval(extractGlobalConst('ENTRY_USABLE'));
+eval([extract('saveStore'), extract('loadStore'), extract('entryFields'),
+      extract('sanitizeJobs')].join('\n'));
+// The real saver, under a name of its own: the module-scope saveExtraQueueToStorage
+// has to stay a no-op stub for the processQueue scenarios.
+eval(extract('saveExtraQueueToStorage')
+     .replace('function saveExtraQueueToStorage', 'global.saveExtraQueueReal = function'));
 const K = 'lisa_extra_queue', LEG = 'lisa_extra_params_v1020';
 
 saveStore(K, [{ jobId: 1 }]);
@@ -177,6 +193,66 @@ eq('bad duration -> default', sj.duration, 900);
 eq('missing name filled in', sj.jobName, 'Job #7');
 eq('upper bound', sanitizeJobs(new Array(900).fill({ jobId: 1 })).length, 500);
 
+// ============================================================
+//  Save -> load round-trip, per task type
+// ============================================================
+// THE regression this guards. The writer and the reader used to carry the field
+// list separately; a sleep's townId and a walk's walkType went unwritten, so
+// sanitizeJobs threw those entries away on the next load and a queued sleep
+// silently vanished across a reload. Both sides now walk ENTRY_FIELDS, and these
+// assertions are what would fail if that ever came apart again.
+console.log('\n=== Storage round-trip ===');
+CONFIG.STORAGE_EXTRA_QUEUE = K;
+
+const roundTrip = (entries) => {
+    extraJobs = entries;
+    saveExtraQueueReal();
+    return sanitizeJobs(loadStore(K));
+};
+
+const job0 = { id: 'a1', retries: 0, deferrals: 0, rejections: 0, jobName: 'Bányász',
+               jobId: 7, x: 100, y: 200, duration: 600, taskType: 'job' };
+eq('a job survives unchanged', roundTrip([job0])[0], job0);
+
+const sleep0 = { id: 'b2', retries: 0, deferrals: 0, rejections: 0, jobName: 'Alvás – Kunyhó',
+                 jobId: 0, x: 10, y: 20, duration: 3600, taskType: 'sleep',
+                 townId: 55, room: 'cubby', sleepMode: 'enough', modeChosen: true };
+eq('a sleep survives unchanged', roundTrip([sleep0])[0], sleep0);
+eq('...and is not dropped on the way back', roundTrip([sleep0]).length, 1);
+
+const walk0 = { id: 'c3', retries: 0, deferrals: 0, rejections: 0, jobName: 'Séta ide: erőd',
+                jobId: 0, x: 30, y: 40, duration: 0, taskType: 'walk',
+                walkType: 'fort', unitId: 12 };
+eq('a walk survives unchanged', roundTrip([walk0])[0], walk0);
+eq('...and is not dropped on the way back', roundTrip([walk0]).length, 1);
+
+// A coordinate-less walk: null is a real state, not a zero. Inventing (0,0) would
+// chain every following ETA off a place the character never goes.
+const walkNoPos = { ...walk0, id: 'c4', x: null, y: null, unitId: null };
+eq('a walk with no coordinates keeps its nulls',
+   (r => [r.x, r.y, r.unitId])(roundTrip([walkNoPos])[0]), [null, null, null]);
+
+// The whole point: every key the loader reads must be a key the saver wrote.
+extraJobs = [sleep0];
+saveExtraQueueReal();
+const writtenSleep = JSON.parse(store[K]).data[0];
+eq('the saver writes exactly the fields the loader reads',
+   Object.keys(writtenSleep).sort(), Object.keys(entryFields('sleep')).sort());
+eq('...for a walk too',
+   (() => { extraJobs = [walk0]; saveExtraQueueReal();
+            return Object.keys(JSON.parse(store[K]).data[0]).sort(); })(),
+   Object.keys(entryFields('walk')).sort());
+eq('...and for a plain job',
+   (() => { extraJobs = [job0]; saveExtraQueueReal();
+            return Object.keys(JSON.parse(store[K]).data[0]).sort(); })(),
+   Object.keys(entryFields('job')).sort());
+eq('what was saved for a sleep passes the usability check',
+   ENTRY_USABLE.sleep(writtenSleep), true);
+
+// Three lists at once, order preserved.
+eq('a mixed list keeps its order',
+   roundTrip([job0, sleep0, walk0]).map(j => j.taskType), ['job', 'sleep', 'walk']);
+extraJobs = [];
 
 // ============================================================
 //  Leader election: a visible tab must never stay silently passive

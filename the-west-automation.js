@@ -2494,9 +2494,12 @@
 
         for (let i = 0; i < n; i++) {
             extraJobs.push({
+                // rejections too, like makeSleepEntry and makeWalkEntry -- this was
+                // the one factory that left it undefined.
                 id: generateId(),
                 retries: 0,
                 deferrals: 0,
+                rejections: 0,
                 jobName: name,
                 jobId: params.jobId,
                 x: params.x,
@@ -2731,77 +2734,90 @@
         return null;
     }
 
+    // ------------------------------------------------------------
+    //  What an extraJobs entry is made of -- declared ONCE
+    // ------------------------------------------------------------
+    // The writer and the reader used to carry the field list separately, and they
+    // drifted: a sleep's townId and a walk's walkType went unwritten, sanitizeJobs
+    // then rejected those entries on the next load, and a queued sleep silently
+    // disappeared across a reload. Both sides now walk the same declaration, so
+    // "what has to be saved for an entry to come back" is not a thing anyone can
+    // forget -- adding a field here adds it to both at once.
+    //
+    // Each entry names its LOADER: the value the field takes coming back out of
+    // storage, coercing whatever was actually there. A task type's own fields are
+    // applied after the common ones, so it can override them (a walk does, for
+    // duration and for the coordinates).
+    const ENTRY_FIELDS = {
+        common: {
+            id:         j => j.id || generateId(),
+            retries:    j => parseInt(j.retries, 10) || 0,
+            deferrals:  j => parseInt(j.deferrals, 10) || 0,
+            rejections: j => parseInt(j.rejections, 10) || 0,
+            jobName:    j => j.jobName || `Job #${j.jobId}`,
+            jobId:      j => parseInt(j.jobId, 10) || 0,
+            x:          j => parseInt(j.x, 10) || 0,
+            y:          j => parseInt(j.y, 10) || 0,
+            duration:   j => parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION,
+            taskType:   j => j.taskType || 'job',
+        },
+        // A sleep has no job id; the town and the room describe it.
+        sleep: {
+            townId:     j => parseInt(j.townId, 10),
+            room:       j => j.room,
+            sleepMode:  j => (j.sleepMode === 'enough' ? 'enough' : 'full'),
+            modeChosen: j => !!j.modeChosen,
+        },
+        walk: {
+            walkType: j => j.walkType,
+            unitId:   j => (j.unitId === null || j.unitId === undefined) ? null : j.unitId,
+            // A walk's length IS its travel, so zero is the right stored value --
+            // the common DEFAULT_DURATION fallback would invent fifteen minutes of
+            // standing still.
+            duration: () => 0,
+            // No coordinates is a real state, not a zero: it means "we don't know
+            // where this ends", and the ETA chain has to leave the character where
+            // it was rather than teleport it to (0,0).
+            x: j => (typeof j.x === 'number' ? j.x : null),
+            y: j => (typeof j.y === 'number' ? j.y : null),
+        },
+    };
+
+    // Whether a stored entry carries enough to be rebuilt at all. Anything failing
+    // this is dropped on load -- so whatever it reads MUST be in ENTRY_FIELDS.
+    const ENTRY_USABLE = {
+        sleep: j => parseInt(j.townId, 10) > 0 && !!j.room,
+        // A walk is identified by its target, not by a job id. Without a type the
+        // game could not be told where to go, so such an entry is dropped.
+        walk: j => !!j.walkType,
+        job: j => j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10)),
+    };
+
+    // An unknown task type falls back to the plain-job rules, which is what the
+    // hand-written if-chain did before.
+    function entryFields(taskType) {
+        return Object.assign({}, ENTRY_FIELDS.common, ENTRY_FIELDS[taskType] || {});
+    }
+
     function sanitizeJobs(list) {
-        const usable = j => {
-            if (!j) return false;
-            if (j.taskType === 'sleep') return parseInt(j.townId, 10) > 0 && !!j.room;
-            // A walk is identified by its target, not by a job id. Without a type
-            // the game could not be told where to go, so such an entry is dropped.
-            if (j.taskType === 'walk') return !!j.walkType;
-            return j.jobId !== undefined && j.jobId !== null && !isNaN(parseInt(j.jobId, 10));
-        };
         return list
-            .filter(usable)
+            .filter(j => j && (ENTRY_USABLE[j.taskType] || ENTRY_USABLE.job)(j))
             .map(j => {
-                const isWalk = j.taskType === 'walk';
-                const base = {
-                    id: j.id || generateId(),
-                    retries: parseInt(j.retries, 10) || 0,
-                    deferrals: parseInt(j.deferrals, 10) || 0,
-                    rejections: parseInt(j.rejections, 10) || 0,
-                    jobName: j.jobName || `Job #${j.jobId}`,
-                    jobId: parseInt(j.jobId, 10) || 0,
-                    x: parseInt(j.x, 10) || 0,
-                    y: parseInt(j.y, 10) || 0,
-                    // A walk's length IS its travel, so zero is the right stored
-                    // value -- the usual DEFAULT_DURATION fallback would invent
-                    // fifteen minutes of standing still.
-                    duration: isWalk ? 0 : (parseInt(j.duration, 10) || CONFIG.DEFAULT_DURATION),
-                    taskType: j.taskType || 'job',
-                };
-                // A sleep has no job id; the town and the room describe it.
-                if (base.taskType === 'sleep') {
-                    base.townId = parseInt(j.townId, 10);
-                    base.room = j.room;
-                    base.sleepMode = j.sleepMode === 'enough' ? 'enough' : 'full';
-                    base.modeChosen = !!j.modeChosen;
-                }
-                if (isWalk) {
-                    base.walkType = j.walkType;
-                    base.unitId = (j.unitId === null || j.unitId === undefined) ? null : j.unitId;
-                    // No coordinates is a real state, not a zero: it means "we don't
-                    // know where this ends", and the ETA chain has to leave the
-                    // character where it was rather than teleport it to (0,0).
-                    const hasPos = typeof j.x === 'number' && typeof j.y === 'number';
-                    base.x = hasPos ? j.x : null;
-                    base.y = hasPos ? j.y : null;
-                }
-                return base;
+                const out = {};
+                const fields = entryFields(j.taskType || 'job');
+                for (const key in fields) out[key] = fields[key](j);
+                return out;
             })
             .slice(0, CONFIG.MAX_EXTRA_QUEUE);
     }
 
-    // Everything sanitizeJobs needs to accept the entry back has to be written --
-    // it filters a sleep on townId and a walk on walkType, so an entry saved
-    // without them is silently dropped on the next load. That is how a queued
-    // sleep used to disappear across a reload.
+    // Exactly the keys sanitizeJobs will read back. A field missing off a live
+    // entry is written as undefined, JSON drops it, and the loader coerces it to
+    // its default -- the same answer the old hand-written `|| 0` gave.
     function saveExtraQueueToStorage() {
         saveStore(CONFIG.STORAGE_EXTRA_QUEUE, extraJobs.map(j => {
-            const out = {
-                id: j.id, retries: j.retries, deferrals: j.deferrals || 0,
-                rejections: j.rejections || 0, jobName: j.jobName,
-                jobId: j.jobId, x: j.x, y: j.y, duration: j.duration, taskType: j.taskType,
-            };
-            if (j.taskType === 'sleep') {
-                out.townId = j.townId;
-                out.room = j.room;
-                out.sleepMode = j.sleepMode;
-                out.modeChosen = !!j.modeChosen;
-            }
-            if (j.taskType === 'walk') {
-                out.walkType = j.walkType;
-                out.unitId = j.unitId;
-            }
+            const out = {};
+            for (const key in entryFields(j.taskType || 'job')) out[key] = j[key];
             return out;
         }));
     }

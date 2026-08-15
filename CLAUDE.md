@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 333 assertions, no dependencies.
+  name and runs them against stubs. 358 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -24,7 +24,7 @@ treat it as the baseline rather than something to redesign.
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `333 passed, 0 failed`.
+2. `node test-queue.js` should print `358 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -346,6 +346,13 @@ overflow into `extraJobs` instead of letting it evaporate.
 - Everything `sanitizeJobs` needs to accept an entry back must actually be **written** by
   `saveExtraQueueToStorage`. It filters a sleep on `townId` and a walk on `walkType`, and the save
   used to omit both — which is how a queued sleep silently disappeared across a reload.
+  **Since v12.17 this cannot drift**: both sides walk one declaration, `ENTRY_FIELDS` (plus
+  `ENTRY_USABLE` for the validity check). Each entry there names the field's *loader* — the value
+  it takes coming back out of storage — and a task type's own fields are applied after the common
+  ones, so a walk can override `duration` (0, not the 15-minute default) and `x`/`y` (`null`, not
+  0). Adding a field adds it to the writer and the reader at once. Guarded by save→load round-trip
+  assertions per task type under "Storage round-trip"; deleting `townId` from the schema makes five
+  of them fail, including the original symptom (the sleep is gone after the load).
 
 ### Travel time
 
@@ -856,3 +863,8 @@ and "Nem" correctly does nothing.
   a function breaks the tests, and a new call to a browser-only function inside an already-extracted
   one needs a stub near the top of `test-queue.js`. That is the usual cause of a sudden
   `ReferenceError: … is not defined` when the tests had been passing.
+  `extract` only finds `function name(`. For a `const NAME = {…}` there is `extractGlobalConst`,
+  which rewrites the declaration to a `global.` assignment — a `const` declared inside an `eval`
+  stays inside that eval, while a function declaration leaks out on its own. And when the real
+  function collides with a stub of the same name, extract it under another name, the way the
+  round-trip test takes `saveExtraQueueToStorage` as `saveExtraQueueReal`.
