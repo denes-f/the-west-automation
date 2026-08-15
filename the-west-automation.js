@@ -152,11 +152,6 @@
         };
     }
 
-    function extractJobName(body) {
-        const task = extractTaskFromBody(body);
-        return task ? `Job #${task.jobId}` : 'Ismeretlen';
-    }
-
     // EVERY job of one request, in order. The response's tasks[] array maps by
     // index onto the request's jobs, so pairing them needs the whole list.
     function extractTasksFromBody(body) {
@@ -281,9 +276,9 @@
         return Math.min(Math.max(wait, CONFIG.MIN_SEND_GAP), CONFIG.MAX_WAIT_MS);
     }
 
-    // ------------------------------------------------------------
-    //  Predicted start / finish
-    // ------------------------------------------------------------
+    // ============================================================
+    //  5. PREDICTED START / FINISH
+    // ============================================================
     // Character.calcWayTo(x, y) gives the travel time in seconds from the CURRENT
     // position, but chaining needs the time between any two arbitrary points.
     // Verified by measurement: the time is exactly linear in euclidean distance
@@ -390,9 +385,9 @@
         });
     }
 
-    // ------------------------------------------------------------
-    //  Energy and motivation
-    // ------------------------------------------------------------
+    // ============================================================
+    //  6. ENERGY AND MOTIVATION
+    // ============================================================
     // We ask the game for both, we never model them:
     //  - the per-job energy cost and the motivation come from a single READ-ONLY
     //    call (Ajax.remoteCallMode "job"/"job"), which spends no energy;
@@ -798,9 +793,9 @@
         return forecast.findIndex(f => f && f.notEnoughEnergy);
     }
 
-    // ------------------------------------------------------------
-    //  Forecast energy bar below the character's energy bar
-    // ------------------------------------------------------------
+    // ============================================================
+    //  7. THE FORECAST ENERGY BAR, BELOW THE CHARACTER'S OWN
+    // ============================================================
     // The game's bar is a single div; the fill comes from the background sprite's
     // offset. The formula was read out of the game (WestUi.updateEnergy), so our
     // own bar looks pixel-identical -- only fainter, because it is a prediction.
@@ -992,9 +987,9 @@
         return { etas, forecast };
     }
 
-    // ------------------------------------------------------------
-    //  Sleeping
-    // ------------------------------------------------------------
+    // ============================================================
+    //  8. SLEEPING
+    // ============================================================
     // The game starts a sleep the same way as a job:
     // TaskQueue.add(new TaskSleep(townId, room)) -- exactly what the hotel
     // window's start button does. While asleep the game raises energyRegen
@@ -1176,9 +1171,9 @@
         };
     }
 
-    // ------------------------------------------------------------
-    //  Walking
-    // ------------------------------------------------------------
+    // ============================================================
+    //  9. WALKING
+    // ============================================================
     // Walking to a fort, a quest giver or the county fair is a queue entry of its
     // own (TaskWalk), added through the very same TaskQueue.add -- so a full queue
     // discards it silently, exactly like a job. Measured shape of an unqueued one:
@@ -1546,6 +1541,11 @@
         }
     }
 
+    // ============================================================
+    //  10. PUTTING THE FORECAST INTO WORDS
+    // ============================================================
+    // Shared by both displays -- the panel's rows and the tiles injected into the
+    // game's queue widget -- so the two can never describe the same job differently.
     function clockHM(ms) {
         const d = new Date(ms);
         return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -1574,18 +1574,6 @@
             : `${clockHM(eta.start)}→${clockHM(eta.finish)}${dayOffset(eta.finish)}`;
     }
 
-    // ------------------------------------------------------------
-    //  Waiting jobs in the game's queue widget (display only)
-    // ------------------------------------------------------------
-    // The contents of #queuedTasks belong to the game, we don't write there. Our
-    // own elements go into a separate container directly below it, with the game's
-    // class names -- identical appearance without modifying the game's DOM.
-    //
-    // The container's parent (.middle) has a DIRECT click handler in the game that
-    // reacts to the taskAbort / taskHalveway / taskInstantFinish / centermap / icon
-    // classes and parses the queueId out of the class name. Our rows have no real
-    // task behind them, so we let no click travel upwards at all -- without that,
-    // one click would cancel a real job.
     // The energy warning in words. The forecast pays each cost at the moment the
     // energy reaches it, so "not enough energy" is normally a WAIT, not a shortfall:
     // the job starts that much later. A real shortfall is only possible when there is
@@ -1606,6 +1594,18 @@
         return out.join(', ');
     }
 
+    // ============================================================
+    //  11. WAITING JOBS IN THE GAME'S QUEUE WIDGET (DISPLAY ONLY)
+    // ============================================================
+    // The contents of #queuedTasks belong to the game, we don't write there. Our
+    // own elements go into a separate container directly below it, with the game's
+    // class names -- identical appearance without modifying the game's DOM.
+    //
+    // The container's parent (.middle) has a DIRECT click handler in the game that
+    // reacts to the taskAbort / taskHalveway / taskInstantFinish / centermap / icon
+    // classes and parses the queueId out of the class name. Our rows have no real
+    // task behind them, so we let no click travel upwards at all -- without that,
+    // one click would cancel a real job.
     function pendingIconUrl(job) {
         try {
             if (!gameReady()) return null;
@@ -1757,7 +1757,7 @@
     }
 
     // The game rebuilds the contents of #queuedTasks on every queue change, and
-    // drops our rows with it. Left to the two-second watcher this is a visible
+    // drops our rows with it. Left to the once-a-second watcher this is a visible
     // flicker: the waiting rows disappear and come back. So we replace them
     // immediately, in the same round.
     //
@@ -1874,7 +1874,7 @@
         const split = previewSplit(extraJobs.length, preview);
         const shown = extraJobs.slice(0, split.shown);
         const hidden = split.hidden;
-        // The watcher calls every 2 s. We only rebuild when the list changed, or when
+        // The watcher calls every second. We only rebuild when the list changed, or when
         // our rows disappeared during the game's redraw (self-healing).
         // The warnings are part of the key too: if a job's motivation or energy
         // crosses the threshold, the rows have to be redrawn. So is the preview
@@ -1919,6 +1919,9 @@
         }
     }
 
+    // ============================================================
+    //  12. HANDING JOBS OVER TO THE GAME
+    // ============================================================
     // We call the game's own add, never raw XHR. That leaves the hash, the slot
     // handling and the limit check to the game, keeps the bottom-right queue UI in
     // sync (with raw XHR the server knew about the job but the game client did
@@ -1961,7 +1964,7 @@
     }
 
     // ============================================================
-    //  4b. CATCHING WHAT THE GAME WOULD THROW AWAY
+    //  13. CATCHING WHAT THE GAME WOULD THROW AWAY
     // ============================================================
     // TaskQueue.add TRUNCATES silently when the queue is full. Read out of the
     // bundle, verbatim:
@@ -2037,7 +2040,7 @@
     }
 
     // ============================================================
-    //  5. UNLOCKING THE AMOUNT SELECTOR
+    //  14. UNLOCKING THE AMOUNT SELECTOR
     // ============================================================
     function initAmountPatch() {
         document.addEventListener('click', function(e) {
@@ -2071,7 +2074,7 @@
     }
 
     // ============================================================
-    //  6. AUTO-CLOSING THE "MORE JOBS?" DIALOG
+    //  15. AUTO-CLOSING THE "MORE JOBS?" DIALOG
     // ============================================================
     function closeMoreJobsDialog() {
         const dialogs = document.querySelectorAll('.tw2gui_dialog');
@@ -2106,7 +2109,7 @@
     }
 
     // ============================================================
-    //  7. EXTRACTING JOB DATA (FOR THE FALLBACK)
+    //  16. READING JOB DATA OUT OF THE JOB WINDOW
     // ============================================================
     // "45 mp", "15 p", "1 ó", "1 ó 30 p" -> seconds. Handles compound forms and
     // hours too: without that every long job looked like 15 minutes.
@@ -2169,8 +2172,11 @@
     }
 
     // ============================================================
-    //  9. XHR INTERCEPTOR
+    //  17. INTERCEPTING EVERY WAY A JOB CAN BE STARTED
     // ============================================================
+    // Three of them: the job window's start buttons (below), the map's quick-start
+    // arrows, and the game's own "cancel all" -- each takes the whole batch into our
+    // list instead of letting it jump the queue.
     document.addEventListener('click', function(e) {
         const startBtn = e.target.closest('.job_startbutton');
         if (!startBtn) return;
@@ -2335,6 +2341,9 @@
         if (e.target.closest('#cancelAllInQueue')) watchCancelAllConfirm();
     }, true);
 
+    // ============================================================
+    //  18. THE XHR INTERCEPTOR: WHAT THE SERVER SAID TO OUR BATCH
+    // ============================================================
     // Jobs rejected by the server go back to the FRONT of the list, in their
     // original order -- so the user's ordering stays intact.
     // We don't drop them after a couple of tries: the most common cause (not
@@ -2481,7 +2490,7 @@
             y: jobData.y,
             duration: jobData.duration,
             taskType: jobData.taskType || 'job',
-            jobName: jobData.jobName || extractJobName(jobData.body),
+            jobName: jobData.jobName,
             timestamp: Date.now(),
         });
         if (jobHistory.length > CONFIG.MAX_HISTORY) jobHistory.length = CONFIG.MAX_HISTORY;
@@ -2489,7 +2498,7 @@
     }
 
     // ============================================================
-    //  10. MANAGING THE EXTRA QUEUE
+    //  19. MANAGING THE EXTRA QUEUE
     // ============================================================
     // Batched add: a single localStorage write instead of N. Adding 99 jobs used
     // to mean 99 synchronous stringify+write cycles.
@@ -2522,7 +2531,7 @@
     }
 
     // ============================================================
-    //  12. PROCESSING
+    //  20. PROCESSING
     // ============================================================
     // By default it only schedules when there is no timer at all -- that way the
     // per-second heartbeat doesn't trample the deliberate waits (full queue,
@@ -2696,14 +2705,15 @@
             scheduleNextJob(waitMs);
         } finally {
             processing = false;
-            // Emergency brake: in normal operation applyVerdict has already scheduled.
-            // If it somehow hasn't, we restart slowly here – not with a 500 ms spin.
+            // Emergency brake: in normal operation every branch above has already
+            // scheduled. If one somehow hasn't, we restart slowly here – not with a
+            // 500 ms spin.
             if (!paused && extraJobs.length > 0 && !nextJobTimer) scheduleNextJob(CONFIG.IDLE_RESCHEDULE);
         }
     }
 
     // ============================================================
-    //  13. UI AND STORAGE
+    //  21. STORAGE
     // ============================================================
     // The version goes into the content, not into the key, and we migrate once
     // from the old keys – so an update never strands the user's queue.
@@ -2835,7 +2845,7 @@
     }
 
     // ============================================================
-    //  13/b. KEEP-AWAKE (for multi-hour queues)
+    //  22. KEEP-AWAKE (for multi-hour queues)
     // ============================================================
     // A multi-hour queue only runs to the end if the MACHINE and the TAB both stay
     // awake. There are two separate obstacles with two separate answers:
@@ -2985,7 +2995,7 @@
     }
 
     // ============================================================
-    //  13/b. TICKER: A BACKGROUND TAB'S TIMERS GET THROTTLED
+    //  23. TICKER: A BACKGROUND TAB'S TIMERS GET THROTTLED
     // ============================================================
     // MEASURED (Chrome, hu27, hidden tab, 2×7 minutes):
     //
@@ -3182,7 +3192,7 @@
     });
 
     // ============================================================
-    //  14. MULTIPLE TABS: A SINGLE PROCESSOR
+    //  24. MULTIPLE TABS: A SINGLE PROCESSOR
     // ============================================================
     // Two open game tabs used to send from the same list in parallel.
     // The leader tab writes a heartbeat into localStorage; the rest follow passively.
@@ -3318,9 +3328,8 @@
         });
     }
 
-    // --- Menu bar button ---
     // ============================================================
-    //  THE PANEL: IN THE GAME'S OWN WINDOW FRAME
+    //  25. THE PANEL: IN THE GAME'S OWN WINDOW FRAME
     // ============================================================
     // wman is the game's window manager: wman.open(uid, title) gives a real game
     // window with a frame, a title bar, minimize/close buttons and drag-to-move.
@@ -3714,12 +3723,6 @@
         warnEl.title = reasons.length ? `${job.jobName} – ${reasons.join(', ')}` : '';
         li.classList.toggle('lisa-row-warn', reasons.length > 0);
 
-        // What the row shows is the energy WHILE THIS JOB RUNS: the level when it
-        // starts and when it finishes. The cost itself is taken earlier, when the
-        // game accepts the job -- that belongs in the tooltip, not in the headline
-        // number. Showing the post-deduction figure as if it were frozen was wrong
-        // in the other direction: energy keeps regenerating both while the job waits
-        // in the game's queue and while it runs.
         // The energy LEFT once this job is paid for. This is the pay chain, and it is
         // the only reading that carries a signal on every row: it steps down by the
         // job's own cost (and back up wherever regeneration outpaces the costs).
@@ -3806,8 +3809,9 @@
         updateUI();
         updateUIStatus('Extra sor törölve.');
     }
+
     // ============================================================
-    // BOOT
+    //  26. BOOT
     // ============================================================
     function boot() {
         // Decide the leader before any processing, so a second tab doesn't start
