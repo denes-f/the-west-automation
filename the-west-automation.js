@@ -75,6 +75,8 @@
         RELOAD_DELAY_MS: 20000,      // ...this long after noticing it
         RELOAD_MAX: 3,               // ...but no more often than this many times
         RELOAD_WINDOW_MS: 1800000,   // ...within this window, so a reload that can't log back in can't loop
+        AUTO_LOGIN_BONUS: false,     // after OUR reload, collect the daily login bonus (button unverified live)
+        LOGIN_BONUS_AFTER_RELOAD_MS: 120000,  // a load this soon after our reload counts as ours
     };
 
     // ============================================================
@@ -2685,6 +2687,35 @@
         p.forceLogout.__lisa = true;
     }
 
+    // The reload usually lands on the daily login bonus: a modal dialog the game
+    // raises on its own when Player.hasLoginBonus (west.player.LoginBonus). Its
+    // "Átvétel" button is a west.gui.Button with the class `collect-btn`, inside a
+    // dialog with the class `loginbonus` -- read out of the bundle, NOT yet seen
+    // live, hence off by default. We press the game's own button rather than call
+    // the server ourselves, so the game's flow (closing, showing the reward) runs.
+    // Only after a reload WE did: someone reloading by hand is there to click it.
+    function reloadedByUs() {
+        const list = recentReloads(Date.now());
+        if (!list.length) return false;
+        const since = scriptStartedAt - Math.max(...list);
+        return since >= 0 && since < CONFIG.LOGIN_BONUS_AFTER_RELOAD_MS;
+    }
+
+    function collectLoginBonusAfterReload() {
+        if (!CONFIG.AUTO_LOGIN_BONUS || !reloadedByUs()) return;
+        if (!window.Player || !window.Player.hasLoginBonus) return;
+        pollFor(() => {
+            const el = document.querySelector('.loginbonus .collect-btn');
+            if (!el) return false;
+            const btn = el.guiElement;
+            if (btn && typeof btn.click === 'function') btn.click();
+            else el.click();
+            console.log('[Lisa] Daily login bonus collected after the automatic reload.');
+            return true;
+        }, 1000, 60,
+            () => console.warn('[Lisa] The login bonus button never showed up; leaving it to the user.'));
+    }
+
     // ============================================================
     //  20. MANAGING THE EXTRA QUEUE
     // ============================================================
@@ -4039,6 +4070,7 @@
             : 'Passzív fül – egy másik, látható fül dolgozza fel a sort.');
         initAmountPatch();
         patchForceLogout();
+        collectLoginBonusAfterReload();
         // The game's queue also changes from the outside (a job finishes, the user
         // cancels one), so we look in on it regularly.
         lastSeenQueueLen = gameQueueLength();

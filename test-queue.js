@@ -1711,6 +1711,44 @@ eq('the status then asks for a manual reload', /töltsd újra/.test(sessionLostS
 sessionLost = null;
 reloadAfterLogout();
 eq('no logout, no reload', reloads, 4);
+// The daily login bonus: only after OUR reload, only when switched on, and by
+// pressing the game's own button.
+console.log('\n=== Login bonus after our reload ===');
+CONFIG.LOGIN_BONUS_AFTER_RELOAD_MS = 120000;
+let scriptStartedAt = reloadNow;
+let bonusClicks = 0, polled = 0;
+const pollFor = (fn) => { polled++; fn(1); };
+const bonusButton = { guiElement: { click: () => { bonusClicks++; } } };
+global.document = { querySelector: (sel) => (sel === '.loginbonus .collect-btn' ? bonusButton : null) };
+eval([extract('reloadedByUs'), extract('collectLoginBonusAfterReload')].join('\n'));
+window.Player = { hasLoginBonus: true };
+
+delete store[CONFIG.STORAGE_RELOADS];
+CONFIG.AUTO_LOGIN_BONUS = true;
+collectLoginBonusAfterReload();
+eq('no reload of ours -> the user clicks it', [polled, bonusClicks], [0, 0]);
+
+store[CONFIG.STORAGE_RELOADS] = JSON.stringify([reloadNow - 5000]);
+CONFIG.AUTO_LOGIN_BONUS = false;
+collectLoginBonusAfterReload();
+eq('off by default: nothing pressed', [polled, bonusClicks], [0, 0]);
+
+CONFIG.AUTO_LOGIN_BONUS = true;
+collectLoginBonusAfterReload();
+eq("switched on, after our reload: the game's own button is pressed", bonusClicks, 1);
+
+window.Player.hasLoginBonus = false;
+collectLoginBonusAfterReload();
+eq('no bonus due -> nothing to press', bonusClicks, 1);
+window.Player.hasLoginBonus = true;
+
+scriptStartedAt = reloadNow + 10 * 60000;   // a manual reload, ten minutes after ours
+collectLoginBonusAfterReload();
+eq('a later load is not ours', bonusClicks, 1);
+
+delete store[CONFIG.STORAGE_RELOADS];
+delete global.document;
+CONFIG.AUTO_LOGIN_BONUS = false;
 Date.now = realNow;
 delete global.location;
 
