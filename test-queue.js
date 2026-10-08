@@ -83,6 +83,8 @@ const real = console.log;
 console.log = quiet; console.warn = quiet; console.error = quiet;
 
 let handingOver = false;   // set while our own batch is inside TaskQueue.add
+let sessionLost = null;   // { at, reason } once the server has logged us out
+let inFlightBatch = null; // what startJobsViaGame handed over last
 
 eval([
     'gameReady', 'gameQueueLength', 'gameQueueLimit', 'freeSlots', 'nextFreeAtMs',
@@ -392,6 +394,7 @@ const cancelSleepIfFull = () => {};   // cancelling a sleep needs live game stat
 const askRunningSleepMode = () => {}; // needs a dialog
 const patchHotelStart = () => {};     // the hotel window only exists in the game
 const patchTaskQueueAdd = () => {};   // ...and so does TaskQueue
+const patchForceLogout = () => {};    // ...and Player
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -1547,6 +1550,72 @@ currentPlanReal(); currentPlanReal(); currentPlanReal(); currentPlanReal();
 eq('four askers in one tick, one computation', plans, 1);
 
 Date.now = realNow;
+
+// ============================================================
+//  Session loss
+// ============================================================
+// The login expires after about a day. Measured: every game.php request is then
+// answered with HTTP 200 and the body below -- no `error`, no `tasks`. The add
+// reply therefore read as "nothing rejected" and the handed-over batch was lost,
+// and the forecast, reading a game client that had stopped hearing from the
+// server, raised a phantom "not enough energy, insert a sleep?" offer.
+console.log('\n=== Session loss ===');
+const LOGOUT_BODY = '{"fatal":true,"message":"Az elmentett bejelentkez\\u00e9sed lej\\u00e1rt vagy \\u00e9rv\\u00e9nytelen. K\\u00e9rlek jelentkezz be ism\\u00e9t.","logout":true}';
+eval([extract('isLogoutResponse'), extract('markSessionLost'),
+      extract('sessionLostStatus')].join('\n'));
+const patchForceLogoutReal = asFn('patchForceLogout');
+
+eq('the measured logout body is recognised', isLogoutResponse(LOGOUT_BODY), true);
+eq('an ordinary add reply is not a logout',
+   isLogoutResponse('{"tasks":[{"task":{"queue_id":1}}],"energy":91.78}'), false);
+eq('"logout" as mere text is not a logout', isLogoutResponse('{"msg":"logout"}'), false);
+eq('a broken body is not a logout', isLogoutResponse('{"logout":tru'), false);
+eq('a fatal top-level reply fails the WHOLE batch',
+   rejectedFromAddResponse(b3, JSON.parse(LOGOUT_BODY)).length, 3);
+
+// The batch handed over last never reached the server: back to the FRONT, in order.
+const lostA = { id: 'lostA', jobId: 1, duration: 15 }, lostB = { id: 'lostB', jobId: 2, duration: 15 };
+extraJobs = mkJobs(2);
+inFlightBatch = { jobs: [lostA, lostB], at: Date.now() };
+sessionLost = null;
+markSessionLost('server');
+eq('the session is marked lost', sessionLost && sessionLost.reason, 'server');
+eq('the in-flight batch is back at the front, in order',
+   extraJobs.map(j => j.id), ['lostA', 'lostB', 'j0', 'j1']);
+eq('...and is no longer in flight', inFlightBatch, null);
+eq('putting it back is not a rejection', lostA.rejections, undefined);
+inFlightBatch = { jobs: [lostA], at: Date.now() };
+markSessionLost('forceLogout');
+eq('a second signal changes nothing', [sessionLost.reason, extraJobs.length], ['server', 4]);
+
+// Frozen: nothing is handed over, however many slots look free.
+window.TaskQueue = makeGame(4, 0);
+processing = false;
+await processQueue();
+eq('a dead session sends nothing', [window.TaskQueue.addCalls, extraJobs.length], [0, 4]);
+
+// ...and the frozen forecast raises no sleep question.
+sleepOffer = null; sleepDeclinedUntil = 0; dialogs = 0;
+lastForecast = [{ notEnoughEnergy: true, cost: 5 }];
+offerSleepReal();
+eq('no sleep offer from a frozen forecast', [sleepOffer, dialogs], [null, 0]);
+maybeOfferSleep(5, 0);
+eq('...nor from the energy pre-check', [sleepOffer, dialogs], [null, 0]);
+
+// The chat's "invalid sid" path only ever reaches Player.forceLogout.
+sessionLost = null;
+let forceLogouts = 0;
+window.Player = { forceLogout: () => { forceLogouts++; } };
+patchForceLogoutReal();
+patchForceLogoutReal();               // the watcher calls it every second
+window.Player.forceLogout('Regisztrációs azonosítód lejárt.');
+eq('forceLogout marks the session lost', !!sessionLost, true);
+eq("...and still shows the game's own box, once", forceLogouts, 1);
+
+sessionLost = null;
+extraJobs = [];
+lastForecast = [];
+delete window.Player;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

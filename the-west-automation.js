@@ -86,6 +86,7 @@
     let lastSeenQueueLen = 0;
     let inFlightBatch = null;        // what we just handed to the game, until the response
     let handingOver = false;         // our own TaskQueue.add is in flight -- don't divert it
+    let sessionLost = null;          // { at, reason } once the server has logged us out
     let lastForecast = [];           // per-job energy/motivation forecast
     let renderedPendingKey = '';
     let pendingObserver = null;
@@ -180,7 +181,10 @@
     function rejectedFromAddResponse(batch, data) {
         if (!batch || !batch.length || !data) return [];
         if (!Array.isArray(data.tasks)) {
-            return data.error ? batch.map(job => ({ job, msg: data.msg || '' })) : [];
+            // `fatal` is the other top-level failure: it is what a logged-out
+            // session answers ({fatal, message, logout}, no `error` at all).
+            if (!data.error && !data.fatal) return [];
+            return batch.map(job => ({ job, msg: data.msg || data.message || '' }));
         }
         const out = [];
         data.tasks.forEach((entry, i) => {
@@ -1342,7 +1346,7 @@
     // not raised again, but the offer stays in the panel in a collapsed form, so
     // the user can change their mind at any time without going to the hotel.
     function maybeOfferSleep(neededEnergy, atIndex) {
-        if (!CONFIG.AUTO_SLEEP || !canSleep()) return;
+        if (!CONFIG.AUTO_SLEEP || !canSleep() || sessionLost) return;
         if (isSleeping() || extraJobs.some(j => j.taskType === 'sleep')) {
             // A sleep is already running or queued: there is nothing left to offer.
             clearDeclinedSleepOffer();
@@ -1435,6 +1439,9 @@
     // solving already. Without this the panel only said "-2" and offered no
     // solution for it.
     function offerSleepIfForecastRunsOut() {
+        // After a logout the forecast reads a frozen game -- that is where the
+        // phantom "not enough energy" offer came from.
+        if (sessionLost) return;
         const i = forecastShortageIndex(lastForecast);
         if (i === -1) {
             // The shortage is gone -- energy recovered, or the jobs were removed.
@@ -1476,7 +1483,7 @@
     // it run out, or cut it short once enough energy has built up for the jobs.
     // We ask once per sleep, and the answer stays bound to the task's queue id.
     function askRunningSleepMode() {
-        if (!CONFIG.AUTO_SLEEP) return;
+        if (!CONFIG.AUTO_SLEEP || sessionLost) return;
         if (!gameReady() || !isLeaderTab) return;
         // Adopting the chosen mode must not depend on whether work is waiting.
         adoptPendingSleepMode();
@@ -1566,7 +1573,7 @@
     // challenged to a duel, so with no work sleeping is the better state, even at
     // full energy. Without this the script would cancel every sleep immediately.
     function cancelSleepIfFull() {
-        if (!gameReady() || !isLeaderTab) return;
+        if (!gameReady() || !isLeaderTab || sessionLost) return;
         const pos = window.TaskQueue.queue.findIndex(t => t && t.type === 'sleep');
         if (pos === -1) return;
         const task = window.TaskQueue.queue[pos];
@@ -2466,6 +2473,12 @@
             if (loadBound) return origSend.apply(this, arguments); // reused xhr: don't bind twice
             loadBound = true;
             xhr.addEventListener('load', function() {
+                // Before anything else: a logged-out session answers EVERY request
+                // with {logout:true}, and must not be read as our batch's verdict.
+                if (reqUrl.includes('game.php') && isLogoutResponse(xhr.responseText)) {
+                    markSessionLost('server');
+                    return;
+                }
                 if (reqMethod !== 'POST') return;
                 if (!reqUrl.includes(CONFIG.JOB_ADD_ENDPOINT)) return;
 
@@ -2511,7 +2524,70 @@
     window.XMLHttpRequest = InterceptedXHR;
 
     // ============================================================
-    //  19. MANAGING THE EXTRA QUEUE
+    //  19. SESSION LOSS
+    // ============================================================
+    // The login expires after about a day. What the server then answers to every
+    // game.php request was measured (HTTP 200, no `error` field):
+    //   {"fatal":true,"message":"Az elmentett bejelentkezésed lejárt…","logout":true}
+    // The game reacts in two places, both ending in Player.forceLogout(msg), a
+    // modal "Kijelentkezés" box: its Ajax layer on `logout`, and the chat server
+    // on "invalid sid" -- the latter is the "Regisztrációs azonosítód lejárt" the
+    // user actually saw. Read out of the bundle, after that:
+    //  - Ajax.request THROWS 'invalid session' before sending anything, so a
+    //    TaskQueue.add pushes the task locally and the request never leaves;
+    //  - that throw lands inside TaskQueue.batchStart, so TaskQueue.busy stays
+    //    true for good, and the pushed tasks sit in the queue with no queueId
+    //    and no date_done.
+    // Everything we read from the game is fiction from then on, and every decision
+    // built on it -- the energy forecast raising a sleep offer, above all -- is
+    // wrong. Worse, the add reply carried neither `tasks` nor `error`, so our
+    // batch counted as accepted and its jobs were lost. So: detect it once,
+    // put the in-flight batch back, and stop deciding anything.
+    function isLogoutResponse(text) {
+        if (typeof text !== 'string' || text.indexOf('"logout"') === -1) return false;
+        try {
+            const data = JSON.parse(text);
+            return !!data && data.logout === true;
+        } catch(e) { return false; }
+    }
+
+    function markSessionLost(reason) {
+        if (sessionLost) return;
+        sessionLost = { at: Date.now(), reason };
+        console.warn(`[Lisa] The session has expired (${reason}) -- nothing is sent or decided until a reload.`);
+        // Whatever we handed over last cannot have reached the server: either its
+        // reply is this logout, or the game refused to even send it. It goes back
+        // to the FRONT, in order, and does not count as a rejection.
+        const batch = inFlightBatch;
+        inFlightBatch = null;
+        if (batch && batch.jobs.length) {
+            const back = batch.jobs.filter(j => !extraJobs.some(e => e.id === j.id));
+            extraJobs.unshift(...back);
+            console.warn(`[Lisa] ${back.length} job(s) from the last hand-over put back on the list.`);
+        }
+        queueChanged(sessionLostStatus());
+    }
+
+    function sessionLostStatus() {
+        return `Lejárt a bejelentkezés – újratöltés kell (${extraJobs.length} munka vár).`;
+    }
+
+    // The chat's "invalid sid" path never goes through the game's Ajax, so the XHR
+    // check alone would miss the very case that was reported. Wrapping the one
+    // function both paths end in covers them all, whatever the message says.
+    function patchForceLogout() {
+        const p = window.Player;
+        if (!p || typeof p.forceLogout !== 'function' || p.forceLogout.__lisa) return;
+        const orig = p.forceLogout;
+        p.forceLogout = function() {
+            try { markSessionLost('forceLogout'); } catch(e) {}
+            return orig.apply(this, arguments);
+        };
+        p.forceLogout.__lisa = true;
+    }
+
+    // ============================================================
+    //  20. MANAGING THE EXTRA QUEUE
     // ============================================================
     // Batched add: a single localStorage write instead of N. Adding 99 jobs used
     // to mean 99 synchronous stringify+write cycles.
@@ -2550,7 +2626,7 @@
     }
 
     // ============================================================
-    //  20. PROCESSING
+    //  21. PROCESSING
     // ============================================================
     // By default it only schedules when there is no timer at all -- that way the
     // per-second heartbeat doesn't trample the deliberate waits (full queue,
@@ -2609,6 +2685,12 @@
         try {
             if (paused) {
                 updateUIStatus('Szüneteltetve');
+                return;
+            }
+            // A dead session accepts nothing, and the game would push the jobs into
+            // its queue locally anyway -- from where they would never come back.
+            if (sessionLost) {
+                updateUIStatus(sessionLostStatus());
                 return;
             }
             if (extraJobs.length === 0) {
@@ -2731,7 +2813,7 @@
     }
 
     // ============================================================
-    //  21. STORAGE
+    //  22. STORAGE
     // ============================================================
     // The version goes into the content, not into the key, and we migrate once
     // from the old keys – so an update never strands the user's queue.
@@ -2866,7 +2948,7 @@
         saveExtraQueueToStorage();
     }
     // ============================================================
-    //  22. KEEP-AWAKE (for multi-hour queues)
+    //  23. KEEP-AWAKE (for multi-hour queues)
     // ============================================================
     // A multi-hour queue only runs to the end if the MACHINE and the TAB both stay
     // awake. There are two separate obstacles with two separate answers:
@@ -3016,7 +3098,7 @@
     }
 
     // ============================================================
-    //  23. TICKER: A BACKGROUND TAB'S TIMERS GET THROTTLED
+    //  24. TICKER: A BACKGROUND TAB'S TIMERS GET THROTTLED
     // ============================================================
     // MEASURED (Chrome, hu27, hidden tab, 2×7 minutes):
     //
@@ -3107,6 +3189,8 @@
     function pumpGameClient() {
         const ui = window.TaskQueueUi;
         if (!ui || typeof ui.tick !== 'function') return false;
+        // Nothing to catch up with: the server no longer answers this page.
+        if (sessionLost) return true;
         // Don't touch the queue while a batch (ours or the game's) is in flight.
         if (processing || (window.TaskQueue && window.TaskQueue.busy)) return true;
 
@@ -3210,10 +3294,12 @@
         keepAwake: keepAwakeStatus(),
         waitingJobs: extraJobs.length,
         leaderTab: isLeaderTab,
+        sessionLost: sessionLost
+            ? `${sessionLost.reason}, ${Math.round((Date.now() - sessionLost.at) / 1000)} s ago` : false,
     });
 
     // ============================================================
-    //  24. MULTIPLE TABS: A SINGLE PROCESSOR
+    //  25. MULTIPLE TABS: A SINGLE PROCESSOR
     // ============================================================
     // Two open game tabs used to send from the same list in parallel.
     // The leader tab writes a heartbeat into localStorage; the rest follow passively.
@@ -3264,6 +3350,7 @@
     function watchGameQueue() {
         ensureMenuButton();
         patchHotelStart();      // the hotel window may load later too
+        patchForceLogout();
         patchTaskQueueAdd();    // ...and so may TaskQueue itself
         updateQueueBadge();
         // This is the tick's one call to currentPlan(), so it must come before the
@@ -3351,7 +3438,7 @@
     }
 
     // ============================================================
-    //  25. THE PANEL: IN THE GAME'S OWN WINDOW FRAME
+    //  26. THE PANEL: IN THE GAME'S OWN WINDOW FRAME
     // ============================================================
     // wman is the game's window manager: wman.open(uid, title) gives a real game
     // window with a frame, a title bar, minimize/close buttons and drag-to-move.
@@ -3591,6 +3678,7 @@
     function refreshIdleStatus() {
         updateUIStatus(
             paused ? 'Szüneteltetve'
+            : sessionLost ? sessionLostStatus()
             : !isLeaderTab ? 'Passzív fül – egy másik, látható fül dolgozza fel a sort.'
             : extraJobs.length ? `${extraJobs.length} munka várakozik.`
             : 'Kész.');
@@ -3833,7 +3921,7 @@
     }
 
     // ============================================================
-    //  26. BOOT
+    //  27. BOOT
     // ============================================================
     function boot() {
         // Decide the leader before any processing, so a second tab doesn't start
@@ -3848,6 +3936,7 @@
             ? 'Kész.'
             : 'Passzív fül – egy másik, látható fül dolgozza fel a sort.');
         initAmountPatch();
+        patchForceLogout();
         // The game's queue also changes from the outside (a job finishes, the user
         // cancels one), so we look in on it regularly.
         lastSeenQueueLen = gameQueueLength();
