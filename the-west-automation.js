@@ -34,6 +34,7 @@
         STORAGE_LEADER: 'lisa_leader_tab',
         STORAGE_SLEEP_MODE: 'lisa_sleep_mode',
         STORAGE_RELOADS: 'lisa_logout_reloads',
+        STORAGE_SLEEP_DECLINED: 'lisa_sleep_declined_until',
         STORAGE_VERSION: 2,
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         MIN_SEND_GAP: 2000,          // between two consecutive sends
@@ -66,6 +67,7 @@
         AUTO_SLEEP: true,            // offer sleeping when energy runs short
         QUEUE_MANUAL_SLEEP: true,    // sleep started in the hotel also goes into our own queue
         SLEEP_DECLINE_MS: 1800000,   // after a "No" we don't ask again for this long
+        SLEEP_BOOT_GRACE_MS: 30000,  // no sleep question this soon after the page loads
         SLEEP_REGEN_ESTIMATE: 0.125, // only for estimating the DISPLAYED sleep length (measured)
         JOBGROUP_MAX_DIST: 200,      // a job group farther than this isn't accepted as the location
         GAME_QUEUE_PREVIEW: 6,       // how many waiting jobs show in the game's queue widget
@@ -92,6 +94,7 @@
     let inFlightBatch = null;        // what we just handed to the game, until the response
     let handingOver = false;         // our own TaskQueue.add is in flight -- don't divert it
     let sessionLost = null;          // { at, reason } once the server has logged us out
+    const scriptStartedAt = Date.now();
     let lastForecast = [];           // per-job energy/motivation forecast
     let renderedPendingKey = '';
     let pendingObserver = null;
@@ -1080,6 +1083,8 @@
     // without asking.
     let hotelRooms = null;          // { townId, rooms, at }
     let sleepOffer = null;          // the question currently on screen
+    // Persisted: a reload used to forget a "no", and the dialog came straight
+    // back -- which is how the sleep question reappeared after every refresh.
     let sleepDeclinedUntil = 0;
     // The decision about the RUNNING sleep, bound to the task's queue id. It is
     // persisted because a page reload must not ask the same question again.
@@ -1093,6 +1098,44 @@
             const parsed = raw ? JSON.parse(raw) : null;
             if (parsed && parsed.queueId) runningSleepDecision = parsed;
         } catch(e) {}
+    }
+
+    function setSleepDeclinedUntil(until) {
+        sleepDeclinedUntil = until;
+        try { localStorage.setItem(CONFIG.STORAGE_SLEEP_DECLINED, String(until)); } catch(e) {}
+    }
+
+    function loadSleepDeclined() {
+        try {
+            const until = Number(localStorage.getItem(CONFIG.STORAGE_SLEEP_DECLINED));
+            if (until > Date.now()) sleepDeclinedUntil = until;
+        } catch(e) {}
+    }
+
+    // Right after a load the game's state is still arriving -- the job costs come
+    // in one request per job, a reload lands in the middle of everything -- and a
+    // question raised from that half-picture is one the user then has to dismiss
+    // again. The processor itself does not wait; only the questions do.
+    function sleepQuestionsSettled() {
+        return Date.now() - scriptStartedAt >= CONFIG.SLEEP_BOOT_GRACE_MS;
+    }
+
+    // Why a sleep question came up, for the console: it was reported as appearing
+    // for no reason, and the numbers behind it are gone by the time anyone looks.
+    function sleepQuestionContext(atIndex) {
+        const c = window.Character || {};
+        const q = (gameReady() && window.TaskQueue.queue) || [];
+        return {
+            energy: c.energy, maxEnergy: c.maxEnergy, energyRegen: c.energyRegen,
+            energyAnchorAgeSec: typeof c.energyDate === 'number'
+                ? Math.round(serverNowSec() - c.energyDate) : null,
+            gameQueue: q.map(t => ({ type: t && t.type, queueId: t && t.queueId,
+                                     doneInSec: t && t.data && typeof t.data.date_done === 'number'
+                                         ? Math.round((t.data.date_done - Date.now()) / 1000) : null })),
+            waiting: extraJobs.length,
+            forecast: (lastForecast || []).slice(0, (atIndex || 0) + 1),
+            sinceLoadSec: Math.round((Date.now() - scriptStartedAt) / 1000),
+        };
     }
 
     function saveSleepDecision(queueId, mode) {
@@ -1351,7 +1394,7 @@
     // not raised again, but the offer stays in the panel in a collapsed form, so
     // the user can change their mind at any time without going to the hotel.
     function maybeOfferSleep(neededEnergy, atIndex) {
-        if (!CONFIG.AUTO_SLEEP || !canSleep() || sessionLost) return;
+        if (!CONFIG.AUTO_SLEEP || !canSleep() || sessionLost || !sleepQuestionsSettled()) return;
         if (isSleeping() || extraJobs.some(j => j.taskType === 'sleep')) {
             // A sleep is already running or queued: there is nothing left to offer.
             clearDeclinedSleepOffer();
@@ -1377,7 +1420,11 @@
         const declined = Date.now() < sleepDeclinedUntil;
         sleepOffer = { needed: neededEnergy, at, total, declined };
         renderSleepOffer();
-        if (!declined) showSleepDialog(sleepOffer);
+        if (!declined) {
+            console.info(`[Lisa] Sleep offered: ${neededEnergy} energy short at job ${at + 1}.`,
+                         sleepQuestionContext(at));
+            showSleepDialog(sleepOffer);
+        }
     }
 
     // How much energy do the remaining jobs need? That number says how long it is
@@ -1446,7 +1493,7 @@
     function offerSleepIfForecastRunsOut() {
         // After a logout the forecast reads a frozen game -- that is where the
         // phantom "not enough energy" offer came from.
-        if (sessionLost) return;
+        if (sessionLost || !sleepQuestionsSettled()) return;
         const i = forecastShortageIndex(lastForecast);
         if (i === -1) {
             // The shortage is gone -- energy recovered, or the jobs were removed.
@@ -1462,7 +1509,7 @@
     // in the panel, collapsed to a single button, so the user can come back to it
     // at any time; `sleepDeclinedUntil` keeps the game's dialog away meanwhile.
     function dismissSleepOffer(declined) {
-        if (declined) sleepDeclinedUntil = Date.now() + CONFIG.SLEEP_DECLINE_MS;
+        if (declined) setSleepDeclinedUntil(Date.now() + CONFIG.SLEEP_DECLINE_MS);
         if (declined && sleepOffer) sleepOffer.declined = true;
         else sleepOffer = null;               // accepted, or nothing left to keep
         renderSleepOffer();
@@ -1473,7 +1520,7 @@
     function reopenSleepOffer() {
         if (!sleepOffer) return;
         sleepOffer.declined = false;
-        sleepDeclinedUntil = 0;
+        setSleepDeclinedUntil(0);
         renderSleepOffer();
     }
 
@@ -1492,7 +1539,7 @@
         if (!gameReady() || !isLeaderTab) return;
         // Adopting the chosen mode must not depend on whether work is waiting.
         adoptPendingSleepMode();
-        if (sleepModeAsked) return;
+        if (sleepModeAsked || !sleepQuestionsSettled()) return;
         const task = window.TaskQueue.queue.find(t => t && t.type === 'sleep');
         if (!task || !task.queueId) return;
         // Nothing to wake up for: only work coming AFTER this sleep counts.
@@ -1504,6 +1551,7 @@
         }
 
         sleepModeAsked = true;
+        console.info(`[Lisa] Asking how long to sleep (queueId ${task.queueId}).`, sleepQuestionContext(0));
         // The waiting-job count includes the GAME's queue, the energy need does not:
         // a job already in the queue has had its energy deducted, so it needs no
         // more. That is why we omit a 0 rather than print it.
@@ -3982,6 +4030,7 @@
         initTabSync();
         loadExtraQueueFromStorage();
         loadSleepDecision();
+        loadSleepDeclined();
         ensurePanel();
         ensureMenuButton();
         updateUI();

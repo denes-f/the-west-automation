@@ -58,6 +58,10 @@ let extraJobs = [], paused = false, processing = false, nextJobTimer = null, isL
 let isSleeping = () => false;
 let jobEnergyCost = () => null;
 let maybeOfferSleep = () => {};
+// The post-load grace for sleep questions is tested on its own; elsewhere the
+// page has been up for long enough.
+let sleepQuestionsSettled = () => true;
+const sleepQuestionContext = () => ({});
 let scheduled = null;
 const rand = (a) => a;
 const saveExtraQueueToStorage = () => {};
@@ -1438,8 +1442,10 @@ jobEnergyCost = (job) => (job.taskType === 'sleep' ? null : 5);
 const asFn = (name) => eval('(' + extract(name) + ')');
 maybeOfferSleep = asFn('maybeOfferSleep');
 const offerSleepReal = asFn('offerSleepIfForecastRunsOut');
+CONFIG.STORAGE_SLEEP_DECLINED = 'lisa_sleep_declined_until';
 eval([extract('dismissSleepOffer'), extract('reopenSleepOffer'),
-      extract('clearDeclinedSleepOffer')].join('\n'));
+      extract('clearDeclinedSleepOffer'), extract('setSleepDeclinedUntil'),
+      extract('loadSleepDeclined')].join('\n'));
 
 extraJobs = mkJobs(3);
 maybeOfferSleep(5, 1);
@@ -1502,6 +1508,39 @@ maybeOfferSleep(5, 0);
 eq('a queued sleep clears the collapsed row', sleepOffer, null);
 eq('and the panel was told to repaint', renders > 0, true);
 extraJobs = [];
+
+// A "no" used to live in memory only, so every reload forgot it and the dialog
+// came straight back -- the sleep question "once more after a refresh".
+setSleepDeclinedUntil(0);
+sleepOffer = { needed: 5, at: 0, total: 5 };
+dismissSleepOffer(true);
+const declinedUntil = sleepDeclinedUntil;
+sleepDeclinedUntil = 0;              // the reload
+loadSleepDeclined();
+eq('a "no" survives a reload', sleepDeclinedUntil, declinedUntil > Date.now() ? declinedUntil : 'unset');
+reopenSleepOffer();
+eq('...and so does taking it back', localStorage.getItem(CONFIG.STORAGE_SLEEP_DECLINED), '0');
+setSleepDeclinedUntil(Date.now() - 1000);
+sleepDeclinedUntil = 0;
+loadSleepDeclined();
+eq('an expired "no" is not restored', sleepDeclinedUntil, 0);
+sleepOffer = null;
+
+// Right after a load nothing is asked: the game's picture is still arriving.
+sleepQuestionsSettled = () => false;
+dialogs = 0;
+extraJobs = mkJobs(3);
+maybeOfferSleep(5, 0);
+lastForecast = [{ notEnoughEnergy: true, cost: 5 }];
+offerSleepReal();
+eq('no sleep question in the post-load grace', [sleepOffer, dialogs], [null, 0]);
+sleepQuestionsSettled = () => true;
+offerSleepReal();
+eq('...and it comes once the grace is over', [!!sleepOffer, dialogs], [true, 1]);
+dismissSleepOffer(false);
+setSleepDeclinedUntil(0);
+extraJobs = [];
+lastForecast = [];
 
 // ============================================================
 //  One plan per tick
