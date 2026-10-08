@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 368 assertions, no dependencies.
+  name and runs them against stubs. 406 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,8 +15,21 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.17.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.18.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.18 handles the login expiring** (about once a day), four commits — see "Session expiry" under
+the game facts. Before it, an expired session lost the batch being handed over and raised a phantom
+"not enough energy, insert a sleep?" offer; the user had to refresh by hand, and the sleep question
+came back after the refresh. Now the logout is detected, the batch goes back on the list, every
+decision freezes, and the page reloads by itself 20 s later (capped at 3 reloads per 30 min).
+A sleep "no" is persisted across reloads, and no sleep question is raised in the first 30 s after a
+load. Collecting the daily login bonus after our own reload is behind `AUTO_LOGIN_BONUS` (**off**).
+**Not exercised live**: the logout reply's shape was measured, but nothing else — an expired session
+can't be produced on demand. The first real expiry is worth watching in the console
+(`[Lisa] The session has expired`, then the reload, then `lisaDiag().sessionLost` on the new page
+should be `false`). The login-bonus button selector is read out of the bundle only; check it the
+next time the bonus is due before switching the setting on.
 
 **v12.17 is a pure cleanup release — no feature, no behaviour change.** Five commits: dead code and
 stale comments out plus sections renumbered 1–26; `jobHistory` removed; four helpers replacing four
@@ -31,8 +44,10 @@ suite covers the logic, not the DOM.
 0. The test account for `hu27` is in `local-notes.md` (**gitignored** — the repo has a GitHub
    remote, so no credentials in tracked files). The browser session is usually still signed in,
    so entering the world needs no password.
+   **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
+   session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `368 passed, 0 failed`.
+2. `node test-queue.js` should print `406 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -200,6 +215,37 @@ grows and the script counts the jobs as accepted — but a few seconds later the
 the game removes them from the queue, and the jobs are already gone from `extraJobs`. Verified:
 8 seeded jobs, all silently lost, with the panel reporting "all started". The synchronous
 length check alone is **not** proof of acceptance; only the response is.
+
+### Session expiry
+
+The login expires after about a day. Measured with an anonymous request (no cookies), every
+`game.php` call is answered **HTTP 200** with:
+
+```json
+{"fatal":true,"message":"Az elmentett bejelentkezésed lejárt vagy érvénytelen. Kérlek jelentkezz be ismét.","logout":true}
+```
+
+No `error`, no `tasks` — which is why the add-response check used to read it as "nothing rejected".
+Read out of the bundle (jQuery 3.5.1):
+
+- The game's `Ajax` checks every reply for `logout`, then calls `Player.forceLogout(message)` (a modal
+  "Kijelentkezés" box with a logout button) and **throws `'invalid session'`**. From then on
+  `Ajax.request` throws before sending anything.
+- The chat server answers `"invalid sid"` independently and also ends in `Player.forceLogout`, with
+  the text **"Regisztrációs azonosítód lejárt…"** — this is the box the user actually saw. The game's
+  map-loading overlay ("Térkép adatok betöltése…") then never goes away.
+- The throw lands inside `TaskQueue.batchStart`, so **`TaskQueue.busy` stays `true` for good**, and a
+  `TaskQueue.add` still pushes the task locally (no `queueId`, no `date_done`) while the request
+  never leaves. Our synchronous length check would count it as accepted.
+- Reloading the page logs back in (the user's experience), and usually lands on the **daily login
+  bonus** dialog: `west.player.LoginBonus`, raised when `Player.hasLoginBonus`, class `loginbonus`,
+  its "Átvétel" button a `west.gui.Button` with the class `collect-btn` (call `el.guiElement.click()`).
+
+The script catches both signals (`isLogoutResponse` in the XHR interceptor for any `game.php`
+reply, and a wrapper around `Player.forceLogout` via `patchForceLogout`), and `markSessionLost` puts
+`inFlightBatch` back at the front. While `sessionLost` is set, `processQueue`, the pump and every
+sleep decision do nothing; `reloadAfterLogout` (tick-driven) reloads after `RELOAD_DELAY_MS`.
+Keep-awake deliberately stays on: the reload is driven by the tick, and a frozen tab never reloads.
 
 ### Durations
 
