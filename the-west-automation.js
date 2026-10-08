@@ -33,6 +33,7 @@
         STORAGE_EXTRA_QUEUE: 'lisa_extra_queue',
         STORAGE_LEADER: 'lisa_leader_tab',
         STORAGE_SLEEP_MODE: 'lisa_sleep_mode',
+        STORAGE_RELOADS: 'lisa_logout_reloads',
         STORAGE_VERSION: 2,
         LEGACY_EXTRA_QUEUE: 'lisa_extra_params_v1020',
         MIN_SEND_GAP: 2000,          // between two consecutive sends
@@ -68,6 +69,10 @@
         SLEEP_REGEN_ESTIMATE: 0.125, // only for estimating the DISPLAYED sleep length (measured)
         JOBGROUP_MAX_DIST: 200,      // a job group farther than this isn't accepted as the location
         GAME_QUEUE_PREVIEW: 6,       // how many waiting jobs show in the game's queue widget
+        AUTO_RELOAD: true,           // reload the page by itself once the login has expired
+        RELOAD_DELAY_MS: 20000,      // ...this long after noticing it
+        RELOAD_MAX: 3,               // ...but no more often than this many times
+        RELOAD_WINDOW_MS: 1800000,   // ...within this window, so a reload that can't log back in can't loop
     };
 
     // ============================================================
@@ -2569,7 +2574,53 @@
     }
 
     function sessionLostStatus() {
-        return `Lejárt a bejelentkezés – újratöltés kell (${extraJobs.length} munka vár).`;
+        const waiting = `${extraJobs.length} munka vár`;
+        if (!sessionLost || !CONFIG.AUTO_RELOAD || sessionLost.gaveUp) {
+            return `Lejárt a bejelentkezés – töltsd újra az oldalt (${waiting}).`;
+        }
+        const left = Math.max(0, Math.ceil((sessionLost.at + CONFIG.RELOAD_DELAY_MS - Date.now()) / 1000));
+        return `Lejárt a bejelentkezés – újratöltés ${left} mp múlva (${waiting}).`;
+    }
+
+    // Reloading is what the user did by hand, and it is enough: the page logs back
+    // in and the list comes back from storage. The only risk is a reload that can't
+    // log in (the main site's own login expired too) and loops, so the reloads are
+    // counted in localStorage and capped per window. If that count can't be stored,
+    // the cap can't be enforced either -- then we don't reload at all.
+    function recentReloads(now) {
+        let list = [];
+        try { list = JSON.parse(localStorage.getItem(CONFIG.STORAGE_RELOADS) || '[]'); } catch(e) {}
+        return Array.isArray(list)
+            ? list.filter(t => typeof t === 'number' && now - t >= 0 && now - t < CONFIG.RELOAD_WINDOW_MS)
+            : [];
+    }
+
+    function recordReload(now) {
+        const list = [...recentReloads(now), now];
+        try {
+            localStorage.setItem(CONFIG.STORAGE_RELOADS, JSON.stringify(list));
+            return recentReloads(now).length === list.length;
+        } catch(e) { return false; }
+    }
+
+    // Driven by the tick, so a hidden tab's throttled timers can't hold it up.
+    function reloadAfterLogout() {
+        if (!sessionLost || !CONFIG.AUTO_RELOAD || sessionLost.gaveUp || sessionLost.reloading) return;
+        const now = Date.now();
+        if (now - sessionLost.at < CONFIG.RELOAD_DELAY_MS) {
+            updateUIStatus(sessionLostStatus());
+            return;
+        }
+        if (recentReloads(now).length >= CONFIG.RELOAD_MAX || !recordReload(now)) {
+            sessionLost.gaveUp = true;
+            console.warn('[Lisa] Not reloading again: too many reloads lately, or nowhere to count them.');
+            updateUIStatus(sessionLostStatus());
+            return;
+        }
+        sessionLost.reloading = true;
+        saveExtraQueueToStorage();
+        console.warn('[Lisa] Reloading the page to log back in.');
+        location.reload();
     }
 
     // The chat's "invalid sid" path never goes through the game's Ajax, so the XHR
@@ -3233,6 +3284,8 @@
             && nextJobDeadline < now + CONFIG.LONG_GAP_SETTLE_MS) {
             scheduleNextJob(CONFIG.LONG_GAP_SETTLE_MS);
         }
+
+        reloadAfterLogout();
 
         if (now - lastLeaderAt >= CONFIG.LEADER_HEARTBEAT) {
             lastLeaderAt = now;

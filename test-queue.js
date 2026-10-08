@@ -1612,6 +1612,69 @@ window.Player.forceLogout('Regisztrációs azonosítód lejárt.');
 eq('forceLogout marks the session lost', !!sessionLost, true);
 eq("...and still shows the game's own box, once", forceLogouts, 1);
 
+// Reloading is what brings the session back -- but a reload that cannot log in
+// would land in the same state and reload again, so the reloads are capped.
+console.log('\n=== Reload after a logout ===');
+CONFIG.AUTO_RELOAD = true; CONFIG.RELOAD_DELAY_MS = 20000;
+CONFIG.RELOAD_MAX = 3; CONFIG.RELOAD_WINDOW_MS = 1800000;
+CONFIG.STORAGE_RELOADS = 'lisa_logout_reloads';
+let reloads = 0;
+global.location = { reload: () => { reloads++; } };
+let reloadNow = 5000000;
+Date.now = () => reloadNow;
+eval([extract('recentReloads'), extract('recordReload'), extract('reloadAfterLogout')].join('\n'));
+
+delete store[CONFIG.STORAGE_RELOADS];
+sessionLost = { at: reloadNow, reason: 'server' };
+reloadAfterLogout();
+eq('not at once: the delay runs first', reloads, 0);
+reloadNow += 20000;
+reloadAfterLogout();
+eq('after the delay the page reloads', reloads, 1);
+eq('...and the reload is counted', recentReloads(reloadNow).length, 1);
+reloadAfterLogout();
+eq('one page reloads once', reloads, 1);
+
+// Two more pages that came back logged out: the third reload is the last.
+for (let k = 0; k < 2; k++) {
+    reloadNow += 60000;
+    sessionLost = { at: reloadNow - 20000, reason: 'server' };
+    reloadAfterLogout();
+}
+eq('three reloads within the window', reloads, 3);
+reloadNow += 60000;
+sessionLost = { at: reloadNow - 20000, reason: 'server' };
+reloadAfterLogout();
+eq('a fourth within the window is refused', reloads, 3);
+eq('...and the page says so', sessionLost.gaveUp, true);
+eq('...asking for a manual reload', /töltsd újra/.test(sessionLostStatus()), true);
+
+// The window slides: an expiry the next day reloads again.
+reloadNow += CONFIG.RELOAD_WINDOW_MS;
+sessionLost = { at: reloadNow - 20000, reason: 'server' };
+reloadAfterLogout();
+eq('outside the window it reloads again', reloads, 4);
+
+// No storage, no cap -- and without a cap we do not reload at all.
+const realSetItem = localStorage.setItem;
+localStorage.setItem = () => { throw new Error('quota'); };
+reloadNow += CONFIG.RELOAD_WINDOW_MS;
+sessionLost = { at: reloadNow - 20000, reason: 'server' };
+reloadAfterLogout();
+eq('storage failing -> no reload', reloads, 4);
+localStorage.setItem = realSetItem;
+
+CONFIG.AUTO_RELOAD = false;
+sessionLost = { at: reloadNow - 60000, reason: 'server' };
+reloadAfterLogout();
+eq('the setting turns it off', reloads, 4);
+eq('the status then asks for a manual reload', /töltsd újra/.test(sessionLostStatus()), true);
+sessionLost = null;
+reloadAfterLogout();
+eq('no logout, no reload', reloads, 4);
+Date.now = realNow;
+delete global.location;
+
 sessionLost = null;
 extraJobs = [];
 lastForecast = [];
