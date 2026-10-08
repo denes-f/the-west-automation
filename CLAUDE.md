@@ -25,10 +25,13 @@ came back after the refresh. Now the logout is detected, the batch goes back on 
 decision freezes, and the page reloads by itself 20 s later (capped at 3 reloads per 30 min).
 A sleep "no" is persisted across reloads, and no sleep question is raised in the first 30 s after a
 load. Collecting the daily login bonus after our own reload is behind `AUTO_LOGIN_BONUS` (**off**).
-**Not exercised live**: the logout reply's shape was measured, but nothing else — an expired session
-can't be produced on demand. The first real expiry is worth watching in the console
-(`[Lisa] The session has expired`, then the reload, then `lisaDiag().sessionLost` on the new page
-should be `false`). The login-bonus button selector is read out of the bundle only; check it the
+**Verified live, 2026-10-08** (hu27 test character, installed build, no energy spent): calling
+`Player.forceLogout('…')` by hand in a **hidden** tab — the wrapper fired, the status line counted
+down (`újratöltés 17 mp múlva`), the page reloaded itself at 20 s, came back logged in with
+`sessionLost: false`, and the reload was counted (the count was removed afterwards so the test did
+not eat into the cap). **Still not seen**: a *real* expiry, and the XHR-side detection — an expired
+session can't be produced on demand. Worth watching the first time in the console
+(`[Lisa] The session has expired`, then `Reloading the page to log back in`). The login-bonus button selector is read out of the bundle only; check it the
 next time the bonus is due before switching the setting on.
 
 **v12.17 is a pure cleanup release — no feature, no behaviour change.** Five commits: dead code and
