@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 406 assertions, no dependencies.
+  name and runs them against stubs. 410 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,8 +15,20 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.18.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.19.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.19 fixes the add reply's second shape** (see "Add response shape"): into a non-empty queue
+`tasks` is an object keyed by queue position, and a rejection in that form used to pass for a
+success. Found while reproducing a report that a quest-giver walk queued behind jobs "never
+starts" — **which did not reproduce**: measured live (hu27, 2026-10-14), four 15 s jobs filled the
+queue, `QuestEmployerWindow.startWalk({key:'circus', x:18688, y:12831})` was diverted onto our
+list, handed over the moment the first slot freed, accepted by the server, and started walking
+once the jobs were done (cancelled afterwards; 4 energy spent). If it is reported again, get
+`lisaDiag()`, the status line and the `[Lisa]` console lines from the moment it sticks.
+Also measured the same day: the **login-bonus selector** — `.loginbonus .collect-btn` matched
+exactly one element, text `Átvétel`, with a `guiElement` whose `onclick` is set. The click itself
+was not pressed (left to the user), so `AUTO_LOGIN_BONUS` is still off by default.
 
 **v12.18 handles the login expiring** (about once a day), four commits — see "Session expiry" under
 the game facts. Before it, an expired session lost the batch being handed over and raised a phantom
@@ -50,7 +62,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `406 passed, 0 failed`.
+2. `node test-queue.js` should print `410 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -204,6 +216,13 @@ game client unaware — the job runs but never appears in the bottom-right queue
 `tasks[i].task.date_done` — note the wrapper. `tasks` holds the tasks **added by this request**,
 not the whole queue. Errors are `{"error":true,"msg":"…"}`. A bare `msg` with no `error` is **not**
 a success — assuming it was is what ate three jobs.
+
+**`tasks` is keyed by QUEUE POSITION** — the same keys the request uses (`post.tasks[queuePos]`).
+Into an empty queue those are `0..n-1` and PHP sends an **array**; into a non-empty one they are
+not, and it sends an **object**. Measured (v12.19): one walk handed over behind three queued jobs
+came back as `{"tasks":{"3":{"task":{"queue_id":…,"data_obj":{"name":"walk",…}}}}}`. Since our
+hand-overs nearly always go into a non-empty queue, read it through `addResponseEntries` (numeric
+key order), never as an array only — that is how a rejection used to pass for a success.
 
 **`tasks[]` is per-task and mixed**: the i-th element answers the i-th task of the request, and is
 either `{"task":{…}}` or `{"error":true,"msg":"…"}`. Measured rejection (job requiring level 53

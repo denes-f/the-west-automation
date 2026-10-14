@@ -705,7 +705,8 @@ global.document = { getElementById: () => null };
 // removes them from the queue -- and they are already gone from the list. 8 jobs were lost this way.
 console.log('\n=== Server-side rejection ===');
 eval([extract('parseBodyParams'), extract('extractTasksFromBody'),
-      extract('rejectedFromAddResponse'), extract('addResponseMatchesBatch')].join('\n'));
+      extract('addResponseEntries'), extract('rejectedFromAddResponse'),
+      extract('addResponseMatchesBatch')].join('\n'));
 global.URLSearchParams = require('url').URLSearchParams;
 
 const body3 = 'tasks[0][jobId]=129&tasks[0][x]=1&tasks[0][y]=2&tasks[0][duration]=15&tasks[0][taskType]=job'
@@ -741,6 +742,19 @@ eq('no error and no tasks is not a failure',
 eq('a batch shorter than the response does not overrun',
    rejectedFromAddResponse([b3[0]], { tasks: [okEntry, { error: true, msg: 'x' }] }).length, 0);
 eq('an empty batch yields empty', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
+
+// Into a NON-EMPTY queue the keys are queue positions, not 0..n-1, and the reply
+// comes as an object. Measured: a walk handed over behind three jobs.
+const measuredWalkReply = { tasks: { 3: { task: { queue_id: 3442725, date_done: 1791966062.83,
+    data_obj: { name: 'walk', duration: 1, coords: { x: 18688, y: 12831 } } } } } };
+eq('a keyed success is a success', rejectedFromAddResponse([b3[0]], measuredWalkReply).length, 0);
+const keyed = rejectedFromAddResponse(b3, {
+    tasks: { 2: okEntry, 3: { error: true, msg: 'Legalább a 53 szintet kell elérned' }, 4: okEntry } });
+eq('a keyed rejection is NOT lost', keyed.length, 1);
+eq('...and pairs with the right job', keyed[0].job.jobId, 127);
+eq('keys are ordered numerically, not as text',
+   rejectedFromAddResponse(b3, { tasks: { 10: okEntry, 9: okEntry, 11: { error: true } } })
+       .map(r => r.job.jobId), [60]);
 
 // The backoff doubles: low energy is an hours-long problem, and with a fixed
 // 20 s retry the job would burn through its attempts in minutes.

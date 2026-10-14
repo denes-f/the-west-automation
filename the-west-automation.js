@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.18)
+// @name         The-West Modular Job Queue (Lisa v12.19)
 // @namespace   http://tampermonkey.net/
-// @version     12.18
+// @version     12.19
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -185,19 +185,33 @@
             .filter(t => t.jobId !== null || t.taskType !== 'job');
     }
 
-    // The response's tasks[i] answers the i-th job of the request, and is either
+    // The response's tasks answer the request's jobs in order, each either
     // {task:{...}} or {error:true,msg:"..."}. Returns the failed ones paired with
     // their job object. On a top-level error the WHOLE batch failed.
+    //
+    // `tasks` is keyed by QUEUE POSITION, the same keys the request used
+    // (post.tasks[queuePos]). Into an empty queue those are 0..n-1 and arrive as
+    // an array; into a non-empty one they arrive as an OBJECT -- measured: one
+    // walk handed over behind three jobs came back as {"tasks":{"3":{"task":…}}}.
+    // Our hand-overs nearly always go into a non-empty queue, so reading only the
+    // array form meant a rejection there passed for a success and lost the job.
+    function addResponseEntries(tasks) {
+        if (Array.isArray(tasks)) return tasks;
+        if (!tasks || typeof tasks !== 'object') return null;
+        return Object.keys(tasks).sort((a, b) => a - b).map(k => tasks[k]);
+    }
+
     function rejectedFromAddResponse(batch, data) {
         if (!batch || !batch.length || !data) return [];
-        if (!Array.isArray(data.tasks)) {
+        const entries = addResponseEntries(data.tasks);
+        if (!entries) {
             // `fatal` is the other top-level failure: it is what a logged-out
             // session answers ({fatal, message, logout}, no `error` at all).
             if (!data.error && !data.fatal) return [];
             return batch.map(job => ({ job, msg: data.msg || data.message || '' }));
         }
         const out = [];
-        data.tasks.forEach((entry, i) => {
+        entries.forEach((entry, i) => {
             if (batch[i] && entry && entry.error) out.push({ job: batch[i], msg: entry.msg || '' });
         });
         return out;
@@ -3411,7 +3425,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.18',
+        version: '12.19',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -4099,5 +4113,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.18 loaded.');
+    console.log('[Lisa] Modular v12.19 loaded.');
 })();
