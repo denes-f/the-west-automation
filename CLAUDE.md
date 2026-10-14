@@ -79,7 +79,7 @@ suite covers the logic, not the DOM.
   **energy** won't cover its cost — and offers to insert a **sleep** (never unasked, never a paid
   room), ending it once that sleep's goal is met: the room's level, or just enough for the jobs
   behind it, whichever the user chose for that sleep.
-- Shows waiting jobs in **two places**: its own game-style window (top right, scrollable) and as
+- Shows waiting jobs in **two places**: its own game-style window (top left, below the character box, scrollable) and as
   extra rows in the game's bottom-right queue widget, under a separator (5 shown, then a `+N` tile
   in the sixth slot).
 - Shows predicted start→finish times per job, chaining travel between locations.
@@ -583,7 +583,8 @@ Background layers, measured — these cap how tall a window can usefully be:
   bottom-left. Any window taller than ~454 px leaves the top bare.
 - `.tw2gui_inner_window_bg2` is a **32×420** right-hand edge strip anchored bottom-right.
 
-The script uses **320×210 at top-right (140 px down, 35 px in)** — deliberately short, about
+The script uses **320×210 at top-left (215 px down, 60 px in)**, below the character box — moved
+there by the user from the original top-right spot, and settled. Deliberately short, about
 4 visible rows, everything else by scrolling. Fixed chrome (title bar, status line, toolbar) eats
 ~134 px, so visible rows ≈ (height − 134) / 19.
 

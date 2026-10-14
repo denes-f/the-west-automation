@@ -53,8 +53,8 @@
         WINDOW_ID: 'lisaExtraQueue',
         PANEL_WIDTH: 320,
         PANEL_HEIGHT: 210,           // about 4-5 job rows visible, the rest by scrolling
-        PANEL_TOP: 140,
-        PANEL_RIGHT: 35,
+        PANEL_TOP: 215,              // below the character's box and its status bars
+        PANEL_LEFT: 60,
         MAX_AMOUNT: 99,
         MIN_AMOUNT: 1,
         FALLBACK_QUEUE_LIMIT: 4,     // only if the game's TaskQueue is unreachable
@@ -3701,8 +3701,8 @@
         try { win.setSize(CONFIG.PANEL_WIDTH, panelHeight()); } catch(e) {}
         const el = document.querySelector('.' + CONFIG.WINDOW_ID);
         if (!el) return;
-        // The panel's original spot: top right corner, below the map.
-        el.style.left = Math.max(0, window.innerWidth - CONFIG.PANEL_WIDTH - CONFIG.PANEL_RIGHT) + 'px';
+        // Top left, below the character's box and stats.
+        el.style.left = Math.max(0, CONFIG.PANEL_LEFT) + 'px';
         el.style.top = CONFIG.PANEL_TOP + 'px';
     }
 
