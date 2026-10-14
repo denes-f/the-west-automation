@@ -12,8 +12,20 @@ jobs beyond that limit and feeds them in as slots free up.
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
   that would show up live as an empty panel. Run this one first.
 
-The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
-any change ask them to reinstall before testing live.
+**Installing a new version** (v12.21+), no editor and no copy-paste:
+- **Safari** (the *Userscripts* app, not Tampermonkey): `./install.sh` runs the smoke test and the
+  suite, then copies the script into
+  `~/Library/Containers/com.userscripts.macos.Userscripts-Extension/Data/Documents/scripts/` as
+  `The-West Modular Job Queue (Lisa).user.js`. Userscripts maps URL patterns to file *names* in the
+  `manifest.json` next to it, so overwriting the file is the whole update; the first run also
+  removed the old versioned file and repointed the manifest. Reload the game page.
+- **Chrome** (Tampermonkey): Tampermonkey's storage cannot be written from outside, so a small
+  loader (`./install.sh chrome-loader` prints it) is installed **once**; it `@require`s
+  `file://…/the-west-automation.js`. Needs *Allow access to file URLs* on the Tampermonkey
+  extension. After that, saving the file and reloading the page is the update.
+After a change, run `./install.sh` and ask the user to reload; `lisaDiag().version` confirms which
+build is running. The Safari half was run on 2026-10-14; the Chrome loader has **not been seen
+working yet** — check `lisaDiag().version` after the user installs it.
 
 **Current release: v12.21.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
@@ -990,8 +1002,10 @@ and "Nem" correctly does nothing.
   wholesale after v12.13, and the history was rewritten to English in the same session; nothing
   Hungarian should reappear outside the in-game strings listed above.
 - Comments explain *why*, especially where a subtle game behaviour forced the design. Keep them.
-- Bump `@name`, `@version` and the boot `console.log` together on every release — and the release
-  number plus the assertion count at the top of this file.
+- Bump `@version`, the boot `console.log` and `lisaDiag().version` together on every release — and
+  the release number plus the assertion count at the top of this file. **`@name` stays fixed**
+  (`The-West Modular Job Queue (Lisa)`): Safari's Userscripts names the file after it, so a version
+  in the name would leave a stale copy matching the same pages after every release.
 - Run `node smoke-load.js && node test-queue.js` before committing. Add cases for anything measured in-game so it does not
   have to be rediscovered.
 - The test harness pulls functions out of the userscript **by name** (`extract('foo')`), so renaming

@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.21)
+// @name         The-West Modular Job Queue (Lisa)
 // @namespace   http://tampermonkey.net/
 // @version     12.21
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
