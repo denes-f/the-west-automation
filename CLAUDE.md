@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 410 assertions, no dependencies.
+  name and runs them against stubs. 415 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,8 +15,16 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.19.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.20.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.20 fixes the quest-giver walk that vanished.** Reproduced by the user (10 × 15 s jobs, then a
+walk to Flint Eastwood): the walk showed a `?` length and disappeared when its turn came. Cause,
+measured: a quest giver opened from the map gets its position from `GameMap.Helper.getPosition`,
+which returns **strings**, and `QuestLog.setActiveEmployer` passes them on — so `startWalk` queues
+`{x:"18688", y:"12831"}`. `makeWalkEntry` accepted only numbers, stored the walk without coordinates,
+and the server refuses a coordinate-less quest-giver walk (see "Walking"). `walkCoord` now accepts
+numeric strings. The v12.19 test below passed numbers, which is why it did not reproduce.
 
 **v12.19 fixes the add reply's second shape** (see "Add response shape"): into a non-empty queue
 `tasks` is an object keyed by queue position, and a rejection in that form used to pass for a
@@ -62,7 +70,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `410 passed, 0 failed`.
+2. `node test-queue.js` should print `415 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -389,6 +397,13 @@ Reported live: starting a walk with four jobs queued and having it vanish.
   (`.../images/jobs/walk.png`). So it rebuilds exactly from `post`, and the existing ETA chain turns
   the coordinates into the time it takes. Zero duration is correct, not a placeholder: never let the
   `DEFAULT_DURATION` fallback invent 15 minutes of standing still.
+- **The coordinates may be strings.** Measured (v12.20): opening a quest giver from the map passes
+  `GameMap.Helper.getPosition`'s strings through `QuestLog.setActiveEmployer`, so the walk's post is
+  `{unitId:"circus", type:"questgiver", x:"18688", y:"12831"}`. `walkCoord` accepts finite numbers and
+  numeric strings. And a quest-giver walk **without** coordinates is refused by the server — measured,
+  `TaskQueue.add(new TaskWalk('circus','questgiver'))` on an empty queue answered
+  `{"tasks":[{"error":true,"msg":"Die gewünschte Position ist ungültig!"}]}` (German, on a Hungarian
+  server) and the game dropped it. A fort walk resolves by its id; a quest giver does not.
 - Without coordinates the entry keeps `x: null` rather than `0`. Inventing a position would make
   every following job's ETA chain from a place the character never goes.
 - **A coordinate-less walk therefore has no knowable length**, and it must not be drawn as

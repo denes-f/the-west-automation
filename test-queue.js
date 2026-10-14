@@ -1270,7 +1270,7 @@ eq('incomplete sleep entries are dropped', stored[1].jobId, 129);
 // an unqueued TaskWalk: post = {taskType:'walk', type, unitId, x, y} (x/y absent
 // on the Guidepost path) and getDuration() === 0, the whole length being travel.
 console.log('\n=== Walking ===');
-eval([extract('overflowOfBatch'), extract('makeWalkEntry'),
+eval([extract('overflowOfBatch'), extract('walkCoord'), extract('makeWalkEntry'),
       extract('walkDisplayName'), extract('divertibleEntry')].join('\n'));
 const DIVERTIBLE = { walk: true };
 
@@ -1294,6 +1294,22 @@ eq('and no job id', walk.jobId, 0);
 const blind = makeWalkEntry({ taskType: 'walk', type: 'fair', unitId: null }, 'Séta');
 eq('no coordinates stays unknown, not zero', [blind.x, blind.y], [null, null]);
 eq('a missing unitId is kept as null', blind.unitId, null);
+
+// REPORTED LIVE: a walk to a quest giver opened from the map. Its coordinates
+// arrive as strings (GameMap.Helper.getPosition), so the entry lost them, showed
+// a "?" length, and the server then refused the coordinate-less walk with
+// "Die gewünschte Position ist ungültig!" -- the walk vanished when its turn came.
+const quest = makeWalkEntry({ taskType: 'walk', type: 'questgiver', unitId: 'circus',
+                              x: '18688', y: '12831' }, 'Séta ide: küldetésadó');
+eq('string coordinates are kept, as numbers', [quest.x, quest.y], [18688, 12831]);
+eq('a string unitId (the employer key) is kept', quest.unitId, 'circus');
+// The game's own TaskWalk, as measured: post = {unitId, type, x, y, taskType}.
+window.TaskWalk = function(unitId, type, x, y) { this.post = { unitId, type, x, y, taskType: 'walk' }; };
+eq('...so the hand-over rebuilds it WITH a destination', buildGameTask(quest).post,
+   { unitId: 'circus', type: 'questgiver', x: 18688, y: 12831, taskType: 'walk' });
+delete window.TaskWalk;
+eq('an empty string is still unknown', makeWalkEntry({ type: 'fort', x: '', y: '5' }).x, null);
+eq('garbage is still unknown', makeWalkEntry({ type: 'fort', x: 'abc', y: 5 }).x, null);
 
 eq('a walk is diverted', divertibleEntry({ post: { taskType: 'walk', type: 'fort' } }).taskType, 'walk');
 eq('a duel is not something we can rebuild',

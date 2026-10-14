@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.19)
+// @name         The-West Modular Job Queue (Lisa v12.20)
 // @namespace   http://tampermonkey.net/
-// @version     12.19
+// @version     12.20
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -1320,8 +1320,23 @@
     //   getDuration() === 0  -- a walk's whole length IS the travel
     // so it rebuilds exactly, and computeEtas already turns the coordinates into
     // the time it takes. Zero duration is right, not a placeholder.
+    // The coordinates are not always numbers. A quest giver opened from the map
+    // gets its position from GameMap.Helper.getPosition, which returns STRINGS
+    // ("18688"), and QuestLog.setActiveEmployer passes them on untouched -- so
+    // QuestEmployerWindow.startWalk queues {x:"18688", y:"12831"}. Reading only
+    // numbers turned that walk into a coordinate-less one, and a quest-giver walk
+    // without coordinates is refused by the server ("Die gewünschte Position ist
+    // ungültig!", measured) -- unlike a fort, which the server finds by its id.
+    function walkCoord(v) {
+        if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+        if (typeof v !== 'string' || v.trim() === '') return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    }
+
     function makeWalkEntry(post, displayName) {
-        const hasPos = typeof post.x === 'number' && typeof post.y === 'number';
+        const px = walkCoord(post.x), py = walkCoord(post.y);
+        const hasPos = px !== null && py !== null;
         return {
             id: generateId(), retries: 0, deferrals: 0, rejections: 0,
             taskType: 'walk',
@@ -1332,8 +1347,8 @@
             // Without coordinates we must NOT invent a position: computeEtas would
             // chain every following job off a made-up place. x:null leaves the
             // character where it was, which only costs us the travel estimate.
-            x: hasPos ? post.x : null,
-            y: hasPos ? post.y : null,
+            x: hasPos ? px : null,
+            y: hasPos ? py : null,
             duration: 0,
         };
     }
@@ -3425,7 +3440,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.19',
+        version: '12.20',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -4113,5 +4128,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.19 loaded.');
+    console.log('[Lisa] Modular v12.20 loaded.');
 })();
