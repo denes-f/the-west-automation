@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 415 assertions, no dependencies.
+  name and runs them against stubs. 420 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -15,8 +15,21 @@ jobs beyond that limit and feeds them in as slots free up.
 The user installs the script by pasting it into Tampermonkey. There is no deploy step, so after
 any change ask them to reinstall before testing live.
 
-**Current release: v12.20.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.21.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.21 fixes the walk-back travel time.** Reported live: at a quest giver, 10 × 15 s jobs, then a
+walk back — the walk showed almost no travel. Measured (hu27, 4 energy): the in-game tile read
+`00:05:55`, the travel from the character's spot, where the chain from the jobs gives `00:06:01`; the
+panel row read `11:55→11:55`. Three causes, all fixed:
+- `queueTailAnchor` skipped game-queue entries without `date_done`. `TaskQueue.add` pushes at once
+  but `date_done` only arrives with the server's reply (~1 s later), so a walk queued right behind
+  fresh jobs chained from `currentPosition()` — the quest giver itself, hence ~0. Pending entries are
+  now the END of the chain (`pendingPos`), and `taskPosition` reads string coordinates too.
+- `renderPendingInGameQueue`'s key held no times, so a tile kept its very first computation for
+  good. The key now includes each shown tile's time text (`tileTimeText`).
+- A walk's `start` is its arrival (the travel comes first and its duration is 0), so the row printed
+  arrival→arrival. `displaySpan` makes a walk row departure→arrival.
 
 **v12.20 fixes the quest-giver walk that vanished.** Reproduced by the user (10 × 15 s jobs, then a
 walk to Flint Eastwood): the walk showed a `?` length and disappeared when its turn came. Cause,
@@ -70,7 +83,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `415 passed, 0 failed`.
+2. `node test-queue.js` should print `420 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.

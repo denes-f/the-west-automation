@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         The-West Modular Job Queue (Lisa v12.20)
+// @name         The-West Modular Job Queue (Lisa v12.21)
 // @namespace   http://tampermonkey.net/
-// @version     12.20
+// @version     12.21
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -406,23 +406,39 @@
         return done;
     }
 
+    // Where a game-queue entry takes the character. For a sleep the coordinates
+    // live in data, not in post; a walk's post may carry them as strings.
+    function taskPosition(e) {
+        const p = e && e.post;
+        if (p && walkCoord(p.x) !== null && walkCoord(p.y) !== null) return { x: walkCoord(p.x), y: walkCoord(p.y) };
+        const d = e && e.data;
+        if (d && typeof d.x === 'number' && typeof d.y === 'number') return { x: d.x, y: d.y };
+        return null;
+    }
+
     function queueTailAnchor() {
         const now = Date.now();
         let tail = null;
+        let pendingPos = null;
         if (gameReady()) {
             for (const e of window.TaskQueue.queue) {
                 const done = taskFinishAt(e, now);
-                if (typeof done === 'number' && done > 0 && (!tail || done > tail.at)) {
-                    // For a sleep the coordinates live in data, not in post.
-                    const p = (e.post && typeof e.post.x === 'number') ? e.post
-                            : (e.data && typeof e.data.x === 'number') ? e.data : null;
-                    tail = { at: done, pos: p ? { x: p.x, y: p.y } : null };
+                if (typeof done === 'number' && done > 0) {
+                    if (!tail || done > tail.at) tail = { at: done, pos: taskPosition(e) };
+                } else {
+                    // Just handed over: TaskQueue.add pushes at once, but date_done only
+                    // arrives with the server's reply, a second or so later. Such an
+                    // entry still runs after everything ahead of it, so it is where the
+                    // chain ENDS. Skipping it is what measured a walk queued right behind
+                    // fresh jobs from the character's current spot -- live, a walk back
+                    // to the quest giver the character stood at came out as ~0 travel.
+                    pendingPos = taskPosition(e) || pendingPos;
                 }
             }
         }
         return {
             at: tail ? Math.max(now, tail.at) : now,
-            pos: (tail && tail.pos) || currentPosition(),
+            pos: pendingPos || (tail && tail.pos) || currentPosition(),
         };
     }
 
@@ -1708,6 +1724,14 @@
         return !!job && job.taskType === 'walk' && typeof job.x !== 'number';
     }
 
+    // A walk's whole length is its travel, so its row is departure -> arrival. A
+    // job's `start` is when the WORK starts, after the travel; for a walk that is
+    // the arrival, and start -> finish came out as "11:55→11:55" (measured).
+    function displaySpan(job, eta) {
+        if (!eta || !job || job.taskType !== 'walk') return eta;
+        return Object.assign({}, eta, { start: eta.start - (eta.travelMs || 0) });
+    }
+
     function formatEta(eta, unknownLength) {
         return unknownLength
             ? `${clockHM(eta.start)}→?`
@@ -1932,6 +1956,12 @@
         pendingObserver.observe(host, { childList: true });
     }
 
+    function tileTimeText(job, eta) {
+        if (durationUnknown(job)) return '?';
+        const travelSec = eta ? Math.round(eta.travelMs / 1000) : 0;
+        return formatClock(travelSec + jobDurationSeconds(job, extraJobs.indexOf(job)));
+    }
+
     function buildPendingItem(job, eta, forecast) {
         // A DIV, not a span -- see the "+N" tile below for why the game cares.
         const item = document.createElement('div');
@@ -1943,13 +1973,10 @@
         // starting with 5 s of travel shows as 00:00:20. We do the same, so where
         // there is no change of location only the job time shows, by itself.
         const travelSec = eta ? Math.round(eta.travelMs / 1000) : 0;
-        const noLength = durationUnknown(job);
         const time = document.createElement('div');
         time.className = 'taskTime';
         const p = document.createElement('p');
-        p.textContent = noLength
-            ? '?'
-            : formatClock(travelSec + jobDurationSeconds(job, extraJobs.indexOf(job)));
+        p.textContent = tileTimeText(job, eta);
         time.appendChild(p);
 
         const btns = document.createElement('div');
@@ -1986,8 +2013,10 @@
 
         item.title = !eta
             ? `${job.jobName} — ${formatDuration(job.duration)} (várakozik)`
-            : noLength
+            : durationUnknown(job)
                 ? `${job.jobName} — indulás: ${clockHM(eta.start)}, a hossza a célponttól függ`
+                : job.taskType === 'walk'
+                ? `${job.jobName} — út: ${formatDuration(travelSec)}, várható: ${formatEta(displaySpan(job, eta))}`
                 : travelSec > 0
                     ? `${job.jobName} — út: ${formatDuration(travelSec)} + munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`
                     : `${job.jobName} — munka: ${formatDuration(job.duration)}, várható: ${formatEta(eta)}`;
@@ -2042,7 +2071,12 @@
         const forecast = plan.forecast;
         const etas = plan.etas;
         const warnKey = forecast.slice(0, shown.length).map(f => (forecastWarning(f) ? '1' : '0')).join('');
-        const key = `${extraJobs.length}|${preview}|${shown.map(j => j.id).join(',')}|${warnKey}`;
+        // ...and so are the times on the tiles. Leaving them out froze each tile at
+        // its first computation: a walk queued right behind fresh jobs kept the
+        // travel it had before the server answered, measured live as 00:05:55 where
+        // the settled chain says 00:06:01.
+        const timeKey = shown.map((j, i) => tileTimeText(j, etas[i])).join(',');
+        const key = `${extraJobs.length}|${preview}|${shown.map(j => j.id).join(',')}|${warnKey}|${timeKey}`;
         if (key === renderedPendingKey && host.querySelector('.lisa-pending-sep')) return;
         renderedPendingKey = key;
 
@@ -3440,7 +3474,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.20',
+        version: '12.21',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -4047,10 +4081,12 @@
             const job = extraJobs[i];
             const f = forecast[i];
             const noLength = durationUnknown(job);
-            el.textContent = formatEta(eta, noLength);
+            el.textContent = formatEta(displaySpan(job, eta), noLength);
             el.title = (noLength
                 ? `Indulás ${clockHM(eta.start)} — a séta hossza csak a célpont ismeretében derül ki,`
                   + ` ezért a mögötte lévő időpontok is korábbiak a valósnál`
+                : job.taskType === 'walk'
+                ? `Indulás ${clockHM(eta.start - eta.travelMs)}, érkezés ${clockHM(eta.finish)} — út: ${formatDuration(eta.travelMs / 1000)}`
                 : eta.travelMs >= 1000
                 ? `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — út: ${formatDuration(eta.travelMs / 1000)}, munka: ${formatDuration(job.duration)}`
                 : `Indulás ${clockHM(eta.start)}, vége ${clockHM(eta.finish)} — munka: ${formatDuration(job.duration)}`)
@@ -4128,5 +4164,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.20 loaded.');
+    console.log('[Lisa] Modular v12.21 loaded.');
 })();

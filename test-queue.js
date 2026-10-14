@@ -329,8 +329,8 @@ window.Character = global.Character;
 const estimateSleepSeconds = () => 3600;
 const sleepGoalForTask = () => 100;
 const sleepPerHour = () => 0;
-eval(['secondsPerDistanceUnit','currentPosition','taskFinishAt','queueTailAnchor','computeEtas',
-      'clockHM','dayOffset','formatEta',
+eval(['secondsPerDistanceUnit','currentPosition','taskFinishAt','walkCoord','taskPosition',
+      'queueTailAnchor','computeEtas','clockHM','dayOffset','formatEta','displaySpan',
       'jobDurationSeconds','msUntilEnergyAtRate'].map(extract).join('\n'));
 
 eq('seconds per unit comes from calcWayTo', +secondsPerDistanceUnit().toFixed(6), SEC_PER_UNIT);
@@ -366,6 +366,33 @@ etas = computeEtas([{ id: 'a', x: 2000, y: 0, duration: 120 }]);
 eq('the chain starts at the latest finish', Math.round((etas[0].start - future) / 1000), 0);
 etas = computeEtas([{ id: 'a', x: 4000, y: 0, duration: 0 }]);
 eq('travel from the tail location', Math.round(etas[0].travelMs / 1000), Math.round(2000 * SEC_PER_UNIT));
+
+// REPORTED LIVE: at a quest giver, ten 15 s jobs elsewhere, then a walk back to
+// the quest giver -- the walk came out as ~0 travel. TaskQueue.add pushes the
+// jobs at once, but their date_done only comes with the server's reply, and the
+// tail skipped them: the chain started from the character's current spot, which
+// IS the quest giver. Measured: 00:05:55 from the character vs 00:06:01 from the
+// jobs. Entries still waiting for their reply are the END of the chain.
+charPos = { x: 0, y: 0 };                         // standing at the quest giver
+window.TaskQueue.queue = [
+    { data: { date_done: Date.now() + 30000 }, post: { x: 0, y: 0 } },   // already answered
+    { data: {}, post: { jobId: 87, x: 5000, y: 0, duration: 15 } },       // just pushed
+    { data: {}, post: { jobId: 87, x: 5000, y: 0, duration: 15 } },
+];
+etas = computeEtas([{ id: 'w', taskType: 'walk', x: 0, y: 0, duration: 0 }]);
+eq('the walk back starts from the fresh jobs, not from the character',
+   Math.round(etas[0].travelMs / 1000), Math.round(5000 * SEC_PER_UNIT));
+// A walk in the game's queue carries its coordinates as strings.
+window.TaskQueue.queue = [{ data: { date_done: Date.now() + 30000 },
+                            post: { taskType: 'walk', type: 'questgiver', unitId: 'circus', x: '3000', y: '0' } }];
+etas = computeEtas([{ id: 'a', x: 3000, y: 0, duration: 60 }]);
+eq('a queued walk with string coordinates is a position too', etas[0].travelMs, 0);
+
+// A walk's row is departure -> arrival; for a job, the work start -> its end.
+const walkEta = { start: 1000000 + 360000, finish: 1000000 + 360000, travelMs: 360000 };
+eq('a walk row starts when the walk sets out', displaySpan({ taskType: 'walk' }, walkEta).start, 1000000);
+eq('...and ends at the arrival', displaySpan({ taskType: 'walk' }, walkEta).finish, 1360000);
+eq('a job row is left as it is', displaySpan({ taskType: 'job' }, walkEta).start, 1360000);
 
 // Expired queue: a date_done in the past does not pull the estimate back
 window.TaskQueue.queue = [{ data: { date_done: Date.now() - 999999 }, post: { x: 0, y: 0 } }];
