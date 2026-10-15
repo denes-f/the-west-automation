@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 420 assertions, no dependencies.
+  name and runs them against stubs. 458 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -24,11 +24,34 @@ jobs beyond that limit and feeds them in as slots free up.
   `file://…/the-west-automation.js`. Needs *Allow access to file URLs* on the Tampermonkey
   extension. After that, saving the file and reloading the page is the update.
 After a change, run `./install.sh` and ask the user to reload; `lisaDiag().version` confirms which
-build is running. The Safari half was run on 2026-10-14; the Chrome loader has **not been seen
-working yet** — check `lisaDiag().version` after the user installs it.
+build is running. Both halves verified: Safari on 2026-10-14, the Chrome loader on 2026-10-15
+(a page reload picked up an edited file straight away, `lisaDiag().version` = 12.22).
 
-**Current release: v12.21.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.22.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.22 adds gold/silver swaps and route ordering, and fixes two old rejection bugs.** All verified
+live on hu27 (monkey, 2026-10-15, net energy 0 — the cancels refunded everything).
+- **★ G/S button** (lights up with a count): runs of the same job at the same place, read across the
+  game's queue and our list as one sequence (`jobBlocks`), can be moved to that job's cheapest gold
+  and/or silver spot. The box shows the route change (`blockDetourSec`: only the two legs touching
+  the run) and the extra $/XP. No popup ever — the user wanted only a marker. The game-queue part is
+  cancelled and queued again (see "Gold and silver locations"); the task already working at its
+  spot is left alone, and a game-queue run is only taken along if it reaches the END of the game's
+  queue. Measured: 8 jobs, 4 of them in the game's queue → all 8 at the gold spot, energy
+  96 → 100 → 96.
+- **Útvonal button**: reorders OUR list only, for the least travel. Sleeps and walks stay put and cut
+  it into segments; the same job at the same place moves as one block. Exact (Held-Karp) up to
+  `ROUTE_EXACT_MAX` 12 places, nearest-neighbour + 2-opt above. Shows the saving, applies on
+  confirm. Measured: a zig-zag list 9 p → 3 p of travel.
+- **Panel 390×300** (was 320×210), the user asked for more room.
+- **Bug 1, data loss**: once the server rejects one task of a request, every task AFTER it is
+  answered with an empty array (see "Add response shape") and the game drops it. That used to pass
+  for an acceptance. `unansweredFromAddResponse` puts them back, without counting a rejection.
+- **Bug 2, the backoff never held**: the game removing a rejected task looks like a freed slot, and
+  `watchGameQueue` pulled the retry in to 0.4 s — ten rejections in seconds, then the job was given
+  up. `rejectHoldUntil` keeps the slot path out until the backoff ends. Reproduced live (6 jobs at a
+  spot without that job: before, 5 vanished at once; after, all 6 stayed, one rejection, 20 s wait).
 
 **v12.21 fixes the walk-back travel time.** Reported live: at a quest giver, 10 × 15 s jobs, then a
 walk back — the walk showed almost no travel. Measured (hu27, 4 energy): the in-game tile read
@@ -95,7 +118,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `420 passed, 0 failed`.
+2. `node test-queue.js` should print `458 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -242,6 +265,11 @@ game client unaware — the job runs but never appears in the bottom-right queue
 
 ### Add response shape
 
+**After a failed task the rest of the request is not processed.** Measured (2026-10-15, two tasks
+at a spot where that job does not exist): `{"tasks":[{"error":true,"msg":"A munka nem található!"},[]]}`.
+The task behind the failure gets `[]` — neither `task` nor `error` — and the game drops it. Only a
+`{task}` entry is an acceptance.
+
 ```json
 {"tasks":[{"task":{"queue_id":…,"date_done":1785828704.77,"data_obj":{…}}}],"energy":91.78,…}
 ```
@@ -301,6 +329,26 @@ reply, and a wrapper around `Player.forceLogout` via `patchForceLogout`), and `m
 `inFlightBatch` back at the front. While `sessionLost` is set, `processQueue`, the pump and every
 sleep decision do nothing; `reloadAfterLogout` (tick-driven) reloads after `RELOAD_DELAY_MS`.
 Keep-awake deliberately stays on: the reload is driven by the tick, and a frozen tab never reloads.
+
+### Gold and silver locations
+
+- `Ajax.get('map','get_minimap',{})` → `job_groups[groupId] = [[x, y], …]`: every location of every
+  job group (34 groups, 1189 locations on hu27). `JobList.getJobById(id).groupid` links a job to it.
+- `Ajax.get('map','get_complete_data',{tiles: JSON.stringify([[tx, ty], …])})` (a jQuery promise),
+  tile = `floor(coordinate / 256)` (`GameMap.tileSize`): the featured spots appear in the reply as
+  `{x, y, job_id, group_id, silver, gold}` — **only** the featured ones. 1188 tiles in one request is
+  refused ("*ennyire* nagy felbontást nem támogat a játék"), 200 are fine, a group has ≤ 55
+  locations. The whole map took 2.4 MB / 0.7 s: 95 featured spots (20 gold, 75 silver), 1–3 per job.
+  `GameMap.JobHandler.Featured` holds the same, but only for the tiles the map has drawn.
+- The read-only job call at a featured spot answers `is_gold`/`is_silver` and per duration
+  `featured_money`/`featured_xp` (15 s Újságárulás gold: +2 $/+1 XP on 2/1; Térítés silver: +1/+2).
+- The world-wide quota is not visible anywhere; a spot just stops being featured. Re-check before
+  acting (`applyFeaturedSwap` re-reads the group first).
+- **Cancelling**: `TaskQueue.cancel(queuePos)` only records the task in `toCancel` and goes through
+  the same debounced `batchStart` as add, so several cancels in one go become **one** request; the
+  reply re-inits the queue. A cancelled not-yet-run job refunds its **whole** energy (measured
+  96 → 100 for four 15 s jobs). `Task.isArrived(serverSec)` tells a task still on the road
+  (redirectable) from one already working.
 
 ### Durations
 
@@ -623,9 +671,10 @@ Background layers, measured — these cap how tall a window can usefully be:
   bottom-left. Any window taller than ~454 px leaves the top bare.
 - `.tw2gui_inner_window_bg2` is a **32×420** right-hand edge strip anchored bottom-right.
 
-The script uses **320×210 at top-left (215 px down, 60 px in)**, below the character box — moved
-there by the user from the original top-right spot, and settled. Deliberately short, about
-4 visible rows, everything else by scrolling. Fixed chrome (title bar, status line, toolbar) eats
+The script uses **390×300 at top-left (215 px down, 60 px in)**, below the character box — moved
+there by the user from the original top-right spot, and settled; enlarged from 320×210 in v12.22
+at the user's request. About 8 visible rows, everything else by scrolling. The gold/silver and
+route box (`#lisa-tools`, max 118 px) takes rows away while it is open. Fixed chrome (title bar, status line, toolbar) eats
 ~134 px, so visible rows ≈ (height − 134) / 19.
 
 **Keep the window under ~450 px and no override is needed** — the parchment covers it naturally and

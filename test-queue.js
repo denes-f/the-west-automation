@@ -53,6 +53,7 @@ global.Premium = { hasBonus: () => false };
 window.Premium = global.Premium;
 
 let extraJobs = [], paused = false, processing = false, nextJobTimer = null, isLeaderTab = true;
+let swapHold = false;   // a gold/silver swap holding the feeder
 // Sleep/energy: by default there is no sleep and every job is affordable; the
 // scenarios override these where it matters.
 let isSleeping = () => false;
@@ -93,7 +94,7 @@ let inFlightBatch = null; // what startJobsViaGame handed over last
 eval([
     'gameReady', 'gameQueueLength', 'gameQueueLimit', 'freeSlots', 'nextFreeAtMs',
     'waitUntilFreeSlotMs', 'buildGameTask', 'startJobsViaGame', 'addExtraJobs',
-    'formatDuration', 'ensureProcessing',
+    'formatDuration', 'ensureProcessing', 'makeJobEntry',
 ].map(extract).join('\n'));
 eval(extract('processQueue'));
 console.log = real;
@@ -426,6 +427,7 @@ const askRunningSleepMode = () => {}; // needs a dialog
 const patchHotelStart = () => {};     // the hotel window only exists in the game
 const patchTaskQueueAdd = () => {};   // ...and so does TaskQueue
 const patchForceLogout = () => {};    // ...and Player
+let rejectHoldUntil = 0;              // set by a rejection's backoff
 eval(extract('watchGameQueue'));
 
 function watchCase(o) {
@@ -454,6 +456,14 @@ eq('does not push out a nearer timer', watchCase({ len: 3, lastSeen: 4, waiting:
 // After a rejection it must not retry every two seconds: the second call starts nothing
 watchCase({ len: 3, lastSeen: 4, waiting: 2 });
 eq('a repeat call without a new decrease stays quiet', (scheduled = null, watchGameQueue(), scheduled), null);
+// REPORTED LIVE as a vanished list: the game removes the rejected tasks, which reads
+// as a freed slot -- and that used to pull the 20 s backoff in to 0.4 s, so all ten
+// rejections came within seconds and the job was given up.
+rejectHoldUntil = Date.now() + 20000;
+eq('a freed slot does not cut a rejection backoff short', watchCase({ len: 3, lastSeen: 4, waiting: 2 }), null);
+rejectHoldUntil = Date.now() - 1;
+eq('...and works again once the backoff is over', watchCase({ len: 3, lastSeen: 4, waiting: 2 }), 1500);
+rejectHoldUntil = 0;
 paused = false; isLeaderTab = true; processing = false;
 
 
@@ -732,7 +742,7 @@ global.document = { getElementById: () => null };
 // removes them from the queue -- and they are already gone from the list. 8 jobs were lost this way.
 console.log('\n=== Server-side rejection ===');
 eval([extract('parseBodyParams'), extract('extractTasksFromBody'),
-      extract('addResponseEntries'), extract('rejectedFromAddResponse'),
+      extract('addResponseEntries'), extract('rejectedFromAddResponse'), extract('unansweredFromAddResponse'),
       extract('addResponseMatchesBatch')].join('\n'));
 global.URLSearchParams = require('url').URLSearchParams;
 
@@ -769,6 +779,17 @@ eq('no error and no tasks is not a failure',
 eq('a batch shorter than the response does not overrun',
    rejectedFromAddResponse([b3[0]], { tasks: [okEntry, { error: true, msg: 'x' }] }).length, 0);
 eq('an empty batch yields empty', rejectedFromAddResponse([], { tasks: [{ error: true }] }).length, 0);
+
+// Measured (hu27, 2026-10-15): once one task fails, every task after it comes back
+// as an empty array, and the game drops those too. They used to pass for accepted.
+const afterError = { tasks: [{ error: true, msg: 'A munka nem található!' }, [], []] };
+eq('only the first one is a rejection', rejectedFromAddResponse(b3, afterError).map(r => r.job.jobId), [129]);
+eq('the ones behind it were NOT accepted', unansweredFromAddResponse(b3, afterError).map(j => j.jobId), [127, 60]);
+eq('all successes -> nothing unanswered', unansweredFromAddResponse(b3, { tasks: [okEntry, okEntry, okEntry] }).length, 0);
+eq('a missing entry is unanswered too', unansweredFromAddResponse(b3, { tasks: [okEntry] }).map(j => j.jobId), [127, 60]);
+eq('no tasks at all is left to the top-level check', unansweredFromAddResponse(b3, { energy: 97 }).length, 0);
+eq('keyed form: an empty entry is unanswered',
+   unansweredFromAddResponse(b3, { tasks: { 3: okEntry, 4: { error: true }, 5: [] } }).map(j => j.jobId), [60]);
 
 // Into a NON-EMPTY queue the keys are queue positions, not 0..n-1, and the reply
 // comes as an object. Measured: a walk handed over behind three jobs.
@@ -1813,6 +1834,119 @@ sessionLost = null;
 extraJobs = [];
 lastForecast = [];
 delete window.Player;
+
+console.log('\n=== Gold/silver locations ===');
+CONFIG.ROUTE_EXACT_MAX = 12;
+eval(['featuredFromMapData', 'jobBlocks', 'travelSec', 'blockDetourSec', 'featuredOptions',
+      'routeSegments', 'routeGroups', 'bestOrder', 'routeTravelSec', 'planRoute'].map(extract).join('\n'));
+
+// The measured shape (hu27, 2026-10-15): featured entries sit deep inside the
+// per-tile arrays of get_complete_data, only for gold/silver spots.
+const mapReply = { static: [{ 150: { 66: [89, [[0, 91, 130, 181, 1]]] } }],
+    dynamic: { 0: [[{ x: 39431, y: 17586, job_id: 62, group_id: 28, silver: true, gold: false }],
+                   [{ x: 100, y: 200, job_id: 62, group_id: 28, silver: false, gold: true }],
+                   [{ x: 5, y: 5, job_id: 7, group_id: 3, silver: false, gold: false }]] } };
+const feat = featuredFromMapData(mapReply);
+eq('featured entries found anywhere in the reply', feat.map(f => [f.jobId, f.x, f.gold, f.silver]),
+   [[62, 39431, false, true], [62, 100, true, false]]);
+eq('a non-featured entry is not one', feat.some(f => f.jobId === 7), false);
+eq('the same spot twice is listed once', featuredFromMapData([mapReply, mapReply]).length, 2);
+
+const J = (id, jobId, x, y, extra) => Object.assign({ id, jobId, x, y, duration: 15, taskType: 'job', jobName: 'Zsoldosmunka' }, extra);
+const G = (jobId, x, y, swappable = true) => ({ jobId, x, y, duration: 15, pos: { x, y }, swappable });
+
+// The user's example: 24 Zsoldosmunka, 4 in the game's queue, 20 on our list.
+let gameQ = [G(71, 1000, 0), G(71, 1000, 0), G(71, 1000, 0), G(71, 1000, 0)];
+let list = Array.from({ length: 20 }, (_, i) => J('z' + i, 71, 1000, 0));
+let blocks = jobBlocks(gameQ, list, { x: 0, y: 0 });
+eq('24 jobs in both queues form ONE block', blocks.map(b => [b.count, b.gameIdx.length, b.extraIds.length]), [[24, 4, 20]]);
+eq('the block starts where the character is', blocks[0].prev, { x: 0, y: 0 });
+
+// The running task already working at its spot is not ours to move.
+gameQ = [G(71, 1000, 0, false), G(71, 1000, 0), G(71, 1000, 0)];
+blocks = jobBlocks(gameQ, list, { x: 0, y: 0 });
+eq('a task already working is left out of the block', [blocks[0].count, blocks[0].gameIdx], [22, [1, 2]]);
+eq('...and the block travels on from it', blocks[0].prev, { x: 1000, y: 0 });
+
+// A run in the middle of the game's queue cannot be moved: what is behind it would overtake it.
+gameQ = [G(71, 1000, 0), G(71, 1000, 0), G(5, 3000, 0)];
+blocks = jobBlocks(gameQ, [J('a', 9, 50, 50)], null);
+eq('a game-queue run not reaching the end is not offered', blocks.map(b => b.jobId), [5, 9]);
+eq('the last game task joins nothing of ours with another key', blocks[0].count, 1);
+
+// Different jobs, or the same job elsewhere, are separate blocks; a sleep splits a run.
+list = [J('a', 71, 1000, 0), J('b', 71, 1000, 0), J('c', 71, 2000, 0), { id: 's', taskType: 'sleep', jobId: 0, x: 3000, y: 0 }, J('d', 71, 2000, 0)];
+blocks = jobBlocks([], list, { x: 0, y: 0 });
+eq('runs split by place and by a sleep', blocks.map(b => b.extraIds), [['a', 'b'], ['c'], ['d']]);
+eq('a block knows what comes after it', [blocks[0].next, blocks[1].next], [{ x: 2000, y: 0 }, { x: 3000, y: 0 }]);
+
+// Detour: only the legs touching the block change.
+const blk = { x: 1000, y: 0, prev: { x: 0, y: 0 }, next: { x: 2000, y: 0 } };
+eq('a spot on the way costs nothing extra', blockDetourSec(blk, { x: 1500, y: 0 }, 1), 0);
+eq('a spot off the way costs both legs', Math.round(blockDetourSec(blk, { x: 1000, y: 1000 }, 1)),
+   Math.round(2 * Math.hypot(1000, 1000) - 2000));
+eq('the last block has no leg after it', blockDetourSec({ x: 1000, y: 0, prev: { x: 0, y: 0 }, next: null }, { x: 400, y: 0 }, 2), -1200);
+
+const spots = { 71: [{ jobId: 71, x: 1000, y: 500, gold: true, silver: false },
+                     { jobId: 71, x: 5000, y: 0, gold: true, silver: false },
+                     { jobId: 71, x: 900, y: 0, gold: false, silver: true }] };
+blocks = jobBlocks([], [J('a', 71, 1000, 0), J('b', 71, 1000, 0)], { x: 0, y: 0 });
+let opts = featuredOptions(blocks, id => spots[id], 1);
+eq('the cheaper gold is offered', [opts[0].gold.x, opts[0].gold.y], [1000, 500]);
+eq('silver alongside it, even when closer', [opts[0].silver.x, Math.round(opts[0].silver.detourSec)], [900, -100]);
+blocks = jobBlocks([], [J('a', 71, 1000, 500)], { x: 0, y: 0 });
+opts = featuredOptions(blocks, id => spots[id], 1);
+eq('a block already on gold is offered nothing', opts.length, 0);
+blocks = jobBlocks([], [J('a', 71, 900, 0)], { x: 0, y: 0 });
+opts = featuredOptions(blocks, id => spots[id], 1);
+eq('from silver, gold is still offered but silver is not', [!!opts[0].gold, !!opts[0].silver], [true, false]);
+eq('a job with no featured spot gets no line', featuredOptions(jobBlocks([], [J('a', 3, 1, 1)], null), id => spots[id] || [], 1).length, 0);
+
+console.log('\n=== Route order ===');
+const pathLen = (pts, start, end, order) => order.reduce((s, i, k) => s + (k ? Math.hypot(pts[order[k-1]].x - pts[i].x, pts[order[k-1]].y - pts[i].y) : (start ? Math.hypot(start.x - pts[i].x, start.y - pts[i].y) : 0)), 0)
+    + (end ? Math.hypot(pts[order[order.length-1]].x - end.x, pts[order[order.length-1]].y - end.y) : 0);
+const perms = a => a.length <= 1 ? [a] : a.flatMap((x, i) => perms(a.slice(0, i).concat(a.slice(i + 1))).map(p => [x].concat(p)));
+const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+let exactOk = true;
+for (let t = 0; t < 30; t++) {
+    const n = 2 + (t % 6);
+    const pts = Array.from({ length: n }, () => ({ x: Math.round(rnd() * 1000), y: Math.round(rnd() * 1000) }));
+    const start = t % 3 ? { x: 0, y: 0 } : null, end = t % 2 ? { x: 500, y: 900 } : null;
+    const got = pathLen(pts, start, end, bestOrder(pts, start, end, d));
+    const best = Math.min(...perms(pts.map((_, i) => i)).map(o => pathLen(pts, start, end, o)));
+    if (Math.abs(got - best) > 1e-6) exactOk = false;
+}
+eq('exact order equals brute force (30 random cases)', exactOk, true);
+const many = Array.from({ length: 20 }, () => ({ x: Math.round(rnd() * 5000), y: Math.round(rnd() * 5000) }));
+const ord = bestOrder(many, { x: 0, y: 0 }, null, d);
+eq('above the exact limit every place is still visited once', ord.slice().sort((a, b) => a - b), many.map((_, i) => i));
+eq('...and the route is no longer than the given order', pathLen(many, { x: 0, y: 0 }, null, ord) <= pathLen(many, { x: 0, y: 0 }, null, many.map((_, i) => i)), true);
+
+// A zig-zag list: A far, B near, A far again -- with A's run kept together.
+list = [J('a1', 1, 1000, 0), J('b1', 2, 10, 0), J('a2', 1, 1000, 0), J('b2', 2, 10, 0)];
+let rplan = planRoute(list, { x: 0, y: 0 }, 1);
+eq('the same job at the same place travels as one block', rplan.jobs.map(j => j.id), ['b1', 'b2', 'a1', 'a2']);
+eq('travel before/after', [rplan.before, rplan.after], [1000 + 990 + 990 + 990, 10 + 990]);
+
+list = [J('a', 1, 1000, 0), J('b', 2, 10, 0), { id: 's', taskType: 'sleep', jobId: 0, x: 0, y: 0 }, J('c', 3, 900, 0), J('d', 4, 20, 0),
+        { id: 'w', taskType: 'walk', jobId: 0, x: null, y: null }, J('e', 5, 5, 5)];
+rplan = planRoute(list, { x: 0, y: 0 }, 1);
+eq('sleeps and walks stay in place', [rplan.jobs[2].id, rplan.jobs[5].id], ['s', 'w']);
+eq('each segment is reordered on its own', rplan.jobs.map(j => j.id), ['b', 'a', 's', 'd', 'c', 'w', 'e']);
+eq('nothing is lost or doubled', rplan.jobs.map(j => j.id).sort(), list.map(j => j.id).sort());
+eq('an already best list stays as it is', planRoute([J('a', 1, 10, 0), J('b', 2, 20, 0)], { x: 0, y: 0 }, 1).jobs.map(j => j.id), ['a', 'b']);
+
+console.log('\n=== A swap holds the feeder ===');
+window.TaskQueue = makeGame(4, 0);
+extraJobs = mkJobs(3); processing = false; nextJobTimer = null; scheduled = null;
+swapHold = true;
+await processQueue();
+eq('nothing is handed over while a swap cancels', [window.TaskQueue.queue.length, extraJobs.length], [0, 3]);
+swapHold = false; processing = false;
+await processQueue();
+eq('...and feeding resumes afterwards', window.TaskQueue.queue.length, 3);
+extraJobs = [];
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The-West Modular Job Queue (Lisa)
 // @namespace   http://tampermonkey.net/
-// @version     12.21
+// @version     12.22
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -51,8 +51,8 @@
         LEADER_TTL: 15000,           // after this long without a heartbeat, processing is takeable
         BOOT_MAX_ATTEMPTS: 60,
         WINDOW_ID: 'lisaExtraQueue',
-        PANEL_WIDTH: 320,
-        PANEL_HEIGHT: 210,           // about 4-5 job rows visible, the rest by scrolling
+        PANEL_WIDTH: 390,
+        PANEL_HEIGHT: 300,           // about 8 job rows visible, the rest by scrolling
         PANEL_TOP: 215,              // below the character's box and its status bars
         PANEL_LEFT: 60,
         MAX_AMOUNT: 99,
@@ -77,6 +77,10 @@
         RELOAD_WINDOW_MS: 1800000,   // ...within this window, so a reload that can't log back in can't loop
         AUTO_LOGIN_BONUS: false,     // after OUR reload, collect the daily login bonus (button unverified live)
         LOGIN_BONUS_AFTER_RELOAD_MS: 120000,  // a load this soon after our reload counts as ours
+        FEATURED_SCAN: true,         // look up gold/silver spots for the queued jobs in the background
+        FEATURED_TTL: 300000,        // a job's gold/silver spots are re-read after this long
+        FEATURED_SCAN_MS: 15000,     // ...at most one such request this often
+        ROUTE_EXACT_MAX: 12,         // up to this many places the route order is exactly the best
     };
 
     // ============================================================
@@ -95,6 +99,7 @@
     let lastSeenQueueLen = 0;
     let inFlightBatch = null;        // what we just handed to the game, until the response
     let handingOver = false;         // our own TaskQueue.add is in flight -- don't divert it
+    let rejectHoldUntil = 0;         // a freed slot must not cut a rejection backoff short
     let sessionLost = null;          // { at, reason } once the server has logged us out
     const scriptStartedAt = Date.now();
     let lastForecast = [];           // per-job energy/motivation forecast
@@ -217,6 +222,21 @@
         return out;
     }
 
+    // Tasks the server did not process at all. Measured (hu27, 2026-10-15): once
+    // one task of a request fails, every task AFTER it is answered with an empty
+    // array -- {"tasks":[{"error":true,"msg":"A munka nem található!"},[]]} -- and
+    // the game drops them too. Only a {task} entry is an acceptance, so such a job
+    // goes back on the list; it was never judged, so it costs no rejection.
+    function unansweredFromAddResponse(batch, data) {
+        if (!batch || !batch.length || !data) return [];
+        const entries = addResponseEntries(data.tasks);
+        if (!entries) return [];
+        return batch.filter((job, i) => {
+            const entry = entries[i];
+            return !(entry && entry.task) && !(entry && entry.error);
+        });
+    }
+
     // The response is about OUR batch only if the request's jobs are exactly ours,
     // in the same order. Without this, a concurrent start by the user would
     // modify our list too.
@@ -244,12 +264,12 @@
     function updateQueueBadge() {
         if (!uiQueueStatus) return;
         if (!gameReady()) {
-            uiQueueStatus.textContent = 'Sor: –';
+            uiQueueStatus.textContent = 'Sor –';
             uiQueueStatus.style.color = '#a04040';
             return;
         }
         const len = gameQueueLength(), lim = gameQueueLimit();
-        uiQueueStatus.textContent = `Sor: ${len}/${lim}`;
+        uiQueueStatus.textContent = `Sor ${len}/${lim}`;
         uiQueueStatus.style.color = len >= lim ? '#c88a5a' : '#c8a96e';
     }
 
@@ -2528,7 +2548,7 @@
         return Math.min(CONFIG.REJECT_BACKOFF_MS * Math.pow(2, n - 1), CONFIG.REJECT_BACKOFF_MAX);
     }
 
-    function requeueRejected(rejected) {
+    function requeueRejected(rejected, unanswered) {
         if (!rejected.length) return;
         const keep = [], dropped = [];
         rejected.forEach(({ job, msg }) => {
@@ -2536,7 +2556,10 @@
             job.lastRejectMsg = msg;
             (job.rejections > CONFIG.MAX_REJECTIONS ? dropped : keep).push(job);
         });
-        if (keep.length) extraJobs.unshift(...keep);
+        // The unanswered ones stood behind a rejected one in the same request, so
+        // they go back right after it, in their original order.
+        const back = keep.concat((unanswered || []).filter(j => !keep.includes(j)));
+        if (back.length) extraJobs.unshift(...back);
         dropped.forEach(job => console.error(
             `[Lisa] Job given up after ${CONFIG.MAX_REJECTIONS} server-side rejections: ${job.jobName} -- ${job.lastRejectMsg}`));
 
@@ -2551,7 +2574,12 @@
             return;
         }
         const waitMs = rejectBackoffMs(Math.max(...keep.map(j => j.rejections)));
-        updateUIStatus(`${keep.length} munka visszakerült a sorba, újra ~${formatDuration(waitMs / 1000)} múlva – ${reason}`);
+        // The game takes the rejected tasks out of its queue, and watchGameQueue
+        // reads that as a freed slot. Without this hold it pulled the retry in to
+        // 0.4 s, so a job burned through all its rejections in seconds and was
+        // given up -- the backoff only ever existed on paper.
+        rejectHoldUntil = Date.now() + waitMs;
+        updateUIStatus(`${back.length} munka visszakerült a sorba, újra ~${formatDuration(waitMs / 1000)} múlva – ${reason}`);
         if (!paused && isLeaderTab) scheduleNextJob(waitMs);
     }
 
@@ -2567,11 +2595,19 @@
         let data = null;
         try { data = JSON.parse(responseText); } catch(e) { return; }
         const rejected = rejectedFromAddResponse(batch.jobs, data);
-        if (!rejected.length) {
+        const unanswered = unansweredFromAddResponse(batch.jobs, data);
+        if (!rejected.length && !unanswered.length) {
             batch.jobs.forEach(j => { j.rejections = 0; });
             return;
         }
-        requeueRejected(rejected);
+        if (!rejected.length) {
+            // Nothing failed, yet something was not taken: put it back and go on.
+            extraJobs.unshift(...unanswered);
+            console.warn(`[Lisa] The server did not process ${unanswered.length} job(s); they are back on the list.`);
+            queueChanged(null, CONFIG.MIN_SEND_GAP);
+            return;
+        }
+        requeueRejected(rejected, unanswered);
     }
 
     function InterceptedXHR() {
@@ -2788,28 +2824,30 @@
     // It only grows the list and returns how many fitted -- committing is the
     // caller's queueChanged(), which every one of them was already calling right
     // afterwards. Saving here as well meant writing the whole list twice per add.
+    // rejections too, like makeSleepEntry and makeWalkEntry -- this was the one
+    // factory that left it undefined.
+    function makeJobEntry(params, name) {
+        return {
+            id: generateId(),
+            retries: 0,
+            deferrals: 0,
+            rejections: 0,
+            jobName: name,
+            jobId: params.jobId,
+            x: params.x,
+            y: params.y,
+            duration: params.duration,
+            taskType: params.taskType || 'job',
+        };
+    }
+
     function addExtraJobs(params, count, displayName) {
         const wanted = Math.max(0, Math.min(parseInt(count, 10) || 0, CONFIG.MAX_AMOUNT));
         const room = Math.max(0, CONFIG.MAX_EXTRA_QUEUE - extraJobs.length);
         const n = Math.min(wanted, room);
         const name = displayName || `Job #${params.jobId}`;
 
-        for (let i = 0; i < n; i++) {
-            extraJobs.push({
-                // rejections too, like makeSleepEntry and makeWalkEntry -- this was
-                // the one factory that left it undefined.
-                id: generateId(),
-                retries: 0,
-                deferrals: 0,
-                rejections: 0,
-                jobName: name,
-                jobId: params.jobId,
-                x: params.x,
-                y: params.y,
-                duration: params.duration,
-                taskType: params.taskType || 'job',
-            });
-        }
+        for (let i = 0; i < n; i++) extraJobs.push(makeJobEntry(params, name));
 
         if (n < wanted) {
             console.warn(`[Lisa] Extra queue is full (${CONFIG.MAX_EXTRA_QUEUE}), ${wanted - n} job(s) did not fit.`);
@@ -2888,6 +2926,12 @@
             }
             if (extraJobs.length === 0) {
                 updateUIStatus('Nincs több munka az extra sorban.');
+                return;
+            }
+            // A gold/silver swap is cancelling tasks out of the game's queue; the slots
+            // that frees belong to their replacements, not to the jobs behind them.
+            if (swapHold) {
+                scheduleNextJob(1000);
                 return;
             }
             // Only one tab may process the queue, otherwise two instances would
@@ -3435,6 +3479,8 @@
         }
         watchGameQueue();
         pumpNextJobTimer();
+        scanFeatured();
+        renderFeaturedUi();
     }
 
     // Tab switch, window raised, machine wake, network back: after each of these we
@@ -3474,7 +3520,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.21',
+        version: '12.22',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -3565,6 +3611,7 @@
         lastSeenQueueLen = len;
 
         if (!dropped || paused || !isLeaderTab || processing) return;
+        if (Date.now() < rejectHoldUntil) return;     // a rejection backoff is running
         if (extraJobs.length === 0 || freeSlots() <= 0) return;
 
         const soon = Date.now() + CONFIG.SLOT_FREED_DELAY;
@@ -3633,7 +3680,495 @@
     }
 
     // ============================================================
-    //  26. THE PANEL: IN THE GAME'S OWN WINDOW FRAME
+    //  26. GOLD AND SILVER LOCATIONS
+    // ============================================================
+    // A job has the same id everywhere, but a few of its locations are "featured":
+    // gold or silver, paying more money and XP until a world-wide quota runs out.
+    // Measured (hu27, 2026-10-15, read-only):
+    //  - Ajax.get('map','get_minimap') -> job_groups[groupId] = [[x, y], ...]: every
+    //    location of every job group, 34 groups / 1189 locations on the whole map.
+    //  - Ajax.get('map','get_complete_data', {tiles: JSON.stringify([[tx, ty], ...])})
+    //    (tile = floor(coordinate / 256)) carries, for the featured locations only,
+    //    {x, y, job_id, group_id, silver, gold}. The whole map was 95 featured
+    //    locations (20 gold, 75 silver), 1-3 per job. Too many tiles in one request
+    //    is refused ("*ennyire* nagy felbontást nem támogat") -- 200 were fine, and
+    //    one group has at most 55 locations.
+    //  - The read-only job call at a featured spot answers is_gold/is_silver and per
+    //    duration featured_money / featured_xp (gold doubled 2$/1XP, silver gave
+    //    +1$/+2XP on a 15 s job).
+    // The quota is invisible: a location simply stops being featured. So the list
+    // is refreshed every FEATURED_TTL and re-checked right before a swap.
+    const featured = {
+        groups: null, groupsAt: 0, groupsPending: false,
+        byGroup: new Map(),      // groupId -> { at, list: [{jobId, x, y, gold, silver}] }
+        pending: new Set(),
+        rewards: new Map(),      // 'jobId@x,y' -> { at, money, xp } per duration
+        lastScanAt: 0,
+        open: false,             // the panel's gold/silver box is showing
+    };
+    let swapHold = false;        // a swap is cancelling game-queue tasks: feed nothing
+
+    function mapTile(v) {
+        const size = (window.GameMap && GameMap.tileSize) || 256;
+        return Math.floor(v / size);
+    }
+
+    function jobGroupOf(jobId) {
+        try {
+            const j = window.JobList && JobList.getJobById(jobId);
+            return j && j.groupid !== undefined ? parseInt(j.groupid, 10) : null;
+        } catch(e) { return null; }
+    }
+
+    // Every featured entry anywhere in a get_complete_data reply. The reply nests
+    // them inside per-tile arrays whose layout we have no reason to depend on, so we
+    // look for the objects themselves.
+    function featuredFromMapData(data) {
+        const out = [];
+        const seen = new Set();
+        (function walk(v) {
+            if (!v || typeof v !== 'object') return;
+            if (Array.isArray(v)) { v.forEach(walk); return; }
+            if (v.job_id !== undefined && (v.gold === true || v.silver === true)) {
+                const e = { jobId: parseInt(v.job_id, 10), groupId: parseInt(v.group_id, 10),
+                    x: walkCoord(v.x), y: walkCoord(v.y), gold: v.gold === true, silver: v.silver === true };
+                const k = `${e.jobId}@${e.x},${e.y}`;
+                if (e.x !== null && e.y !== null && !seen.has(k)) { seen.add(k); out.push(e); }
+                return;
+            }
+            Object.keys(v).forEach(k => walk(v[k]));
+        })(data);
+        return out;
+    }
+
+    function ajaxGet(window_, action, params) {
+        return new Promise((resolve, reject) => {
+            try {
+                const r = Ajax.get(window_, action, params);
+                if (r && typeof r.done === 'function') r.done(resolve).fail(reject);
+                else reject(new Error('no promise'));
+            } catch(e) { reject(e); }
+        });
+    }
+
+    async function loadJobGroups() {
+        if (featured.groups && Date.now() - featured.groupsAt < 3600000) return featured.groups;
+        if (featured.groupsPending || !window.Ajax || typeof Ajax.get !== 'function') return featured.groups;
+        featured.groupsPending = true;
+        try {
+            const r = await ajaxGet('map', 'get_minimap', {});
+            if (r && r.job_groups) { featured.groups = r.job_groups; featured.groupsAt = Date.now(); }
+        } catch(e) {
+            console.warn('[Lisa] Could not read the job locations:', e && e.message);
+        } finally { featured.groupsPending = false; }
+        return featured.groups;
+    }
+
+    async function refreshFeaturedGroup(groupId, force) {
+        const cached = featured.byGroup.get(groupId);
+        if (!force && cached && Date.now() - cached.at < CONFIG.FEATURED_TTL) return cached.list;
+        if (featured.pending.has(groupId)) return cached ? cached.list : [];
+        const groups = await loadJobGroups();
+        const locs = groups && groups[groupId];
+        if (!Array.isArray(locs) || !locs.length) return [];
+        const tiles = [...new Set(locs.map(([x, y]) => `${mapTile(x)},${mapTile(y)}`))]
+            .map(t => t.split(',').map(Number));
+        featured.pending.add(groupId);
+        try {
+            const r = await ajaxGet('map', 'get_complete_data', { tiles: JSON.stringify(tiles) });
+            if (r && r.error) throw new Error(r.msg);
+            const list = featuredFromMapData(r).filter(f => f.groupId === groupId);
+            featured.byGroup.set(groupId, { at: Date.now(), list });
+            return list;
+        } catch(e) {
+            console.warn('[Lisa] Could not read the gold/silver locations:', e && e.message);
+            return cached ? cached.list : [];
+        } finally { featured.pending.delete(groupId); }
+    }
+
+    function featuredFor(jobId) {
+        const g = jobGroupOf(jobId);
+        const c = g === null ? null : featured.byGroup.get(g);
+        return c ? c.list.filter(f => f.jobId === jobId) : [];
+    }
+
+    // The game's queue as the block finder sees it. The task already working at its
+    // spot (queuePos 0, arrived) is not ours to move -- cancelling it throws the
+    // work away. One still on the road can be redirected.
+    function gameQueueForBlocks() {
+        if (!gameReady()) return [];
+        const now = serverNowSec();
+        return window.TaskQueue.queue.map((t, i) => {
+            const p = t && t.post || {};
+            const isJob = (p.taskType || t.type) === 'job' && !isNaN(parseInt(p.jobId, 10));
+            let arrived = false;
+            try { arrived = i === 0 && typeof t.isArrived === 'function' && t.isArrived(now); } catch(e) {}
+            return {
+                jobId: isJob ? parseInt(p.jobId, 10) : null,
+                x: walkCoord(p.x), y: walkCoord(p.y),
+                duration: parseInt(p.duration, 10) || null,
+                pos: taskPosition(t),
+                swappable: isJob && !arrived && !!t.queueId,
+            };
+        });
+    }
+
+    // Runs of the same job at the same place, read across the game's queue and our
+    // list as one sequence -- that is how the user sees "24 Zsoldosmunka". The user
+    // queues dozens of 15 s jobs at a time, so a swap is offered per run, never per
+    // job. A run may take its game-queue part along only if that part reaches the
+    // END of the game's queue: cancelling from the middle would let whatever stands
+    // behind it overtake the run.
+    function jobBlocks(gameEntries, jobs, startPos) {
+        const seq = [];
+        gameEntries.forEach((g, i) => seq.push({
+            src: 'game', i, pos: g.pos,
+            key: g.swappable && g.jobId ? `${g.jobId}|${g.x}|${g.y}|${g.duration}` : null,
+            jobId: g.jobId, x: g.x, y: g.y, duration: g.duration,
+        }));
+        jobs.forEach(j => {
+            const isJob = (j.taskType || 'job') === 'job' && j.jobId > 0 && typeof j.x === 'number';
+            seq.push({
+                src: 'extra', id: j.id, name: j.jobName,
+                pos: typeof j.x === 'number' && typeof j.y === 'number' ? { x: j.x, y: j.y } : null,
+                key: isJob ? `${j.jobId}|${j.x}|${j.y}|${j.duration}` : null,
+                jobId: j.jobId, x: j.x, y: j.y, duration: j.duration,
+            });
+        });
+        const lastGame = gameEntries.length - 1;
+        const blocks = [];
+        let k = 0;
+        while (k < seq.length) {
+            const head = seq[k];
+            if (!head.key) { k++; continue; }
+            let e = k;
+            while (e + 1 < seq.length && seq[e + 1].key === head.key) e++;
+            const run = seq.slice(k, e + 1);
+            const gameIdx = run.filter(r => r.src === 'game').map(r => r.i);
+            const reachesEnd = !gameIdx.length || gameIdx[gameIdx.length - 1] === lastGame;
+            const extraIds = run.filter(r => r.src === 'extra').map(r => r.id);
+            if (extraIds.length || (gameIdx.length && reachesEnd)) {
+                const prev = k > 0 ? seq[k - 1].pos : startPos;
+                const next = e + 1 < seq.length ? seq[e + 1].pos : null;
+                blocks.push({
+                    key: head.key, jobId: head.jobId, x: head.x, y: head.y, duration: head.duration,
+                    name: (run.find(r => r.name) || {}).name || null,
+                    gameIdx: reachesEnd ? gameIdx : [], extraIds,
+                    count: (reachesEnd ? gameIdx.length : 0) + extraIds.length,
+                    prev: prev || null, next: next || null,
+                });
+            }
+            k = e + 1;
+        }
+        return blocks;
+    }
+
+    function travelSec(a, b, rate) {
+        if (!a || !b || !rate) return 0;
+        return Math.hypot(a.x - b.x, a.y - b.y) * rate;
+    }
+
+    // How much longer the whole route gets if the block moves to `to`: only the two
+    // legs touching it change. Measuring from the character instead would be wrong
+    // for a block that starts an hour from now somewhere else.
+    function blockDetourSec(block, to, rate) {
+        const from = { x: block.x, y: block.y };
+        return travelSec(block.prev, to, rate) + travelSec(to, block.next, rate)
+             - travelSec(block.prev, from, rate) - travelSec(from, block.next, rate);
+    }
+
+    // Per block, the cheapest gold and the cheapest silver alternative (either may be
+    // missing). A block already standing on a featured spot is left alone for that
+    // kind: moving from gold to gold gains nothing.
+    function featuredOptions(blocks, lookup, rate) {
+        const out = [];
+        blocks.forEach(b => {
+            const spots = lookup(b.jobId) || [];
+            const here = spots.find(f => f.x === b.x && f.y === b.y);
+            const best = kind => {
+                if (here && (here.gold || (kind === 'silver' && here.silver))) return null;
+                let pick = null;
+                spots.filter(f => f[kind] && !(f.x === b.x && f.y === b.y)).forEach(f => {
+                    const d = blockDetourSec(b, f, rate);
+                    if (!pick || d < pick.detourSec) pick = { x: f.x, y: f.y, detourSec: d, kind };
+                });
+                return pick;
+            };
+            const gold = best('gold'), silver = best('silver');
+            if (gold || silver) out.push({ block: b, gold, silver });
+        });
+        return out;
+    }
+
+    function currentFeaturedOptions() {
+        const blocks = jobBlocks(gameQueueForBlocks(), extraJobs, currentPosition());
+        return featuredOptions(blocks, featuredFor, secondsPerDistanceUnit());
+    }
+
+    // Keeps the featured lists of the jobs we have fresh, at most one request per
+    // FEATURED_SCAN_MS. Cheap enough to run behind the user's back: a group is at
+    // most 55 tiles in one request.
+    function scanFeatured() {
+        if (!CONFIG.FEATURED_SCAN || sessionLost || !window.Ajax) return;
+        const now = Date.now();
+        if (now - featured.lastScanAt < CONFIG.FEATURED_SCAN_MS) return;
+        const groups = new Set();
+        extraJobs.forEach(j => { if ((j.taskType || 'job') === 'job' && j.jobId > 0) groups.add(jobGroupOf(j.jobId)); });
+        gameQueueForBlocks().forEach(g => { if (g.swappable) groups.add(jobGroupOf(g.jobId)); });
+        groups.delete(null);
+        const stale = [...groups].find(g => {
+            const c = featured.byGroup.get(g);
+            return !c || now - c.at >= CONFIG.FEATURED_TTL;
+        });
+        if (stale === undefined) return;
+        featured.lastScanAt = now;
+        refreshFeaturedGroup(stale).then(() => renderFeaturedUi());
+    }
+
+    // The extra money and XP of one job at a featured spot, from the read-only job
+    // call; per duration, because a 1-hour job's bonus is not a 15 s one's.
+    function featuredReward(jobId, x, y, duration) {
+        const k = `${jobId}@${x},${y}`;
+        const c = featured.rewards.get(k);
+        if (c && Date.now() - c.at < CONFIG.FEATURED_TTL) return c.byDuration[duration] || null;
+        if (!c || !c.pending) {
+            featured.rewards.set(k, Object.assign({}, c || { byDuration: {} }, { pending: true, at: c ? c.at : 0 }));
+            try {
+                Ajax.remoteCallMode('job', 'job', { jobId, x, y }, json => {
+                    const byDuration = {};
+                    ((json && json.durations) || []).forEach(d => {
+                        byDuration[d.duration] = { money: d.featured_money || 0, xp: d.featured_xp || 0 };
+                    });
+                    featured.rewards.set(k, { at: Date.now(), byDuration });
+                    renderFeaturedUi();
+                });
+            } catch(e) {}
+        }
+        return c && c.byDuration ? c.byDuration[duration] || null : null;
+    }
+
+    // Moving a block. The waiting-list part only changes coordinates. The game-queue
+    // part has to be cancelled and queued again: the game moves nothing in place.
+    // Order of events matters, so nothing can be lost or doubled:
+    //  1. hold the feeder (swapHold), so the freed slots are not filled with the
+    //     jobs BEHIND the block;
+    //  2. cancel through the game (TaskQueue.cancel batches the positions into one
+    //     request), which also refunds the energy the game took for them;
+    //  3. only once a task has really left the queue does its replacement go on
+    //     the FRONT of our list -- a cancel that failed must not leave a copy behind.
+    async function applyFeaturedSwap(key, kind) {
+        if (swapHold) { updateUIStatus('Egy csere már folyamatban van.'); return; }
+        let opt = currentFeaturedOptions().find(o => o.block.key === key);
+        if (!opt || !opt[kind]) { updateUIStatus('Ez a csere már nem érhető el.'); renderFeaturedUi(); return; }
+        // The quota may have run out since the list was drawn. The await also lets
+        // the queue move on, so the block is looked up again afterwards.
+        const wanted = opt[kind];
+        await refreshFeaturedGroup(jobGroupOf(opt.block.jobId), true);
+        opt = currentFeaturedOptions().find(o => o.block.key === key);
+        const target = opt && opt[kind];
+        if (!target || target.x !== wanted.x || target.y !== wanted.y) {
+            updateUIStatus(`Ez a hely közben már nem ${kind === 'gold' ? 'gold' : 'silver'}.`);
+            renderFeaturedUi();
+            return;
+        }
+        const b = opt.block;
+        const ids = new Set(b.extraIds);
+        extraJobs.forEach(j => { if (ids.has(j.id)) { j.x = target.x; j.y = target.y; } });
+        const label = `${b.name || 'Munka'} ×${b.count} → ${kind === 'gold' ? 'gold' : 'silver'} hely`;
+
+        if (!b.gameIdx.length) { queueChanged(`${label}.`); return; }
+        if (processing || handingOver || (window.TaskQueue && TaskQueue.busy)) {
+            queueChanged(`${label} (a játék sorában lévők kimaradtak: a játék épp dolgozik, próbáld újra).`);
+            return;
+        }
+        const tasks = b.gameIdx.map(i => window.TaskQueue.queue[i]).filter(t => t && t.queueId);
+        const name = b.name || (window.JobList && JobList.getJobById(b.jobId) || {}).name || `Job #${b.jobId}`;
+        swapHold = true;
+        try {
+            tasks.forEach(t => window.TaskQueue.cancel(t.queuePos));
+        } catch(e) {
+            swapHold = false;
+            console.warn('[Lisa] Cancelling for the swap failed:', e);
+            queueChanged(`${label} (a játék sorában lévőket nem sikerült lemondani).`);
+            return;
+        }
+        updateUIStatus(`${label}: ${tasks.length} munka lemondása a játék sorából…`);
+        const qids = tasks.map(t => t.queueId);
+        const finish = () => {
+            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
+            const gone = qids.filter(q => !still.has(q)).length;
+            const back = Array.from({ length: gone }, () => makeJobEntry(
+                { jobId: b.jobId, x: target.x, y: target.y, duration: b.duration }, name));
+            extraJobs.unshift(...back);
+            swapHold = false;
+            console.log(`[Lisa] Swap: ${gone}/${qids.length} game-queue task(s) cancelled and queued again at ${target.x},${target.y}.`);
+            queueChanged(gone === qids.length ? `${label}.` : `${label} (${qids.length - gone} munka a játék sorában maradt).`,
+                         CONFIG.NEW_WORK_DELAY);
+        };
+        pollFor(() => {
+            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
+            if (qids.some(q => still.has(q)) || window.TaskQueue.busy) return false;
+            finish();
+            return true;
+        }, 500, 40, finish);
+    }
+
+    // ============================================================
+    //  27. ROUTE ORDER
+    // ============================================================
+    // Reorders the WAITING LIST (never the game's queue) for the least travel.
+    // Sleeps and walks stay exactly where they are and cut the list into segments;
+    // within a segment the same job at the same place travels as one block, so a
+    // run of 24 identical jobs is never split up. Energy and motivation are a sum
+    // over the same jobs, so the order changes neither -- only the travel.
+    function routeSegments(jobs) {
+        const segs = [];
+        let start = 0;
+        jobs.forEach((j, i) => {
+            const isJob = (j.taskType || 'job') === 'job' && typeof j.x === 'number' && typeof j.y === 'number';
+            if (isJob) return;
+            if (i > start) segs.push({ from: start, to: i });
+            start = i + 1;
+        });
+        if (start < jobs.length) segs.push({ from: start, to: jobs.length });
+        return segs;
+    }
+
+    function routeGroups(segJobs) {
+        const groups = [];
+        const byKey = new Map();
+        segJobs.forEach(j => {
+            const k = `${j.jobId}|${j.x}|${j.y}|${j.duration}`;
+            let g = byKey.get(k);
+            if (!g) { g = { pos: { x: j.x, y: j.y }, jobs: [] }; byKey.set(k, g); groups.push(g); }
+            g.jobs.push(j);
+        });
+        return groups;
+    }
+
+    // The order of `points` minimising start -> ... -> end (either end may be null,
+    // i.e. free). Exact (Held-Karp) up to ROUTE_EXACT_MAX places, which is plenty
+    // for a list one person queues by hand; above that nearest-neighbour plus 2-opt,
+    // good but not guaranteed best.
+    function bestOrder(points, start, end, dist) {
+        const n = points.length;
+        const idx = points.map((_, i) => i);
+        if (n <= 1) return idx;
+        const d0 = i => start ? dist(start, points[i]) : 0;
+        const dE = i => end ? dist(points[i], end) : 0;
+        if (n <= CONFIG.ROUTE_EXACT_MAX) {
+            const full = 1 << n;
+            const cost = new Float64Array(full * n).fill(Infinity);
+            const from = new Int8Array(full * n).fill(-1);
+            for (let i = 0; i < n; i++) cost[(1 << i) * n + i] = d0(i);
+            for (let m = 1; m < full; m++) {
+                for (let i = 0; i < n; i++) {
+                    const c = cost[m * n + i];
+                    if (!(m & (1 << i)) || c === Infinity) continue;
+                    for (let j = 0; j < n; j++) {
+                        if (m & (1 << j)) continue;
+                        const nm = m | (1 << j);
+                        const v = c + dist(points[i], points[j]);
+                        if (v < cost[nm * n + j] - 1e-9) { cost[nm * n + j] = v; from[nm * n + j] = i; }
+                    }
+                }
+            }
+            let best = -1, bestV = Infinity;
+            for (let i = 0; i < n; i++) {
+                const v = cost[(full - 1) * n + i] + dE(i);
+                if (v < bestV - 1e-9) { bestV = v; best = i; }
+            }
+            const order = [];
+            let m = full - 1, i = best;
+            while (i !== -1) { order.unshift(i); const p = from[m * n + i]; m &= ~(1 << i); i = p; }
+            return order;
+        }
+        // Nearest neighbour from the start...
+        const left = new Set(idx);
+        const order = [];
+        let cur = start;
+        while (left.size) {
+            let pick = null, pv = Infinity;
+            left.forEach(i => { const v = cur ? dist(cur, points[i]) : 0; if (v < pv) { pv = v; pick = i; } });
+            order.push(pick); left.delete(pick); cur = points[pick];
+        }
+        // ...then 2-opt until nothing improves.
+        const total = o => o.reduce((s, i, k) => s + (k ? dist(points[o[k - 1]], points[i]) : d0(i)), 0) + dE(o[o.length - 1]);
+        let improved = true, bestT = total(order), guard = 0;
+        while (improved && guard++ < 200) {
+            improved = false;
+            for (let a = 0; a < n - 1; a++) {
+                for (let b = a + 1; b < n; b++) {
+                    const cand = order.slice(0, a).concat(order.slice(a, b + 1).reverse(), order.slice(b + 1));
+                    const t = total(cand);
+                    if (t < bestT - 1e-9) { order.splice(0, n, ...cand); bestT = t; improved = true; }
+                }
+            }
+        }
+        return order;
+    }
+
+    function routeTravelSec(jobs, startPos, rate) {
+        let pos = startPos, sum = 0;
+        jobs.forEach(j => {
+            if (typeof j.x !== 'number' || typeof j.y !== 'number') return;
+            const p = { x: j.x, y: j.y };
+            sum += travelSec(pos, p, rate);
+            pos = p;
+        });
+        return sum;
+    }
+
+    // -> { jobs, before, after } (seconds of travel along the whole waiting list).
+    function planRoute(jobs, startPos, rate) {
+        const dist = (a, b) => travelSec(a, b, rate);
+        const out = jobs.slice();
+        routeSegments(jobs).forEach(seg => {
+            const before = seg.from > 0 ? jobs[seg.from - 1] : null;
+            const after = seg.to < jobs.length ? jobs[seg.to] : null;
+            const posOf = j => (j && typeof j.x === 'number' && typeof j.y === 'number') ? { x: j.x, y: j.y } : null;
+            // A walk without coordinates leaves the start unknown: a free start then.
+            const s = seg.from === 0 ? startPos : posOf(before);
+            const groups = routeGroups(jobs.slice(seg.from, seg.to));
+            const order = bestOrder(groups.map(g => g.pos), s, posOf(after), dist);
+            const reordered = order.flatMap(i => groups[i].jobs);
+            out.splice(seg.from, reordered.length, ...reordered);
+        });
+        return { jobs: out, before: routeTravelSec(jobs, startPos, rate), after: routeTravelSec(out, startPos, rate) };
+    }
+
+    let routeProposal = null;    // { ids, plan } while the panel shows it
+
+    function proposeRoute() {
+        const rate = secondsPerDistanceUnit();
+        if (!rate) { updateUIStatus('Az utazási idő most nem számolható.'); return; }
+        const plan = planRoute(extraJobs, queueTailAnchor().pos, rate);
+        routeProposal = { ids: extraJobs.map(j => j.id).join(','), plan };
+        featured.open = false;
+        renderToolsBox();
+    }
+
+    function applyRouteProposal() {
+        const p = routeProposal;
+        routeProposal = null;
+        if (!p) return;
+        let plan = p.plan;
+        // The feeder may have taken jobs off the front since: plan again on the
+        // list as it is now, rather than resurrect what has already gone.
+        if (extraJobs.map(j => j.id).join(',') !== p.ids) {
+            plan = planRoute(extraJobs, queueTailAnchor().pos, secondsPerDistanceUnit());
+        }
+        if (plan.after < plan.before - 1) {
+            extraJobs = plan.jobs;
+            queueChanged(`Sorrend átrendezve: ${formatDuration(plan.before - plan.after)} úttal kevesebb.`);
+        } else {
+            updateUIStatus('A sorrenden már nincs mit javítani.');
+        }
+        renderToolsBox();
+    }
+
+    // ============================================================
+    //  28. THE PANEL: IN THE GAME'S OWN WINDOW FRAME
     // ============================================================
     // wman is the game's window manager: wman.open(uid, title) gives a real game
     // window with a frame, a title bar, minimize/close buttons and drag-to-move.
@@ -3714,13 +4249,38 @@
             }
             #lisa-sleep-offer button:hover { background: linear-gradient(#8a7048,#5c4a30); }
             #lisa-toolbar {
-                flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+                flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
                 padding: 4px 20px 0 2px; font-size: 11px; color: #4a3b28;
             }
+            #lisa-toolbar .lisa-spacer { flex: 1 1 auto; min-width: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; }
+            #lisa-toolbar button { white-space: nowrap; flex: 0 0 auto; }
+            #lisa-toolbar button.lisa-hot {
+                background: linear-gradient(#c79a3a,#8a6420); color: #fff8e0; border-color: #5c4010;
+            }
+            #lisa-tools {
+                flex: 0 0 auto; max-height: 118px; overflow-y: auto;
+                margin: 0 20px 2px 2px; padding: 2px 4px;
+                background: rgba(120,95,60,0.10); border: 1px solid #8a7048; border-radius: 3px;
+                font: 11px Georgia,serif; color: #3b2f1e;
+            }
+            #lisa-tools .lisa-tools-head { display: flex; align-items: center; font-weight: bold; margin-bottom: 2px; }
+            #lisa-tools .lisa-tools-head span { flex: 1 1 auto; }
+            #lisa-tools .lisa-tools-row { padding: 2px 0; border-top: 1px dotted rgba(90,70,45,0.35); }
+            #lisa-tools .lisa-tools-row > div:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #lisa-tools .lisa-tools-btns { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 1px; }
+            #lisa-tools button {
+                font: 10px Georgia,serif; color: #f0e4c6; cursor: pointer;
+                background: linear-gradient(#6b5636,#4a3b28);
+                border: 1px solid #2e2416; border-radius: 3px; padding: 1px 6px;
+            }
+            #lisa-tools button:hover { background: linear-gradient(#8a7048,#5c4a30); }
+            #lisa-tools button.lisa-gold { background: linear-gradient(#d4a940,#9a7220); color: #2e2008; border-color: #6b4f10; }
+            #lisa-tools button.lisa-silver { background: linear-gradient(#d8d8d0,#9a9a90); color: #2a2a26; border-color: #6a6a62; }
+            #lisa-tools .lisa-close { color: #a03020; cursor: pointer; font-weight: bold; padding: 0 2px; }
             #lisa-toolbar button {
                 font: 11px Georgia,serif; color: #f0e4c6; cursor: pointer;
                 background: linear-gradient(#6b5636,#4a3b28);
-                border: 1px solid #2e2416; border-radius: 3px; padding: 2px 8px;
+                border: 1px solid #2e2416; border-radius: 3px; padding: 2px 6px;
                 text-shadow: 0 1px 1px #000;
             }
             #lisa-toolbar button:hover { background: linear-gradient(#8a7048,#5c4a30); }
@@ -3767,10 +4327,13 @@
                     <span id="lisa-total-eta"></span>
                 </div>
                 <div id="lisa-sleep-offer" style="display:none"></div>
+                <div id="lisa-tools" style="display:none"></div>
                 <div id="lisa-scroll"><ul id="lisa-extra-list"></ul><div id="lisa-empty"></div></div>
                 <div id="lisa-toolbar">
                     <button id="lisa-pause-btn" title="Szünet / Folytatás">Szünet</button>
-                    <span>Sor: <span id="lisa-queue-status">–</span> · Várakozó: <span id="lisa-extra-count">0</span></span>
+                    <button id="lisa-featured-btn" title="Gold és silver helyek a sorban álló munkákhoz">★ G/S</button>
+                    <button id="lisa-route-btn" title="A várakozó lista sorrendje a legrövidebb úthoz">Útvonal</button>
+                    <span class="lisa-spacer" title="A játék sora (benne / férőhely) és a várakozó lista hossza"><span id="lisa-queue-status">–</span> · <span id="lisa-extra-count">0</span> vár</span>
                     <button id="lisa-clear-extra" title="A teljes várakozó lista törlése">Törlés</button>
                 </div>
             </div>`;
@@ -3785,6 +4348,9 @@
 
         uiPauseBtn.addEventListener('click', togglePause);
         el.querySelector('#lisa-clear-extra').addEventListener('click', clearExtraQueue);
+        el.querySelector('#lisa-featured-btn').addEventListener('click', toggleFeaturedBox);
+        el.querySelector('#lisa-route-btn').addEventListener('click', proposeRoute);
+        toolsKey = '';
         return true;
     }
 
@@ -3931,6 +4497,148 @@
         container.appendChild(link);
         container.appendChild(bottom);
         menubar.appendChild(container);
+    }
+
+    // ---- The gold/silver and route box ----------------------------------------
+    // One box above the list, showing either the gold/silver choices or a route
+    // proposal. Nothing pops up by itself: the toolbar button lights up when a
+    // swap is available, and the user opens the box when they want to look.
+    let toolsKey = '';
+
+    function signedDuration(sec) {
+        if (Math.abs(sec) < 1) return 'ugyanannyi út';
+        return `${sec > 0 ? '+' : '−'}${formatDuration(Math.abs(sec))} út`;
+    }
+
+    function toggleFeaturedBox() {
+        featured.open = !featured.open;
+        routeProposal = null;
+        if (featured.open) {
+            const groups = new Set();
+            extraJobs.forEach(j => { if ((j.taskType || 'job') === 'job' && j.jobId > 0) groups.add(jobGroupOf(j.jobId)); });
+            gameQueueForBlocks().forEach(g => { if (g.swappable) groups.add(jobGroupOf(g.jobId)); });
+            groups.delete(null);
+            Promise.all([...groups].map(g => refreshFeaturedGroup(g))).then(() => renderFeaturedUi());
+        }
+        renderToolsBox();
+    }
+
+    function renderFeaturedUi() {
+        const btn = document.getElementById('lisa-featured-btn');
+        if (!btn) return;
+        const opts = currentFeaturedOptions();
+        btn.textContent = opts.length ? `★ G/S ${opts.length}` : '★ G/S';
+        btn.className = opts.length ? 'lisa-hot' : '';
+        btn.title = opts.length
+            ? `${opts.length} munkacsoport mehetne gold vagy silver helyre – kattints a részletekért`
+            : 'Gold és silver helyek a sorban álló munkákhoz';
+        if (featured.open) renderToolsBox(opts);
+    }
+
+    function optionButton(o, kind) {
+        const t = o[kind];
+        const b = o.block;
+        const r = featuredReward(b.jobId, t.x, t.y, b.duration);
+        const gain = r ? ` · +${r.money * b.count} $ +${r.xp * b.count} XP` : '';
+        const btn = document.createElement('button');
+        btn.className = kind === 'gold' ? 'lisa-gold' : 'lisa-silver';
+        btn.textContent = `${kind === 'gold' ? 'Gold' : 'Silver'}: ${signedDuration(t.detourSec)}${gain}`;
+        btn.title = `${b.count} munka áthelyezése ide: ${t.x}, ${t.y}`
+            + (r ? ` — munkánként +${r.money} $ és +${r.xp} XP` : '')
+            + (b.gameIdx.length ? `\nA játék sorában lévő ${b.gameIdx.length} munkát lemondja és újra sorba állítja.` : '');
+        btn.addEventListener('click', () => applyFeaturedSwap(b.key, kind));
+        return { btn, key: `${kind}${t.x},${t.y},${Math.round(t.detourSec)},${gain}` };
+    }
+
+    function renderToolsBox(opts) {
+        const box = document.getElementById('lisa-tools');
+        if (!box) return;
+        if (!featured.open && !routeProposal) {
+            if (box.style.display !== 'none') { box.style.display = 'none'; box.textContent = ''; }
+            toolsKey = '';
+            return;
+        }
+        const head = (title, onClose) => {
+            const h = document.createElement('div');
+            h.className = 'lisa-tools-head';
+            const t = document.createElement('span');
+            t.textContent = title;
+            const x = document.createElement('span');
+            x.className = 'lisa-close';
+            x.textContent = '✕';
+            x.title = 'Bezárás';
+            x.addEventListener('click', onClose);
+            h.appendChild(t); h.appendChild(x);
+            return h;
+        };
+        const parts = [];
+        let key;
+        if (routeProposal) {
+            const p = routeProposal.plan;
+            const better = p.after < p.before - 1;
+            key = `route${Math.round(p.before)},${Math.round(p.after)}`;
+            if (key === toolsKey) return;
+            parts.push(head('Útvonal', () => { routeProposal = null; renderToolsBox(); }));
+            const row = document.createElement('div');
+            row.className = 'lisa-tools-row';
+            const txt = document.createElement('div');
+            txt.textContent = better
+                ? `Út most ${formatDuration(p.before)} → átrendezve ${formatDuration(p.after)} (−${formatDuration(p.before - p.after)}).`
+                : `A mostani sorrend a legrövidebb (${formatDuration(p.before)} út).`;
+            txt.title = 'Csak a várakozó lista sorrendje változik; az alvások és a séták a helyükön maradnak, az azonos munkák egyben.';
+            row.appendChild(txt);
+            const btns = document.createElement('div');
+            btns.className = 'lisa-tools-btns';
+            if (better) {
+                const ok = document.createElement('button');
+                ok.textContent = 'Átrendezés';
+                ok.addEventListener('click', applyRouteProposal);
+                btns.appendChild(ok);
+            }
+            const no = document.createElement('button');
+            no.textContent = better ? 'Mégse' : 'OK';
+            no.addEventListener('click', () => { routeProposal = null; renderToolsBox(); });
+            btns.appendChild(no);
+            row.appendChild(btns);
+            parts.push(row);
+        } else {
+            opts = opts || currentFeaturedOptions();
+            const loading = featured.pending.size > 0 || featured.groupsPending;
+            const rows = opts.map(o => {
+                const b = o.block;
+                const row = document.createElement('div');
+                row.className = 'lisa-tools-row';
+                const txt = document.createElement('div');
+                txt.textContent = `${b.name || `Munka #${b.jobId}`} ×${b.count}`
+                    + (b.gameIdx.length ? ` (${b.gameIdx.length} a játék sorában)` : '');
+                row.appendChild(txt);
+                const btns = document.createElement('div');
+                btns.className = 'lisa-tools-btns';
+                const keys = [];
+                ['gold', 'silver'].forEach(kind => {
+                    if (!o[kind]) return;
+                    const ob = optionButton(o, kind);
+                    btns.appendChild(ob.btn);
+                    keys.push(ob.key);
+                });
+                row.appendChild(btns);
+                return { row, key: `${b.key}:${b.count}:${b.gameIdx.length}:${keys.join(';')}` };
+            });
+            key = `feat${loading}|${rows.map(r => r.key).join('|')}`;
+            if (key === toolsKey) return;
+            parts.push(head('Gold / silver helyek', () => { featured.open = false; renderToolsBox(); }));
+            if (!rows.length) {
+                const empty = document.createElement('div');
+                empty.className = 'lisa-tools-row';
+                empty.textContent = loading ? 'Keresés…' : 'Most nincs gold vagy silver hely a sorban álló munkákhoz.';
+                parts.push(empty);
+            }
+            rows.forEach(r => parts.push(r.row));
+        }
+        toolsKey = key;
+        box.textContent = '';
+        parts.forEach(el => box.appendChild(el));
+        box.style.display = '';
     }
 
     function updateUI() { updateExtraList(); updateQueueBadge(); }
@@ -4118,7 +4826,7 @@
     }
 
     // ============================================================
-    //  27. BOOT
+    //  29. BOOT
     // ============================================================
     function boot() {
         // Decide the leader before any processing, so a second tab doesn't start
@@ -4164,5 +4872,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.21 loaded.');
+    console.log('[Lisa] Modular v12.22 loaded.');
 })();
