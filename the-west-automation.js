@@ -4163,21 +4163,85 @@
         return order;
     }
 
-    function routeTravelSec(jobs, startPos, rate) {
+    function routeTravelSec(jobs, startPos, rate, posOf) {
         let pos = startPos, sum = 0;
         jobs.forEach(j => {
-            if (typeof j.x !== 'number' || typeof j.y !== 'number') return;
-            const p = { x: j.x, y: j.y };
+            const p = posOf ? posOf(j) : (typeof j.x === 'number' && typeof j.y === 'number' ? { x: j.x, y: j.y } : null);
+            if (!p) return;
             sum += travelSec(pos, p, rate);
             pos = p;
         });
         return sum;
     }
 
-    // -> { jobs, before, after } (seconds of travel along the whole waiting list).
-    function planRoute(jobs, startPos, rate) {
+    // Where each place of a fixed visiting order should be, when place i may be any
+    // of cands[i] (cands[i][0] is where it is now). Exact for that order: a shortest
+    // path through the layers, O(places x candidates^2). A move must gain something
+    // -- staying put wins every tie -- so nothing is relocated for nothing.
+    function chooseLocations(order, cands, start, end, dist) {
+        const EPS = 1e-6;
+        let prev = null;           // [{cost, from}] for the previous place's candidates
+        const back = [];
+        order.forEach((gi, k) => {
+            const cur = cands[gi].map((c, ci) => {
+                const stay = ci === 0 ? 0 : EPS;
+                if (k === 0) return { cost: (start ? dist(start, c) : 0) + stay, from: -1 };
+                let best = Infinity, from = 0;
+                cands[order[k - 1]].forEach((pc, pi) => {
+                    const v = prev[pi].cost + dist(pc, c);
+                    if (v < best) { best = v; from = pi; }
+                });
+                return { cost: best + stay, from };
+            });
+            back.push(cur);
+            prev = cur;
+        });
+        const last = order.length - 1;
+        let bi = 0, bv = Infinity;
+        cands[order[last]].forEach((c, ci) => {
+            const v = back[last][ci].cost + (end ? dist(c, end) : 0);
+            if (v < bv) { bv = v; bi = ci; }
+        });
+        const choice = cands.map(() => 0);
+        for (let k = last; k >= 0; k--) {
+            choice[order[k]] = bi;
+            bi = back[k][bi].from;
+        }
+        return choice;
+    }
+
+    // Order and places together: alternately the best order for the chosen places
+    // and the best places for that order, until neither shortens the route. Each
+    // half is exact on its own; together they settle close to the best, not
+    // provably on it. Without alternatives (every cands[i] a single place) this is
+    // exactly bestOrder.
+    function optimiseSegment(cands, start, end, dist) {
+        const at = (choice, i) => cands[i][choice[i]];
+        const cost = (order, choice) => order.reduce((sum, i, k) =>
+            sum + (k ? dist(at(choice, order[k - 1]), at(choice, i)) : (start ? dist(start, at(choice, i)) : 0)), 0)
+            + (end && order.length ? dist(at(choice, order[order.length - 1]), end) : 0);
+        let choice = cands.map(() => 0);
+        let order = bestOrder(cands.map((c, i) => at(choice, i)), start, end, dist);
+        if (!cands.some(c => c.length > 1)) return { order, choice };
+        let best = cost(order, choice);
+        for (let round = 0; round < 10; round++) {
+            const ch = chooseLocations(order, cands, start, end, dist);
+            const ord = bestOrder(cands.map((c, i) => at(ch, i)), start, end, dist);
+            const v = cost(ord, ch);
+            if (!(v < best - 1e-6)) break;
+            best = v; order = ord; choice = ch;
+        }
+        return { order, choice };
+    }
+
+    // -> { jobs, moves, before, after } (seconds of travel along the whole list).
+    // `candidatesOf(job)`, when given, lists the other places that job may move to;
+    // the chosen ones come back in `moves` (job object -> {x, y}) and are NOT yet
+    // written into the jobs -- applying is the caller's decision.
+    function planRoute(jobs, startPos, rate, candidatesOf) {
         const dist = (a, b) => travelSec(a, b, rate);
         const out = jobs.slice();
+        const moves = new Map();
         routeSegments(jobs).forEach(seg => {
             const before = seg.from > 0 ? jobs[seg.from - 1] : null;
             const after = seg.to < jobs.length ? jobs[seg.to] : null;
@@ -4185,11 +4249,31 @@
             // A walk without coordinates leaves the start unknown: a free start then.
             const s = seg.from === 0 ? startPos : posOf(before);
             const groups = routeGroups(jobs.slice(seg.from, seg.to));
-            const order = bestOrder(groups.map(g => g.pos), s, posOf(after), dist);
+            const cands = groups.map(g => [g.pos].concat(((candidatesOf && candidatesOf(g.jobs[0])) || [])
+                .filter(c => c.x !== g.pos.x || c.y !== g.pos.y)));
+            const { order, choice } = optimiseSegment(cands, s, posOf(after), dist);
+            order.forEach(i => {
+                if (choice[i] > 0) groups[i].jobs.forEach(j => moves.set(j, cands[i][choice[i]]));
+            });
             const reordered = order.flatMap(i => groups[i].jobs);
             out.splice(seg.from, reordered.length, ...reordered);
         });
-        return { jobs: out, before: routeTravelSec(jobs, startPos, rate), after: routeTravelSec(out, startPos, rate) };
+        const movedPos = j => moves.get(j) || (typeof j.x === 'number' && typeof j.y === 'number' ? { x: j.x, y: j.y } : null);
+        return { jobs: out, moves, before: routeTravelSec(jobs, startPos, rate), after: routeTravelSec(out, startPos, rate, movedPos) };
+    }
+
+    // The places a job may move to, by the rule the user set: a plain job anywhere
+    // its job is done, a silver one only to silver or gold, a gold one only to gold
+    // -- never downwards. `locs` are the job group's locations, `feats` that job's
+    // gold/silver spots.
+    function relocationCandidates(job, locs, feats) {
+        if (!Array.isArray(locs)) return null;
+        const tierAt = (x, y) => {
+            const f = feats.find(f => f.x === x && f.y === y);
+            return f ? (f.gold ? 2 : f.silver ? 1 : 0) : 0;
+        };
+        const mine = tierAt(job.x, job.y);
+        return locs.map(([x, y]) => ({ x, y, tier: tierAt(x, y) })).filter(c => c.tier >= mine);
     }
 
     // The movable part of the game's queue: the jobs at its end, after the started
@@ -4204,10 +4288,10 @@
     // our list, starting where the unmovable part of the game's queue ends; `keep`
     // is how many of the game's movable tasks are still in their place, i.e. need
     // no cancelling.
-    function planRouteWithGame(game, jobs, startPos, rate) {
+    function planRouteWithGame(game, jobs, startPos, rate, candidatesOf) {
         const top = game[0];
         const pinned = game.map((g, i) => (i === 0 ? Object.assign({}, g, { swappable: false }) : g));
-        const keepTop = planRouteFrom(top && top.swappable ? pinned : game, jobs, startPos, rate);
+        const keepTop = planRouteFrom(top && top.swappable ? pinned : game, jobs, startPos, rate, candidatesOf);
         if (!top || !top.swappable || !top.pos || !startPos) return keepTop;
         // The top task is still on the road, so it may move too. Both variants are
         // put on one footing, "travel still ahead from now": the one that keeps the
@@ -4216,56 +4300,116 @@
         const leftOfWalk = Math.max(0, travelSec(startPos, top.pos, rate) - (top.elapsedSec || 0));
         keepTop.plan.before += leftOfWalk;
         keepTop.plan.after += leftOfWalk;
-        const moveTop = planRouteFrom(game, jobs, startPos, rate);
+        const moveTop = planRouteFrom(game, jobs, startPos, rate, candidatesOf);
         moveTop.plan.before -= top.elapsedSec || 0;
         if (moveTop.keep > 0) moveTop.plan.after -= top.elapsedSec || 0;
         return moveTop.plan.after < keepTop.plan.after - 1 ? moveTop : keepTop;
     }
 
-    function planRouteFrom(game, jobs, startPos, rate) {
+    function planRouteFrom(game, jobs, startPos, rate, candidatesOf) {
         const from = movableGameTail(game);
         const tail = game.slice(from);
         const start = (from > 0 && game[from - 1].pos) || startPos;
         const gameJobs = tail.map(g => makeJobEntry(
             { jobId: g.jobId, x: g.x, y: g.y, duration: g.duration }, jobNameOf(g.jobId)));
-        const plan = planRoute(gameJobs.concat(jobs), start, rate);
+        const plan = planRoute(gameJobs.concat(jobs), start, rate, candidatesOf);
+        // A game task stays only if it keeps both its turn and its place.
         let keep = 0;
-        while (keep < gameJobs.length && plan.jobs[keep] === gameJobs[keep]) keep++;
+        while (keep < gameJobs.length && plan.jobs[keep] === gameJobs[keep] && !plan.moves.has(gameJobs[keep])) keep++;
         return { plan, gameJobs, tasks: tail.map(g => g.task), keep, from };
     }
 
-    let routeProposal = null;    // { plan, moved } while the panel shows it
-
-    function currentRoutePlan() {
-        const rate = secondsPerDistanceUnit();
-        if (!rate) return null;
-        return planRouteWithGame(gameQueueForBlocks(), extraJobs, currentPosition(), rate);
+    // What a relocation proposal changes, one line per run: "Zsoldosmunka ×24 -> silver".
+    function describeMoves(plan, feats) {
+        const lines = new Map();
+        plan.jobs.forEach(j => {
+            const to = plan.moves.get(j);
+            if (!to) return;
+            const k = `${j.jobId}|${to.x}|${to.y}`;
+            const l = lines.get(k) || { name: j.jobName || jobNameOf(j.jobId), count: 0, tier: to.tier || 0 };
+            l.count++;
+            lines.set(k, l);
+        });
+        return [...lines.values()];
     }
 
-    function proposeRoute() {
-        const r = currentRoutePlan();
-        if (!r) { updateUIStatus('Az utazási idő most nem számolható.'); return; }
-        routeProposal = { plan: r.plan, moved: r.gameJobs.length - r.keep };
+    let routeProposal = null;    // { plain, relocate } while the panel shows it
+
+    // The relocation candidates need the job groups' locations and every queued
+    // job's gold/silver spots, all fresh: a stale or missing featured list would
+    // make a silver run look plain and let it move DOWN to a plain spot. So a job
+    // whose list is not at hand gets no candidates at all.
+    function routeCandidatesOf() {
+        return job => {
+            const g = jobGroupOf(job.jobId);
+            const c = g === null ? null : featured.byGroup.get(g);
+            if (!c || Date.now() - c.at >= CONFIG.FEATURED_TTL || !featured.groups) return null;
+            return relocationCandidates(job, featured.groups[g], c.list.filter(f => f.jobId === job.jobId));
+        };
+    }
+
+    function currentRoutePlan(relocate) {
+        const rate = secondsPerDistanceUnit();
+        if (!rate) return null;
+        return planRouteWithGame(gameQueueForBlocks(), extraJobs, currentPosition(), rate,
+                                 relocate ? routeCandidatesOf() : null);
+    }
+
+    async function refreshFeaturedForQueue() {
+        await loadJobGroups();
+        const groups = new Set();
+        extraJobs.forEach(j => { if ((j.taskType || 'job') === 'job' && j.jobId > 0) groups.add(jobGroupOf(j.jobId)); });
+        gameQueueForBlocks().forEach(g => { if (g.swappable) groups.add(jobGroupOf(g.jobId)); });
+        groups.delete(null);
+        await Promise.all([...groups].map(g => refreshFeaturedGroup(g)));
+    }
+
+    async function proposeRoute() {
+        const plain = currentRoutePlan(false);
+        if (!plain) { updateUIStatus('Az utazási idő most nem számolható.'); return; }
+        routeProposal = { plain: summarisePlan(plain), relocate: null, loading: true };
         featured.open = false;
         renderToolsBox();
+        try { await refreshFeaturedForQueue(); } catch(e) {}
+        if (!routeProposal) return;               // closed meanwhile
+        const rel = currentRoutePlan(true);
+        routeProposal.loading = false;
+        routeProposal.plain = summarisePlan(currentRoutePlan(false) || plain);
+        // Offered only when moving places beats the plain reordering.
+        if (rel && rel.plan.moves.size && rel.plan.after < routeProposal.plain.after - 1) {
+            routeProposal.relocate = Object.assign(summarisePlan(rel), { lines: describeMoves(rel.plan) });
+        }
+        renderToolsBox();
+    }
+
+    function summarisePlan(r) {
+        return { before: r.plan.before, after: r.plan.after, moved: r.gameJobs.length - r.keep };
     }
 
     // Planned again at the moment of applying: the feeder and the game's queue
     // move on while the proposal sits on screen.
-    function applyRouteProposal() {
+    function applyRouteProposal(relocate) {
         routeProposal = null;
         renderToolsBox();
         if (swapHold) { updateUIStatus('Egy átrendezés már folyamatban van.'); return; }
-        const r = currentRoutePlan();
+        const r = currentRoutePlan(relocate);
         if (!r || !(r.plan.after < r.plan.before - 1)) {
             updateUIStatus('A sorrenden már nincs mit javítani.');
             return;
         }
         const saved = formatDuration(r.plan.before - r.plan.after);
+        const movedRuns = describeMoves(r.plan).length;
+        const done = `Sorrend átrendezve${movedRuns ? `, ${movedRuns} csoport új helyen` : ''}: ${saved} úttal kevesebb.`;
+        // The new places are written only once the order is really taking effect.
+        const placeAll = list => list.forEach(j => {
+            const to = r.plan.moves.get(j);
+            if (to) { j.x = to.x; j.y = to.y; }
+        });
         const n = r.gameJobs.length;
         if (r.keep === n) {
             extraJobs = r.plan.jobs.slice(n);
-            queueChanged(`Sorrend átrendezve: ${saved} úttal kevesebb.`);
+            placeAll(extraJobs);
+            queueChanged(done);
             return;
         }
         if (gameBusy()) {
@@ -4277,12 +4421,13 @@
         cancelGameTasks(tasks, gone => {
             if (gone.size === tasks.length) {
                 extraJobs = r.plan.jobs.slice(r.keep);
+                placeAll(extraJobs);
                 console.log(`[Lisa] Route: ${tasks.length} game-queue task(s) cancelled, the list reordered.`);
-                queueChanged(`Sorrend átrendezve: ${saved} úttal kevesebb.`, CONFIG.NEW_WORK_DELAY);
+                queueChanged(done, CONFIG.NEW_WORK_DELAY);
                 return;
             }
             // Partly failed: no reordering, but whatever did leave the game's queue
-            // goes back to the front of our list in its old order -- nothing is lost.
+            // goes back to the front of our list in its old order and place.
             const back = r.gameJobs.slice(r.keep).filter((j, k) => gone.has(tasks[k].queueId));
             extraJobs.unshift(...back);
             queueChanged(`Az átrendezés elmaradt: ${tasks.length - gone.size} munkát nem sikerült lemondani.`,
@@ -4697,35 +4842,55 @@
         const parts = [];
         let key;
         if (routeProposal) {
-            const p = routeProposal.plan;
+            const rp = routeProposal;
+            const p = rp.plain, rel = rp.relocate;
             const better = p.after < p.before - 1;
-            key = `route${Math.round(p.before)},${Math.round(p.after)},${routeProposal.moved}`;
+            key = `route${Math.round(p.before)},${Math.round(p.after)},${p.moved},${rp.loading}`
+                + (rel ? `,${Math.round(rel.after)},${rel.moved},${rel.lines.map(l => l.name + l.count + l.tier).join(';')}` : '');
             if (key === toolsKey) return;
             parts.push(head('Útvonal', () => { routeProposal = null; renderToolsBox(); }));
-            const row = document.createElement('div');
-            row.className = 'lisa-tools-row';
-            const txt = document.createElement('div');
-            const moved = routeProposal.moved;
-            txt.textContent = better
-                ? `Út most ${formatDuration(p.before)} → átrendezve ${formatDuration(p.after)} (−${formatDuration(p.before - p.after)}).`
-                  + (moved ? ` A játék sorából ${moved} munkát újra sorba állít.` : '')
-                : `A mostani sorrend a legrövidebb (${formatDuration(p.before)} út).`;
-            txt.title = 'A játék sorának legfelső munkája csak akkor mozdul, ha a karakter még úton van oda (az addigi út elvész, ez benne van a számításban); az alvások és a séták a helyükön, az azonos munkák egyben.';
-            row.appendChild(txt);
-            const btns = document.createElement('div');
-            btns.className = 'lisa-tools-btns';
-            if (better) {
-                const ok = document.createElement('button');
-                ok.textContent = 'Átrendezés';
-                ok.addEventListener('click', applyRouteProposal);
-                btns.appendChild(ok);
+            const tierName = t => (t === 2 ? 'gold' : t === 1 ? 'silver' : 'sima');
+            const option = (text, title, label, relocate) => {
+                const row = document.createElement('div');
+                row.className = 'lisa-tools-row';
+                const txt = document.createElement('div');
+                txt.style.whiteSpace = 'normal';
+                txt.textContent = text;
+                txt.title = title;
+                row.appendChild(txt);
+                if (label) {
+                    const btns = document.createElement('div');
+                    btns.className = 'lisa-tools-btns';
+                    const ok = document.createElement('button');
+                    ok.textContent = label;
+                    ok.addEventListener('click', () => applyRouteProposal(relocate));
+                    btns.appendChild(ok);
+                    row.appendChild(btns);
+                }
+                parts.push(row);
+            };
+            const common = 'A játék sorának legfelső munkája csak akkor mozdul, ha a karakter még úton van oda'
+                + ' (az addigi út elvész, ez benne van a számításban); az alvások és a séták a helyükön, az azonos munkák egyben.';
+            const fromGame = n => (n ? ` A játék sorából ${n} munkát újra sorba állít.` : '');
+            option(better
+                ? `Csak sorrend: ${formatDuration(p.before)} → ${formatDuration(p.after)} út (−${formatDuration(p.before - p.after)}).${fromGame(p.moved)}`
+                : `Csak sorrend: a mostani a legrövidebb (${formatDuration(p.before)} út).`,
+                common, better ? 'Átrendezés' : null, false);
+            if (rel) {
+                const lines = rel.lines.map(l => `${l.name} ×${l.count} → ${tierName(l.tier)} hely`).join(', ');
+                option(`Sorrend + helycsere: ${formatDuration(rel.before)} → ${formatDuration(rel.after)} út (−${formatDuration(rel.before - rel.after)}). ${lines}.${fromGame(rel.moved)}`,
+                    common + '\nA munka ugyanannak a munkának egy másik helyére kerül: sima bárhová, silver csak silverre vagy goldra, gold csak goldra.',
+                    'Átrendezés helycserével', true);
+            } else if (rp.loading) {
+                option('Helycsere keresése…', '', null, false);
             }
+            const closeRow = document.createElement('div');
+            closeRow.className = 'lisa-tools-btns';
             const no = document.createElement('button');
-            no.textContent = better ? 'Mégse' : 'OK';
+            no.textContent = 'Mégse';
             no.addEventListener('click', () => { routeProposal = null; renderToolsBox(); });
-            btns.appendChild(no);
-            row.appendChild(btns);
-            parts.push(row);
+            closeRow.appendChild(no);
+            parts.push(closeRow);
         } else {
             opts = opts || currentFeaturedOptions();
             const loading = featured.pending.size > 0 || featured.groupsPending;

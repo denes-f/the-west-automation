@@ -1839,7 +1839,8 @@ console.log('\n=== Gold/silver locations ===');
 CONFIG.ROUTE_EXACT_MAX = 12;
 eval(['featuredFromMapData', 'jobBlocks', 'travelSec', 'blockDetourSec', 'featuredOptions',
       'routeSegments', 'routeGroups', 'bestOrder', 'routeTravelSec', 'planRoute',
-      'movableGameTail', 'planRouteWithGame', 'planRouteFrom', 'jobNameOf'].map(extract).join('\n'));
+      'movableGameTail', 'planRouteWithGame', 'planRouteFrom', 'jobNameOf',
+      'chooseLocations', 'optimiseSegment', 'relocationCandidates', 'describeMoves'].map(extract).join('\n'));
 
 // The measured shape (hu27, 2026-10-15): featured entries sit deep inside the
 // per-tile arrays of get_complete_data, only for gold/silver spots.
@@ -1996,6 +1997,47 @@ blocks = jobBlocks([walking(71, 1000, 300), GQ(71, 1000)], [], { x: 0, y: 0 });
 eq('the run holding a walking top task knows what it would lose', [blocks[0].count, blocks[0].lostSec], [2, 300]);
 opts = featuredOptions(blocks, id => [{ jobId: 71, x: 1000, y: 500, gold: true, silver: false }], 1);
 eq('...and the detour includes it', Math.round(opts[0].gold.detourSec), Math.round(Math.hypot(1000, 500) - 1000 + 300));
+
+console.log('\n=== Route order with other places ===');
+// The rule: plain -> anywhere, silver -> silver/gold, gold -> gold only.
+const locs71 = [[1000, 0], [10, 0], [500, 500], [2000, 0]];
+const feats71 = [{ jobId: 71, x: 500, y: 500, silver: true }, { jobId: 71, x: 2000, y: 0, gold: true }];
+eq('a plain job may go anywhere', relocationCandidates({ x: 1000, y: 0 }, locs71, feats71).length, 4);
+eq('a silver job only to silver or gold', relocationCandidates({ x: 500, y: 500 }, locs71, feats71).map(c => c.x), [500, 2000]);
+eq('a gold job only to gold', relocationCandidates({ x: 2000, y: 0 }, locs71, feats71).map(c => c.x), [2000]);
+eq('candidates carry their tier', relocationCandidates({ x: 1000, y: 0 }, locs71, feats71).map(c => c.tier), [0, 0, 1, 2]);
+eq('no locations known -> no candidates', relocationCandidates({ x: 1, y: 1 }, undefined, []), null);
+
+// Per a fixed order, the place choice is exact: brute force over all combinations.
+let locOk = true;
+for (let t = 0; t < 25; t++) {
+    const n = 2 + (t % 4);
+    const cands = Array.from({ length: n }, () => Array.from({ length: 1 + (t % 3) }, () => ({ x: Math.round(rnd() * 1000), y: Math.round(rnd() * 1000) })));
+    const order = cands.map((_, i) => i);
+    const start = { x: 0, y: 0 }, end = t % 2 ? { x: 900, y: 900 } : null;
+    const cost = ch => order.reduce((sum, i, k) => sum + d(k ? cands[order[k-1]][ch[order[k-1]]] : start, cands[i][ch[i]]), 0) + (end ? d(cands[order[n-1]][ch[order[n-1]]], end) : 0);
+    const got = cost(chooseLocations(order, cands, start, end, d));
+    let best = Infinity;
+    const rec = (i, ch) => { if (i === n) { best = Math.min(best, cost(ch)); return; } cands[i].forEach((_, c) => rec(i + 1, ch.concat(c))); };
+    rec(0, []);
+    if (Math.abs(got - best) > 1e-3) locOk = false;
+}
+eq('the place choice equals brute force (25 random cases)', locOk, true);
+eq('staying put wins a tie', chooseLocations([0], [[{ x: 10, y: 0 }, { x: -10, y: 0 }]], { x: 0, y: 0 }, null, d), [0]);
+
+// A run far away, while its job is also done next door: it moves, and the plan says so.
+const candFor = j => (j.jobId === 7 ? [{ x: 20, y: 0, tier: 0 }] : []);
+let rel = planRoute([J('a', 5, 10, 0), J('b', 7, 3000, 0), J('c', 7, 3000, 0), J('e', 5, 10, 0)], { x: 0, y: 0 }, 1, candFor);
+eq('a far run moves to a nearer place of the same job', [rel.moves.size, rel.moves.get(rel.jobs.find(j => j.id === 'b'))], [2, { x: 20, y: 0, tier: 0 }]);
+eq('...the jobs themselves are not touched yet', rel.jobs.find(j => j.id === 'b').x, 3000);
+eq('...and the travel counts the new place', [rel.before, rel.after], [10 + 2990 + 2990, 20]);
+eq('the move is described per run', describeMoves(rel), [{ name: 'Zsoldosmunka', count: 2, tier: 0 }]);
+eq('without candidates nothing moves', planRoute([J('a', 5, 10, 0), J('b', 7, 3000, 0)], { x: 0, y: 0 }, 1).moves.size, 0);
+eq('a run already best placed stays', planRoute([J('a', 7, 20, 0)], { x: 0, y: 0 }, 1, j => [{ x: 3000, y: 0, tier: 2 }]).moves.size, 0);
+
+// A game task that moves place is cancelled even if its turn stays the same.
+gplan = planRouteWithGame([GQ(1, 0, false), GQ(7, 3000)], [], { x: 0, y: 0 }, 1, candFor);
+eq('a game task that only changes place still counts as moved', [gplan.keep, gplan.plan.moves.size], [0, 1]);
 
 console.log('\n=== A swap holds the feeder ===');
 window.TaskQueue = makeGame(4, 0);
