@@ -1903,6 +1903,29 @@ opts = featuredOptions(blocks, id => spots[id], 1);
 eq('from silver, gold is still offered but silver is not', [!!opts[0].gold, !!opts[0].silver], [true, false]);
 eq('a job with no featured spot gets no line', featuredOptions(jobBlocks([], [J('a', 3, 1, 1)], null), id => spots[id] || [], 1).length, 0);
 
+// After a page reload the game rebuilds its queue with post = {jobId, taskType}
+// only; the place and length live in data (measured). Reported live: a run swapped
+// to silver was offered a farther silver after the reload.
+eval(['gameTaskJob', 'gameQueueForBlocks', 'serverNowSec'].map(extract).join('\n'));
+eq('a reloaded game task reads its place from data',
+   gameTaskJob({ post: { jobId: 128, taskType: 'job' }, data: { x: 37677, y: 13434, duration: 15 } }),
+   { jobId: 128, x: 37677, y: 13434, duration: 15 });
+eq('a fresh one from post', gameTaskJob({ post: { jobId: 7, x: '5', y: 6, duration: 600, taskType: 'job' }, data: {} }),
+   { jobId: 7, x: 5, y: 6, duration: 600 });
+{
+    const savedTQ = window.TaskQueue;
+    const reloaded = (qid) => ({ type: 'job', queueId: qid, post: { jobId: 71, taskType: 'job' },
+        data: { x: 900, y: 0, duration: 15 }, wayData: {}, isArrived: () => true });
+    window.TaskQueue = { queue: [reloaded(1), reloaded(2), reloaded(3)], limit: { normal: 4 } };
+    const gq = gameQueueForBlocks();
+    eq('reloaded tasks are movable jobs at their real place', gq.map(g => [g.swappable, g.x, g.duration]),
+       [[false, 900, 15], [true, 900, 15], [true, 900, 15]]);
+    const bl = jobBlocks(gq, [], { x: 0, y: 0 });
+    const op = featuredOptions(bl, id => spots[id], 1);
+    eq('...so a run already on silver is offered gold only', [!!op[0].gold, !!op[0].silver], [true, false]);
+    window.TaskQueue = savedTQ;
+}
+
 console.log('\n=== Route order ===');
 const pathLen = (pts, start, end, order) => order.reduce((s, i, k) => s + (k ? Math.hypot(pts[order[k-1]].x - pts[i].x, pts[order[k-1]].y - pts[i].y) : (start ? Math.hypot(start.x - pts[i].x, start.y - pts[i].y) : 0)), 0)
     + (end ? Math.hypot(pts[order[order.length-1]].x - end.x, pts[order[order.length-1]].y - end.y) : 0);

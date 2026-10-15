@@ -436,6 +436,26 @@
         return null;
     }
 
+    // A game-queue job's id, place and length. A task the page queued itself carries
+    // them in `post`, but after a page reload the game rebuilds its queue through
+    // TaskFactory as `new TaskJob(job_id).setData(...)`, so `post` holds only
+    // {jobId, taskType} and the rest sits in `data` -- measured (2026-10-15):
+    // post {jobId:128, taskType:'job'}, data {x, y, duration:15, ...}. Reading post
+    // alone made every game-queue job look placeless after a reload: a gold/silver
+    // swap re-offered a silver run already standing on silver.
+    function gameTaskJob(t) {
+        const p = (t && t.post) || {};
+        const d = (t && t.data) || {};
+        const jobId = parseInt(p.jobId, 10);
+        const x = walkCoord(p.x) !== null ? walkCoord(p.x) : walkCoord(d.x);
+        const y = walkCoord(p.y) !== null ? walkCoord(p.y) : walkCoord(d.y);
+        return {
+            jobId: isNaN(jobId) ? null : jobId,
+            x, y,
+            duration: parseInt(p.duration, 10) || parseInt(d.duration, 10) || null,
+        };
+    }
+
     function queueTailAnchor() {
         const now = Date.now();
         let tail = null;
@@ -631,10 +651,10 @@
         const out = {};
         if (!gameReady()) return out;
         for (const t of window.TaskQueue.queue) {
-            const p = t && t.post;
-            if (!p || typeof p.jobId !== 'number') continue;
-            const cost = jobEnergyCost({ jobId: p.jobId, duration: p.duration });
-            if (cost !== null) out[p.jobId] = (out[p.jobId] || 0) + cost;
+            if (!t || !t.post || typeof t.post.jobId !== 'number') continue;
+            const j = gameTaskJob(t);
+            const cost = jobEnergyCost({ jobId: j.jobId, duration: j.duration });
+            if (cost !== null) out[j.jobId] = (out[j.jobId] || 0) + cost;
         }
         return out;
     }
@@ -3804,7 +3824,9 @@
         const nowSec = serverNowSec();
         return window.TaskQueue.queue.map((t, i) => {
             const p = t && t.post || {};
-            const isJob = (p.taskType || t.type) === 'job' && !isNaN(parseInt(p.jobId, 10));
+            const j = gameTaskJob(t);
+            const isJob = (p.taskType || t.type) === 'job' && j.jobId !== null
+                && j.x !== null && j.y !== null && !!j.duration;
             let onTheRoad = false, elapsedSec = 0;
             if (i === 0) {
                 try { onTheRoad = typeof t.isArrived === 'function' && !t.isArrived(nowSec); } catch(e) {}
@@ -3812,9 +3834,9 @@
                 if (onTheRoad && typeof started === 'number') elapsedSec = Math.max(0, nowSec - started / 1000);
             }
             return {
-                jobId: isJob ? parseInt(p.jobId, 10) : null,
-                x: walkCoord(p.x), y: walkCoord(p.y),
-                duration: parseInt(p.duration, 10) || null,
+                jobId: isJob ? j.jobId : null,
+                x: j.x, y: j.y,
+                duration: j.duration,
                 pos: taskPosition(t),
                 swappable: isJob && !!t.queueId && (i > 0 || onTheRoad),
                 elapsedSec,
@@ -4021,7 +4043,7 @@
         const b = opt.block;
         const ids = new Set(b.extraIds);
         extraJobs.forEach(j => { if (ids.has(j.id)) { j.x = target.x; j.y = target.y; } });
-        const label = `${b.name || 'Munka'} ×${b.count} → ${kind === 'gold' ? 'gold' : 'silver'} hely`;
+        const label = `${b.name || jobNameOf(b.jobId)} ×${b.count} → ${kind === 'gold' ? 'gold' : 'silver'} hely`;
 
         if (!b.gameIdx.length) { queueChanged(`${label}.`); return; }
         if (gameBusy()) {
@@ -4712,7 +4734,7 @@
                 const row = document.createElement('div');
                 row.className = 'lisa-tools-row';
                 const txt = document.createElement('div');
-                txt.textContent = `${b.name || `Munka #${b.jobId}`} ×${b.count}`
+                txt.textContent = `${b.name || jobNameOf(b.jobId)} ×${b.count}`
                     + (b.gameIdx.length ? ` (${b.gameIdx.length} a játék sorában)` : '');
                 row.appendChild(txt);
                 const btns = document.createElement('div');
