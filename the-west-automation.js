@@ -81,6 +81,8 @@
         FEATURED_TTL: 300000,        // a job's gold/silver spots are re-read after this long
         FEATURED_SCAN_MS: 15000,     // ...at most one such request this often
         ROUTE_EXACT_MAX: 12,         // up to this many places the route order is exactly the best
+        ROUTE_HINT_MS: 10000,        // how often the Útvonal button re-checks for a shorter route
+        ROUTE_HINT_MIN_SEC: 30,      // ...and lights up from this much saving
     };
 
     // ============================================================
@@ -302,6 +304,7 @@
         updateUI();
         if (status) updateUIStatus(status);
         if (typeof pullInMs === 'number') ensureProcessing(pullInMs);
+        routeHint.at = 0;     // the list changed: the Útvonal hint re-checks on the next tick
     }
 
     // A west.gui.Dialog closed with the ✕ fires no button callback at all, so any
@@ -3501,6 +3504,7 @@
         pumpNextJobTimer();
         scanFeatured();
         renderFeaturedUi();
+        updateRouteHint();
     }
 
     // Tab switch, window raised, machine wake, network back: after each of these we
@@ -4382,6 +4386,37 @@
         renderToolsBox();
     }
 
+    // The Útvonal button says by itself when it has something to offer, so the user
+    // need not press it to find out. Both plans, the plain and the relocating one,
+    // every ROUTE_HINT_MS; the relocating one uses only featured lists already at
+    // hand (scanFeatured keeps them fresh), so this sends nothing to the server.
+    let routeHint = { at: 0, savedSec: 0 };
+
+    function updateRouteHint(force) {
+        const btn = document.getElementById('lisa-route-btn');
+        if (!btn) return;
+        const now = Date.now();
+        if (!force && now - routeHint.at < CONFIG.ROUTE_HINT_MS) return;
+        routeHint.at = now;
+        let saved = 0, relocating = false;
+        try {
+            const plain = currentRoutePlan(false);
+            const rel = currentRoutePlan(true);
+            if (plain) saved = plain.plan.before - plain.plan.after;
+            if (rel && rel.plan.moves.size && rel.plan.before - rel.plan.after > saved + 1) {
+                saved = rel.plan.before - rel.plan.after;
+                relocating = true;
+            }
+        } catch(e) { saved = 0; }
+        routeHint.savedSec = saved;
+        const hot = saved >= CONFIG.ROUTE_HINT_MIN_SEC;
+        btn.textContent = hot ? `Útvonal −${formatDuration(saved)}` : 'Útvonal';
+        btn.className = hot ? 'lisa-hot' : '';
+        btn.title = hot
+            ? `Rövidebb út lehetséges: ${formatDuration(saved)} megtakarítás${relocating ? ' (helycserével)' : ''} – kattints a részletekért`
+            : 'A várakozó lista sorrendje a legrövidebb úthoz';
+    }
+
     function summarisePlan(r) {
         return { before: r.plan.before, after: r.plan.after, moved: r.gameJobs.length - r.keep };
     }
@@ -4390,6 +4425,7 @@
     // move on while the proposal sits on screen.
     function applyRouteProposal(relocate) {
         routeProposal = null;
+        routeHint.at = 0;                 // re-check on the next tick, not in 10 s
         renderToolsBox();
         if (swapHold) { updateUIStatus('Egy átrendezés már folyamatban van.'); return; }
         const r = currentRoutePlan(relocate);
@@ -4521,7 +4557,9 @@
                 padding: 4px 20px 0 2px; font-size: 11px; color: #4a3b28;
             }
             #lisa-toolbar .lisa-spacer { flex: 1 1 auto; min-width: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; }
-            #lisa-toolbar button { white-space: nowrap; flex: 0 0 auto; }
+            /* One height for every button: the ★ comes from a fallback font with a taller
+               line box, which made the G/S button stand out from its neighbours. */
+            #lisa-toolbar button { white-space: nowrap; flex: 0 0 auto; height: 20px; line-height: 14px; }
             #lisa-toolbar button.lisa-hot {
                 background: linear-gradient(#c79a3a,#8a6420); color: #fff8e0; border-color: #5c4010;
             }

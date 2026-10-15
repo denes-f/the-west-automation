@@ -57,7 +57,12 @@ live on hu27 (monkey, 2026-10-15, net energy 0 — the cancels refunded everythi
   neither improves; staying put wins ties. Offered only when it beats the plain reordering, with
   one line per moved run. Candidates need a FRESH featured list for the job (else a silver run would
   look plain and could move down), so a job without one gets none. Measured: 2 × Útonálló 70 s
-  away → moved to a location of the same job 29 s away; the server accepted it there. Exact (Held-Karp) up to
+  away → moved to a location of the same job 29 s away; the server accepted it there.
+  **The button tells by itself** (`updateRouteHint`, every `ROUTE_HINT_MS` 10 s and right after a
+  list change): both plans are computed in the background — the relocating one only from featured
+  lists already cached, so nothing is sent — and from `ROUTE_HINT_MIN_SEC` (30 s) of saving it lights
+  up as `Útvonal −5 p`. The toolbar buttons have a fixed 20 px height: the ★ comes from a fallback
+  font with a taller line box and made G/S stand out. Exact (Held-Karp) up to
   `ROUTE_EXACT_MAX` 12 places, nearest-neighbour + 2-opt above. Shows the saving, applies on
   confirm. Measured: a zig-zag list 9 p → 3 p of travel.
 - **Panel 390×300** (was 320×210), the user asked for more room.
