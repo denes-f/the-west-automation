@@ -1838,7 +1838,8 @@ delete window.Player;
 console.log('\n=== Gold/silver locations ===');
 CONFIG.ROUTE_EXACT_MAX = 12;
 eval(['featuredFromMapData', 'jobBlocks', 'travelSec', 'blockDetourSec', 'featuredOptions',
-      'routeSegments', 'routeGroups', 'bestOrder', 'routeTravelSec', 'planRoute'].map(extract).join('\n'));
+      'routeSegments', 'routeGroups', 'bestOrder', 'routeTravelSec', 'planRoute',
+      'movableGameTail', 'planRouteWithGame', 'jobNameOf'].map(extract).join('\n'));
 
 // The measured shape (hu27, 2026-10-15): featured entries sit deep inside the
 // per-tile arrays of get_complete_data, only for gold/silver spots.
@@ -1936,6 +1937,22 @@ eq('sleeps and walks stay in place', [rplan.jobs[2].id, rplan.jobs[5].id], ['s',
 eq('each segment is reordered on its own', rplan.jobs.map(j => j.id), ['b', 'a', 's', 'd', 'c', 'w', 'e']);
 eq('nothing is lost or doubled', rplan.jobs.map(j => j.id).sort(), list.map(j => j.id).sort());
 eq('an already best list stays as it is', planRoute([J('a', 1, 10, 0), J('b', 2, 20, 0)], { x: 0, y: 0 }, 1).jobs.map(j => j.id), ['a', 'b']);
+
+// The game's queue joins in, except its started top task -- never interrupted.
+const GQ = (jobId, x, swappable = true) => ({ jobId, x, y: 0, duration: 15, pos: { x, y: 0 }, swappable, task: { queueId: 'q' + jobId + x } });
+let gplan = planRouteWithGame([GQ(1, 0, false), GQ(2, 1000), GQ(3, 10)], [J('e', 4, 1010, 0)], { x: 0, y: 0 }, 1);
+eq('the top task is not part of the plan', gplan.gameJobs.length, 2);
+eq('the game tail is reordered with our list', gplan.plan.jobs.map(j => j.jobId), [3, 2, 4]);
+eq('nothing of the game tail keeps its place here', gplan.keep, 0);
+eq('travel counted from the top task', [gplan.plan.before, gplan.plan.after], [1000 + 990 + 1000, 10 + 990 + 10]);
+gplan = planRouteWithGame([GQ(1, 0, false), GQ(2, 10), GQ(3, 1000)], [J('e', 4, 20, 0)], { x: 0, y: 0 }, 1);
+eq('an unchanged game prefix needs no cancelling', [gplan.keep, gplan.plan.jobs.map(j => j.jobId)], [1, [2, 4, 3]]);
+gplan = planRouteWithGame([GQ(1, 0, false), GQ(2, 1000), { jobId: null, x: 500, y: 0, pos: { x: 500, y: 0 }, swappable: false, task: {} }, GQ(3, 10)],
+                          [J('e', 4, 1000, 0)], { x: 0, y: 0 }, 1);
+eq('a sleep/walk in the game queue fixes everything before it', gplan.gameJobs.map(j => j.jobId), [3]);
+eq('...and the plan starts from it', gplan.plan.jobs.map(j => j.jobId), [3, 4]);
+gplan = planRouteWithGame([], [J('a', 1, 1000, 0), J('b', 2, 10, 0)], { x: 0, y: 0 }, 1);
+eq('an empty game queue plans our list from the character', gplan.plan.jobs.map(j => j.id), ['b', 'a']);
 
 console.log('\n=== A swap holds the feeder ===');
 window.TaskQueue = makeGame(4, 0);

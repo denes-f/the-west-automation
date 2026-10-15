@@ -3792,25 +3792,58 @@
         return c ? c.list.filter(f => f.jobId === jobId) : [];
     }
 
-    // The game's queue as the block finder sees it. The task already working at its
-    // spot (queuePos 0, arrived) is not ours to move -- cancelling it throws the
-    // work away. One still on the road can be redirected.
+    // The game's queue as the block finder and the route planner see it. The task
+    // at the top (queuePos 0) has started -- on the road or already working -- and
+    // is never interrupted: the user's rule, since cancelling it throws away the
+    // time already spent. Only the tasks behind it may be moved.
     function gameQueueForBlocks() {
         if (!gameReady()) return [];
-        const now = serverNowSec();
         return window.TaskQueue.queue.map((t, i) => {
             const p = t && t.post || {};
             const isJob = (p.taskType || t.type) === 'job' && !isNaN(parseInt(p.jobId, 10));
-            let arrived = false;
-            try { arrived = i === 0 && typeof t.isArrived === 'function' && t.isArrived(now); } catch(e) {}
             return {
                 jobId: isJob ? parseInt(p.jobId, 10) : null,
                 x: walkCoord(p.x), y: walkCoord(p.y),
                 duration: parseInt(p.duration, 10) || null,
                 pos: taskPosition(t),
-                swappable: isJob && !arrived && !!t.queueId,
+                swappable: isJob && i > 0 && !!t.queueId,
+                task: t,
             };
         });
+    }
+
+    function jobNameOf(jobId) {
+        try { return (window.JobList && JobList.getJobById(jobId) || {}).name || `Job #${jobId}`; }
+        catch(e) { return `Job #${jobId}`; }
+    }
+
+    // Cancels game-queue tasks through the game and calls back with the queueIds
+    // that really left the queue. The feeder is held meanwhile, so the freed slots
+    // are not filled with whatever stands behind them. TaskQueue.cancel batches
+    // the positions into one request, and the game refunds their energy.
+    function cancelGameTasks(tasks, done) {
+        swapHold = true;
+        try {
+            tasks.forEach(t => window.TaskQueue.cancel(t.queuePos));
+        } catch(e) {
+            console.warn('[Lisa] Cancelling in the game\'s queue failed:', e);
+        }
+        const qids = tasks.map(t => t.queueId);
+        const finish = () => {
+            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
+            swapHold = false;
+            done(new Set(qids.filter(q => !still.has(q))));
+        };
+        pollFor(() => {
+            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
+            if (qids.some(q => still.has(q)) || window.TaskQueue.busy) return false;
+            finish();
+            return true;
+        }, 500, 40, finish);
+    }
+
+    function gameBusy() {
+        return swapHold || processing || handingOver || (window.TaskQueue && TaskQueue.busy);
     }
 
     // Runs of the same job at the same place, read across the game's queue and our
@@ -3957,7 +3990,7 @@
     //  3. only once a task has really left the queue does its replacement go on
     //     the FRONT of our list -- a cancel that failed must not leave a copy behind.
     async function applyFeaturedSwap(key, kind) {
-        if (swapHold) { updateUIStatus('Egy csere már folyamatban van.'); return; }
+        if (swapHold) { updateUIStatus('Egy átrendezés már folyamatban van.'); return; }
         let opt = currentFeaturedOptions().find(o => o.block.key === key);
         if (!opt || !opt[kind]) { updateUIStatus('Ez a csere már nem érhető el.'); renderFeaturedUi(); return; }
         // The quota may have run out since the list was drawn. The await also lets
@@ -3977,46 +4010,32 @@
         const label = `${b.name || 'Munka'} ×${b.count} → ${kind === 'gold' ? 'gold' : 'silver'} hely`;
 
         if (!b.gameIdx.length) { queueChanged(`${label}.`); return; }
-        if (processing || handingOver || (window.TaskQueue && TaskQueue.busy)) {
+        if (gameBusy()) {
             queueChanged(`${label} (a játék sorában lévők kimaradtak: a játék épp dolgozik, próbáld újra).`);
             return;
         }
         const tasks = b.gameIdx.map(i => window.TaskQueue.queue[i]).filter(t => t && t.queueId);
-        const name = b.name || (window.JobList && JobList.getJobById(b.jobId) || {}).name || `Job #${b.jobId}`;
-        swapHold = true;
-        try {
-            tasks.forEach(t => window.TaskQueue.cancel(t.queuePos));
-        } catch(e) {
-            swapHold = false;
-            console.warn('[Lisa] Cancelling for the swap failed:', e);
-            queueChanged(`${label} (a játék sorában lévőket nem sikerült lemondani).`);
-            return;
-        }
+        const name = b.name || jobNameOf(b.jobId);
         updateUIStatus(`${label}: ${tasks.length} munka lemondása a játék sorából…`);
-        const qids = tasks.map(t => t.queueId);
-        const finish = () => {
-            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
-            const gone = qids.filter(q => !still.has(q)).length;
-            const back = Array.from({ length: gone }, () => makeJobEntry(
+        cancelGameTasks(tasks, gone => {
+            // Only what really left gets a replacement: a failed cancel must not
+            // leave a copy behind.
+            const back = tasks.filter(t => gone.has(t.queueId)).map(() => makeJobEntry(
                 { jobId: b.jobId, x: target.x, y: target.y, duration: b.duration }, name));
             extraJobs.unshift(...back);
-            swapHold = false;
-            console.log(`[Lisa] Swap: ${gone}/${qids.length} game-queue task(s) cancelled and queued again at ${target.x},${target.y}.`);
-            queueChanged(gone === qids.length ? `${label}.` : `${label} (${qids.length - gone} munka a játék sorában maradt).`,
+            console.log(`[Lisa] Swap: ${back.length}/${tasks.length} game-queue task(s) cancelled and queued again at ${target.x},${target.y}.`);
+            queueChanged(back.length === tasks.length ? `${label}.` : `${label} (${tasks.length - back.length} munka a játék sorában maradt).`,
                          CONFIG.NEW_WORK_DELAY);
-        };
-        pollFor(() => {
-            const still = new Set((window.TaskQueue.queue || []).map(t => t && t.queueId));
-            if (qids.some(q => still.has(q)) || window.TaskQueue.busy) return false;
-            finish();
-            return true;
-        }, 500, 40, finish);
+        });
     }
 
     // ============================================================
     //  27. ROUTE ORDER
     // ============================================================
-    // Reorders the WAITING LIST (never the game's queue) for the least travel.
+    // Reorders for the least travel: our waiting list AND the not-yet-started tail of
+    // the game's queue (never its top task, see gameQueueForBlocks). The game cannot
+    // reorder in place, so the game-queue tasks whose position changes are cancelled
+    // and handed over again in the new order -- the longest unchanged prefix stays.
     // Sleeps and walks stay exactly where they are and cut the list into segments;
     // within a segment the same job at the same place travels as one block, so a
     // run of 24 identical jobs is never split up. Energy and motivation are a sum
@@ -4137,34 +4156,84 @@
         return { jobs: out, before: routeTravelSec(jobs, startPos, rate), after: routeTravelSec(out, startPos, rate) };
     }
 
-    let routeProposal = null;    // { ids, plan } while the panel shows it
+    // The movable part of the game's queue: the jobs at its end, after the started
+    // top task and after anything that is not a job (a sleep or a walk stays put).
+    function movableGameTail(game) {
+        let from = game.length;
+        while (from > 0 && game[from - 1].swappable) from--;
+        return from;
+    }
+
+    // -> { plan, gameJobs, tasks, keep }: `plan` covers the movable game tail plus
+    // our list, starting where the unmovable part of the game's queue ends; `keep`
+    // is how many of the game's movable tasks are still in their place, i.e. need
+    // no cancelling.
+    function planRouteWithGame(game, jobs, startPos, rate) {
+        const from = movableGameTail(game);
+        const tail = game.slice(from);
+        const start = (from > 0 && game[from - 1].pos) || startPos;
+        const gameJobs = tail.map(g => makeJobEntry(
+            { jobId: g.jobId, x: g.x, y: g.y, duration: g.duration }, jobNameOf(g.jobId)));
+        const plan = planRoute(gameJobs.concat(jobs), start, rate);
+        let keep = 0;
+        while (keep < gameJobs.length && plan.jobs[keep] === gameJobs[keep]) keep++;
+        return { plan, gameJobs, tasks: tail.map(g => g.task), keep };
+    }
+
+    let routeProposal = null;    // { plan, moved } while the panel shows it
+
+    function currentRoutePlan() {
+        const rate = secondsPerDistanceUnit();
+        if (!rate) return null;
+        return planRouteWithGame(gameQueueForBlocks(), extraJobs, currentPosition(), rate);
+    }
 
     function proposeRoute() {
-        const rate = secondsPerDistanceUnit();
-        if (!rate) { updateUIStatus('Az utazási idő most nem számolható.'); return; }
-        const plan = planRoute(extraJobs, queueTailAnchor().pos, rate);
-        routeProposal = { ids: extraJobs.map(j => j.id).join(','), plan };
+        const r = currentRoutePlan();
+        if (!r) { updateUIStatus('Az utazási idő most nem számolható.'); return; }
+        routeProposal = { plan: r.plan, moved: r.gameJobs.length - r.keep };
         featured.open = false;
         renderToolsBox();
     }
 
+    // Planned again at the moment of applying: the feeder and the game's queue
+    // move on while the proposal sits on screen.
     function applyRouteProposal() {
-        const p = routeProposal;
         routeProposal = null;
-        if (!p) return;
-        let plan = p.plan;
-        // The feeder may have taken jobs off the front since: plan again on the
-        // list as it is now, rather than resurrect what has already gone.
-        if (extraJobs.map(j => j.id).join(',') !== p.ids) {
-            plan = planRoute(extraJobs, queueTailAnchor().pos, secondsPerDistanceUnit());
-        }
-        if (plan.after < plan.before - 1) {
-            extraJobs = plan.jobs;
-            queueChanged(`Sorrend átrendezve: ${formatDuration(plan.before - plan.after)} úttal kevesebb.`);
-        } else {
-            updateUIStatus('A sorrenden már nincs mit javítani.');
-        }
         renderToolsBox();
+        if (swapHold) { updateUIStatus('Egy átrendezés már folyamatban van.'); return; }
+        const r = currentRoutePlan();
+        if (!r || !(r.plan.after < r.plan.before - 1)) {
+            updateUIStatus('A sorrenden már nincs mit javítani.');
+            return;
+        }
+        const saved = formatDuration(r.plan.before - r.plan.after);
+        const n = r.gameJobs.length;
+        if (r.keep === n) {
+            extraJobs = r.plan.jobs.slice(n);
+            queueChanged(`Sorrend átrendezve: ${saved} úttal kevesebb.`);
+            return;
+        }
+        if (gameBusy()) {
+            updateUIStatus('A játék épp dolgozik a során – próbáld újra pár másodperc múlva.');
+            return;
+        }
+        const tasks = r.tasks.slice(r.keep);
+        updateUIStatus(`Átrendezés: ${tasks.length} munka lemondása a játék sorából…`);
+        cancelGameTasks(tasks, gone => {
+            if (gone.size === tasks.length) {
+                extraJobs = r.plan.jobs.slice(r.keep);
+                console.log(`[Lisa] Route: ${tasks.length} game-queue task(s) cancelled, the list reordered.`);
+                queueChanged(`Sorrend átrendezve: ${saved} úttal kevesebb.`, CONFIG.NEW_WORK_DELAY);
+                return;
+            }
+            // Partly failed: no reordering, but whatever did leave the game's queue
+            // goes back to the front of our list in its old order -- nothing is lost.
+            const back = r.gameJobs.slice(r.keep).filter((j, k) => gone.has(tasks[k].queueId));
+            extraJobs.unshift(...back);
+            queueChanged(`Az átrendezés elmaradt: ${tasks.length - gone.size} munkát nem sikerült lemondani.`,
+                         CONFIG.NEW_WORK_DELAY);
+        });
     }
 
     // ============================================================
@@ -4576,16 +4645,18 @@
         if (routeProposal) {
             const p = routeProposal.plan;
             const better = p.after < p.before - 1;
-            key = `route${Math.round(p.before)},${Math.round(p.after)}`;
+            key = `route${Math.round(p.before)},${Math.round(p.after)},${routeProposal.moved}`;
             if (key === toolsKey) return;
             parts.push(head('Útvonal', () => { routeProposal = null; renderToolsBox(); }));
             const row = document.createElement('div');
             row.className = 'lisa-tools-row';
             const txt = document.createElement('div');
+            const moved = routeProposal.moved;
             txt.textContent = better
                 ? `Út most ${formatDuration(p.before)} → átrendezve ${formatDuration(p.after)} (−${formatDuration(p.before - p.after)}).`
+                  + (moved ? ` A játék sorából ${moved} munkát újra sorba állít.` : '')
                 : `A mostani sorrend a legrövidebb (${formatDuration(p.before)} út).`;
-            txt.title = 'Csak a várakozó lista sorrendje változik; az alvások és a séták a helyükön maradnak, az azonos munkák egyben.';
+            txt.title = 'A játék sorának legfelső, már elkezdett munkája marad; az alvások és a séták a helyükön, az azonos munkák egyben.';
             row.appendChild(txt);
             const btns = document.createElement('div');
             btns.className = 'lisa-tools-btns';

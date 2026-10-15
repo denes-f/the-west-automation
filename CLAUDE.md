@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 458 assertions, no dependencies.
+  name and runs them against stubs. 466 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -36,12 +36,17 @@ live on hu27 (monkey, 2026-10-15, net energy 0 — the cancels refunded everythi
   game's queue and our list as one sequence (`jobBlocks`), can be moved to that job's cheapest gold
   and/or silver spot. The box shows the route change (`blockDetourSec`: only the two legs touching
   the run) and the extra $/XP. No popup ever — the user wanted only a marker. The game-queue part is
-  cancelled and queued again (see "Gold and silver locations"); the task already working at its
-  spot is left alone, and a game-queue run is only taken along if it reaches the END of the game's
-  queue. Measured: 8 jobs, 4 of them in the game's queue → all 8 at the gold spot, energy
+  cancelled and queued again (see "Gold and silver locations"); the game queue's **top task is
+  never touched** (the user's rule: it has started, on the road or working, and interrupting it
+  wastes the time spent), and a game-queue run is only taken along if it reaches the END of the
+  game's queue. Measured: 8 jobs, 4 of them in the game's queue → all 8 at the gold spot, energy
   96 → 100 → 96.
-- **Útvonal button**: reorders OUR list only, for the least travel. Sleeps and walks stay put and cut
-  it into segments; the same job at the same place moves as one block. Exact (Held-Karp) up to
+- **Útvonal button**: reorders for the least travel — our list AND the game queue's not-yet-started
+  tail (`planRouteWithGame`; again never the top task). The game can't reorder in place, so the
+  game-queue tasks from the first changed position on are cancelled and handed over again; the
+  unchanged prefix stays. Sleeps and walks stay put and cut it into segments (a sleep/walk in the
+  game's queue fixes everything before it); the same job at the same place moves as one block.
+  Measured: game queue A B A B + our A B → top A kept, then A A B B B, energy refunded and re-paid. Exact (Held-Karp) up to
   `ROUTE_EXACT_MAX` 12 places, nearest-neighbour + 2-opt above. Shows the saving, applies on
   confirm. Measured: a zig-zag list 9 p → 3 p of travel.
 - **Panel 390×300** (was 320×210), the user asked for more room.
@@ -118,7 +123,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `458 passed, 0 failed`.
+2. `node test-queue.js` should print `466 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
