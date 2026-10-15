@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 466 assertions, no dependencies.
+  name and runs them against stubs. 474 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -37,12 +37,15 @@ live on hu27 (monkey, 2026-10-15, net energy 0 — the cancels refunded everythi
   and/or silver spot. The box shows the route change (`blockDetourSec`: only the two legs touching
   the run) and the extra $/XP. No popup ever — the user wanted only a marker. The game-queue part is
   cancelled and queued again (see "Gold and silver locations"); the game queue's **top task is
-  never touched** (the user's rule: it has started, on the road or working, and interrupting it
-  wastes the time spent), and a game-queue run is only taken along if it reaches the END of the
+  never touched once the character is working at it** (the user's rule). While the character is
+  still on the road to it, it may move, and the walk done so far is charged as a loss
+  (`elapsedSec`/`lostSec`), and a game-queue run is only taken along if it reaches the END of the
   game's queue. Measured: 8 jobs, 4 of them in the game's queue → all 8 at the gold spot, energy
   96 → 100 → 96.
 - **Útvonal button**: reorders for the least travel — our list AND the game queue's not-yet-started
-  tail (`planRouteWithGame`; again never the top task). The game can't reorder in place, so the
+  tail (`planRouteWithGame`). A top task still on the road is planned both ways — kept (with the
+  rest of its walk ahead) or restarted from the starting point (its walk so far lost) — and the
+  cheaper wins; measured live: a 70 s walk at the top was moved, B A B A → A A B B. The game can't reorder in place, so the
   game-queue tasks from the first changed position on are cancelled and handed over again; the
   unchanged prefix stays. Sleeps and walks stay put and cut it into segments (a sleep/walk in the
   game's queue fixes everything before it); the same job at the same place moves as one block.
@@ -123,7 +126,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `466 passed, 0 failed`.
+2. `node test-queue.js` should print `474 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.
@@ -349,6 +352,10 @@ Keep-awake deliberately stays on: the reload is driven by the tick, and a frozen
   `featured_money`/`featured_xp` (15 s Újságárulás gold: +2 $/+1 XP on 2/1; Térítés silver: +1/+2).
 - The world-wide quota is not visible anywhere; a spot just stops being featured. Re-check before
   acting (`applyFeaturedSwap` re-reads the group first).
+- **A cancelled walk is lost**: measured (2026-10-15), `Character.position` stays at the STARTING
+  point while the character walks to a job (`task.wayData` = `{date_start, date_done}` in ms plus the
+  destination), and after a cancel the character is still there. So redirecting a task on the road
+  restarts from the start; the walk so far is the cost.
 - **Cancelling**: `TaskQueue.cancel(queuePos)` only records the task in `toCancel` and goes through
   the same debounced `batchStart` as add, so several cancels in one go become **one** request; the
   reply re-inits the queue. A cancelled not-yet-run job refunds its **whole** energy (measured

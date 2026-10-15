@@ -3793,20 +3793,31 @@
     }
 
     // The game's queue as the block finder and the route planner see it. The task
-    // at the top (queuePos 0) has started -- on the road or already working -- and
-    // is never interrupted: the user's rule, since cancelling it throws away the
-    // time already spent. Only the tasks behind it may be moved.
+    // at the top (queuePos 0) is never interrupted once the character is WORKING at
+    // it -- the user's rule. While the character is still on the road it may be
+    // moved, but that walk is lost: measured (2026-10-15), Character.position stays
+    // at the starting point during the walk and is still there after a cancel, so
+    // the character starts over from there. `elapsedSec` is that lost walk, and the
+    // callers charge it against the move.
     function gameQueueForBlocks() {
         if (!gameReady()) return [];
+        const nowSec = serverNowSec();
         return window.TaskQueue.queue.map((t, i) => {
             const p = t && t.post || {};
             const isJob = (p.taskType || t.type) === 'job' && !isNaN(parseInt(p.jobId, 10));
+            let onTheRoad = false, elapsedSec = 0;
+            if (i === 0) {
+                try { onTheRoad = typeof t.isArrived === 'function' && !t.isArrived(nowSec); } catch(e) {}
+                const started = t.wayData && t.wayData.date_start;
+                if (onTheRoad && typeof started === 'number') elapsedSec = Math.max(0, nowSec - started / 1000);
+            }
             return {
                 jobId: isJob ? parseInt(p.jobId, 10) : null,
                 x: walkCoord(p.x), y: walkCoord(p.y),
                 duration: parseInt(p.duration, 10) || null,
                 pos: taskPosition(t),
-                swappable: isJob && i > 0 && !!t.queueId,
+                swappable: isJob && !!t.queueId && (i > 0 || onTheRoad),
+                elapsedSec,
                 task: t,
             };
         });
@@ -3883,8 +3894,11 @@
             if (extraIds.length || (gameIdx.length && reachesEnd)) {
                 const prev = k > 0 ? seq[k - 1].pos : startPos;
                 const next = e + 1 < seq.length ? seq[e + 1].pos : null;
+                // Moving a run that holds the top task throws away the walk done so far.
+                const takesTop = reachesEnd && gameIdx[0] === 0;
                 blocks.push({
                     key: head.key, jobId: head.jobId, x: head.x, y: head.y, duration: head.duration,
+                    lostSec: takesTop ? (gameEntries[0].elapsedSec || 0) : 0,
                     name: (run.find(r => r.name) || {}).name || null,
                     gameIdx: reachesEnd ? gameIdx : [], extraIds,
                     count: (reachesEnd ? gameIdx.length : 0) + extraIds.length,
@@ -3922,7 +3936,7 @@
                 if (here && (here.gold || (kind === 'silver' && here.silver))) return null;
                 let pick = null;
                 spots.filter(f => f[kind] && !(f.x === b.x && f.y === b.y)).forEach(f => {
-                    const d = blockDetourSec(b, f, rate);
+                    const d = blockDetourSec(b, f, rate) + (b.lostSec || 0);
                     if (!pick || d < pick.detourSec) pick = { x: f.x, y: f.y, detourSec: d, kind };
                 });
                 return pick;
@@ -4169,6 +4183,24 @@
     // is how many of the game's movable tasks are still in their place, i.e. need
     // no cancelling.
     function planRouteWithGame(game, jobs, startPos, rate) {
+        const top = game[0];
+        const pinned = game.map((g, i) => (i === 0 ? Object.assign({}, g, { swappable: false }) : g));
+        const keepTop = planRouteFrom(top && top.swappable ? pinned : game, jobs, startPos, rate);
+        if (!top || !top.swappable || !top.pos || !startPos) return keepTop;
+        // The top task is still on the road, so it may move too. Both variants are
+        // put on one footing, "travel still ahead from now": the one that keeps the
+        // top task in place still has the rest of its walk ahead, the one that moves
+        // it starts over from the starting point (the walk so far is lost).
+        const leftOfWalk = Math.max(0, travelSec(startPos, top.pos, rate) - (top.elapsedSec || 0));
+        keepTop.plan.before += leftOfWalk;
+        keepTop.plan.after += leftOfWalk;
+        const moveTop = planRouteFrom(game, jobs, startPos, rate);
+        moveTop.plan.before -= top.elapsedSec || 0;
+        if (moveTop.keep > 0) moveTop.plan.after -= top.elapsedSec || 0;
+        return moveTop.plan.after < keepTop.plan.after - 1 ? moveTop : keepTop;
+    }
+
+    function planRouteFrom(game, jobs, startPos, rate) {
         const from = movableGameTail(game);
         const tail = game.slice(from);
         const start = (from > 0 && game[from - 1].pos) || startPos;
@@ -4177,7 +4209,7 @@
         const plan = planRoute(gameJobs.concat(jobs), start, rate);
         let keep = 0;
         while (keep < gameJobs.length && plan.jobs[keep] === gameJobs[keep]) keep++;
-        return { plan, gameJobs, tasks: tail.map(g => g.task), keep };
+        return { plan, gameJobs, tasks: tail.map(g => g.task), keep, from };
     }
 
     let routeProposal = null;    // { plan, moved } while the panel shows it
@@ -4656,7 +4688,7 @@
                 ? `Út most ${formatDuration(p.before)} → átrendezve ${formatDuration(p.after)} (−${formatDuration(p.before - p.after)}).`
                   + (moved ? ` A játék sorából ${moved} munkát újra sorba állít.` : '')
                 : `A mostani sorrend a legrövidebb (${formatDuration(p.before)} út).`;
-            txt.title = 'A játék sorának legfelső, már elkezdett munkája marad; az alvások és a séták a helyükön, az azonos munkák egyben.';
+            txt.title = 'A játék sorának legfelső munkája csak akkor mozdul, ha a karakter még úton van oda (az addigi út elvész, ez benne van a számításban); az alvások és a séták a helyükön, az azonos munkák egyben.';
             row.appendChild(txt);
             const btns = document.createElement('div');
             btns.className = 'lisa-tools-btns';

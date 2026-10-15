@@ -1839,7 +1839,7 @@ console.log('\n=== Gold/silver locations ===');
 CONFIG.ROUTE_EXACT_MAX = 12;
 eval(['featuredFromMapData', 'jobBlocks', 'travelSec', 'blockDetourSec', 'featuredOptions',
       'routeSegments', 'routeGroups', 'bestOrder', 'routeTravelSec', 'planRoute',
-      'movableGameTail', 'planRouteWithGame', 'jobNameOf'].map(extract).join('\n'));
+      'movableGameTail', 'planRouteWithGame', 'planRouteFrom', 'jobNameOf'].map(extract).join('\n'));
 
 // The measured shape (hu27, 2026-10-15): featured entries sit deep inside the
 // per-tile arrays of get_complete_data, only for gold/silver spots.
@@ -1953,6 +1953,26 @@ eq('a sleep/walk in the game queue fixes everything before it', gplan.gameJobs.m
 eq('...and the plan starts from it', gplan.plan.jobs.map(j => j.jobId), [3, 4]);
 gplan = planRouteWithGame([], [J('a', 1, 1000, 0), J('b', 2, 10, 0)], { x: 0, y: 0 }, 1);
 eq('an empty game queue plans our list from the character', gplan.plan.jobs.map(j => j.id), ['b', 'a']);
+
+// The top task while the character is still on the road (measured: the character
+// is back at the starting point after a cancel, so the walk so far is lost).
+const walking = (jobId, x, elapsedSec) => Object.assign(GQ(jobId, x), { elapsedSec });
+gplan = planRouteWithGame([walking(1, 1000, 100), GQ(2, 10), GQ(3, 1000)], [], { x: 0, y: 0 }, 1);
+eq('a top task still on the road can be moved', [gplan.keep, gplan.plan.jobs[0].jobId], [0, 2]);
+eq('...charging the lost walk: before is what is left from now', [gplan.plan.before, gplan.plan.after], [900 + 990 + 990, 10 + 990]);
+gplan = planRouteWithGame([walking(1, 1000, 950), GQ(2, 1020), GQ(3, 1010)], [], { x: 0, y: 0 }, 1);
+eq('almost there: it keeps its place', gplan.gameJobs.map(j => j.jobId), [2, 3]);
+eq('...and the rest is planned after it', gplan.plan.jobs.map(j => j.jobId), [3, 2]);
+eq('...with the rest of its walk counted', [gplan.plan.before, gplan.plan.after], [50 + 20 + 10, 50 + 10 + 10]);
+// Restarting can still win when the rest lies back near the start.
+gplan = planRouteWithGame([walking(1, 1000, 950), GQ(3, 1000), GQ(2, 10)], [], { x: 0, y: 0 }, 1);
+eq('...but a restart that saves more than the lost walk is taken', [gplan.keep, gplan.plan.after], [0, 10 + 990]);
+
+// A gold swap that takes the walking top task along pays for the lost walk too.
+blocks = jobBlocks([walking(71, 1000, 300), GQ(71, 1000)], [], { x: 0, y: 0 });
+eq('the run holding a walking top task knows what it would lose', [blocks[0].count, blocks[0].lostSec], [2, 300]);
+opts = featuredOptions(blocks, id => [{ jobId: 71, x: 1000, y: 500, gold: true, silver: false }], 1);
+eq('...and the detour includes it', Math.round(opts[0].gold.detourSec), Math.round(Math.hypot(1000, 500) - 1000 + 300));
 
 console.log('\n=== A swap holds the feeder ===');
 window.TaskQueue = makeGame(4, 0);
