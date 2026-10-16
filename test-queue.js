@@ -2039,6 +2039,41 @@ eq('a run already best placed stays', planRoute([J('a', 7, 20, 0)], { x: 0, y: 0
 gplan = planRouteWithGame([GQ(1, 0, false), GQ(7, 3000)], [], { x: 0, y: 0 }, 1, candFor);
 eq('a game task that only changes place still counts as moved', [gplan.keep, gplan.plan.moves.size], [0, 1]);
 
+// Reported live: a running job, then one job far north, then a sleep in a town to
+// the south. The job has a location on the way, but the sleep behind it used to
+// freeze the whole game queue, so nothing was offered.
+var runningSleepDecision = { queueId: 'qs', mode: 'enough' }, hotelRooms = null;
+eval(['gameTaskRebuilder', 'makeWalkEntry', 'walkDisplayName'].map(extract).join('\n'));
+{
+    const savedTQ = window.TaskQueue;
+    const sleepTask = { type: 'sleep', queueId: 'qs', post: { taskType: 'sleep' },
+        data: { townId: 9, room: 'cubby', town_name: 'X', x: 0, y: 1000 } };
+    const job = (qid, x, y) => ({ type: 'job', queueId: qid, post: { jobId: 7, taskType: 'job' },
+        data: { x, y, duration: 600 }, wayData: {}, isArrived: () => true });
+    window.TaskQueue = { queue: [job('q1', 0, 0), job('q2', 0, -1000), sleepTask], limit: { normal: 4 } };
+    const gq = gameQueueForBlocks();
+    eq('a queued sleep behind the top can be rebuilt', [!!gq[0].rebuild, !!gq[2].rebuild, gq[2].swappable], [false, true, false]);
+    const sleepEntry = gq[2].rebuild();
+    eq('...as the same sleep, with its decided mode', [sleepEntry.taskType, sleepEntry.townId, sleepEntry.room, sleepEntry.x, sleepEntry.y, sleepEntry.sleepMode, sleepEntry.modeChosen],
+       ['sleep', 9, 'cubby', 0, 1000, 'enough', true]);
+    const onTheWay = j => (j.jobId === 7 ? [{ x: 0, y: 400, tier: 0 }] : []);
+    gplan = planRouteWithGame(gq, [], { x: 0, y: 0 }, 1, onTheWay);
+    eq('the job in front of the sleep moves to the place on the way', [gplan.keep, gplan.plan.moves.size, gplan.plan.jobs.map(j => j.taskType)],
+       [0, 1, ['job', 'sleep']]);
+    eq('...the sleep is the fixed end of the leg', [gplan.plan.before, gplan.plan.after], [3000, 1000]);
+    gplan = planRouteWithGame(gq, [], { x: 0, y: 0 }, 1);
+    eq('nothing to gain: nothing is cancelled', gplan.keep, gplan.gameJobs.length);
+    sleepTask.data.townId = undefined;
+    eq('a sleep that cannot be rebuilt still fixes the queue', planRouteWithGame(gameQueueForBlocks(), [], { x: 0, y: 0 }, 1, onTheWay).gameJobs.length, 0);
+    const walk = { type: 'walk', queueId: 'qw', post: { taskType: 'walk', type: 'questgiver', unitId: 'circus', x: '5', y: '6' }, data: {} };
+    window.TaskQueue = { queue: [job('q1', 0, 0), walk], limit: { normal: 4 } };
+    const w = gameQueueForBlocks()[1].rebuild();
+    eq('a walk with coordinates is rebuilt from its post', [w.taskType, w.walkType, w.unitId, w.x, w.y], ['walk', 'questgiver', 'circus', 5, 6]);
+    delete walk.post.x;
+    eq('...one without them is not', gameQueueForBlocks()[1].rebuild, null);
+    window.TaskQueue = savedTQ;
+}
+
 console.log('\n=== A swap holds the feeder ===');
 window.TaskQueue = makeGame(4, 0);
 extraJobs = mkJobs(3); processing = false; nextJobTimer = null; scheduled = null;
@@ -2048,6 +2083,15 @@ eq('nothing is handed over while a swap cancels', [window.TaskQueue.queue.length
 swapHold = false; processing = false;
 await processQueue();
 eq('...and feeding resumes afterwards', window.TaskQueue.queue.length, 3);
+extraJobs = [];
+
+// Jobs behind a sleep must not go in the same batch: their energy would be taken
+// out of what the sleep is collecting.
+window.TaskQueue = makeGame(4, 0);
+extraJobs = mkJobs(3); extraJobs.splice(1, 0, { id: 'sl', taskType: 'sleep', townId: 1, room: 'cubby', jobName: 'Alvás', jobId: 0, x: 0, y: 0, duration: 3600, retries: 0, deferrals: 0, rejections: 0 });
+processing = false; nextJobTimer = null; scheduled = null;
+await processQueue();
+eq('a batch stops before a sleep', [window.TaskQueue.queue.length, extraJobs[0].taskType], [1, 'sleep']);
 extraJobs = [];
 
 console.log(`\n${pass} passed, ${fail} failed`);

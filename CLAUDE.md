@@ -6,7 +6,7 @@ jobs beyond that limit and feeds them in as slots free up.
 
 - `the-west-automation.js` — the whole userscript, single IIFE, no build step.
 - `test-queue.js` — `node test-queue.js`. Extracts the real functions out of the userscript by
-  name and runs them against stubs. 492 assertions, no dependencies.
+  name and runs them against stubs. 501 assertions, no dependencies.
 - `smoke-load.js` — `node smoke-load.js`. Runs the *whole* IIFE in a stubbed browser and checks
   `lisaDiag()` came up. `test-queue.js` pulls functions out by name, so it cannot see a script that
   fails to load at all (typo'd global, `const` in the temporal dead zone, missing browser API) —
@@ -27,8 +27,18 @@ After a change, run `./install.sh` and ask the user to reload; `lisaDiag().versi
 build is running. Both halves verified: Safari on 2026-10-14, the Chrome loader on 2026-10-15
 (a page reload picked up an edited file straight away, `lisaDiag().version` = 12.22).
 
-**Current release: v12.22.** Feature-complete and in daily use. The behaviour below is all verified;
+**Current release: v12.23.** Feature-complete and in daily use. The behaviour below is all verified;
 treat it as the baseline rather than something to redesign.
+
+**v12.23: a queued sleep or walk no longer freezes the route.** Reported live: a running job, one
+job far north, then a sleep in a town to the south — the job had a location on the way, but
+`movableGameTail` stopped at the sleep, so the whole game queue counted as fixed. A not-yet-started
+sleep/walk behind the top task is now rebuildable (`gameTaskRebuilder`: a sleep from `data`
+townId/room/x/y with its decided mode, a walk only with coordinates in `post`); it keeps its turn
+as a segment boundary, and if a job in front of it changes it is cancelled and queued again behind
+it. Also: `processQueue` stops a batch of jobs BEFORE a sleep (jobs behind a sleep in one batch
+would have had their energy taken out of what the sleep collects). Unit-tested only; not yet run
+live.
 
 **v12.22 adds gold/silver swaps and route ordering, and fixes two old rejection bugs.** All verified
 live on hu27 (monkey, 2026-10-15, net energy 0 — the cancels refunded everything).
@@ -139,7 +149,7 @@ suite covers the logic, not the DOM.
    **Check which character it is before spending anything**: on 2026-10-08 the signed-in Chrome
    session on `hu27` was a level-101 character, not the level-10 test one.
 1. Read this file first — the game facts below cost many live browser sessions to establish.
-2. `node test-queue.js` should print `492 passed, 0 failed`.
+2. `node test-queue.js` should print `501 passed, 0 failed`.
 3. For anything touching the game, open one tab and measure. Do not reason from the code alone;
    the code is right *because* of these measurements, not the other way round.
 4. Close your tab when finished and say what energy you spent.

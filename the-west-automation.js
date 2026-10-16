@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The-West Modular Job Queue (Lisa)
 // @namespace   http://tampermonkey.net/
-// @version     12.22
+// @version     12.23
 // @description A játék saját TaskQueue-ján keresztül indít munkát, a maradékot FIFO sorrendben sorba állítja, várható kezdés/befejezés kijelzéssel.
 // @author      Lisa
 // @include     https://*.the-west.hu/*
@@ -3005,10 +3005,12 @@
             // Nothing can vanish on an error, a rejection or an exception -- this is
             // what structurally rules out the "jobs vanished" class of bug.
             // A sleep is sent ALONE: the energy of jobs behind it would be deducted
-            // on entering the queue, out of the very energy the sleep collects.
-            const batch = extraJobs[0].taskType === 'sleep'
+            // on entering the queue, out of the very energy the sleep collects. So a
+            // batch of jobs also stops before a sleep, which goes in the next round.
+            const nextSleep = extraJobs.findIndex(j => j.taskType === 'sleep');
+            const batch = nextSleep === 0
                 ? extraJobs.slice(0, 1)
-                : extraJobs.slice(0, freeSlots());
+                : extraJobs.slice(0, Math.min(freeSlots(), nextSleep < 0 ? Infinity : nextSleep));
             console.log(`[Lisa] Starting ${batch.length} job(s) (${batch[0].jobName}...), free slots: ${freeSlots()}`);
 
             const accepted = startJobsViaGame(batch);
@@ -3544,7 +3546,7 @@
 
     // Queryable from outside, so the user can see what the defence is worth.
     window.lisaDiag = () => ({
-        version: '12.22',
+        version: '12.23',
         visible: isVisible(),
         focused: document.hasFocus(),
         ticker: tickWorker ? 'worker' : 'tab-timer',
@@ -3843,10 +3845,34 @@
                 duration: j.duration,
                 pos: taskPosition(t),
                 swappable: isJob && !!t.queueId && (i > 0 || onTheRoad),
+                rebuild: !isJob && i > 0 && t.queueId ? gameTaskRebuilder(t) : null,
                 elapsedSec,
                 task: t,
             };
         });
+    }
+
+    // A sleep or a walk behind the top task has not started yet, so it can be
+    // cancelled and queued again unchanged -- which is what lets the route reorder
+    // the jobs IN FRONT of it. Reported live: running job, one job far north, then
+    // a sleep in a town to the south; the job could not move to a location on the
+    // way, because the sleep after it froze the whole game queue. -> a factory for
+    // the list entry, or null when the task cannot be rebuilt exactly.
+    function gameTaskRebuilder(t) {
+        const type = (t.post && t.post.taskType) || t.type;
+        const d = t.data || {};
+        if (type === 'sleep' && d.townId && d.room && typeof d.x === 'number' && typeof d.y === 'number') {
+            const decided = runningSleepDecision && runningSleepDecision.queueId === t.queueId
+                ? runningSleepDecision.mode : undefined;
+            const info = hotelRooms && hotelRooms.townId === d.townId && hotelRooms.rooms
+                ? hotelRooms.rooms[d.room] : null;
+            return () => makeSleepEntry(d.townId, d.room, info && info.name, d.x, d.y, decided);
+        }
+        // Only a walk with coordinates: what the server needs is then all in post.
+        if (type === 'walk' && t.post && walkCoord(t.post.x) !== null && walkCoord(t.post.y) !== null) {
+            return () => makeWalkEntry(t.post, walkDisplayName(t.post));
+        }
+        return null;
     }
 
     function jobNameOf(jobId) {
@@ -4280,11 +4306,13 @@
         return locs.map(([x, y]) => ({ x, y, tier: tierAt(x, y) })).filter(c => c.tier >= mine);
     }
 
-    // The movable part of the game's queue: the jobs at its end, after the started
-    // top task and after anything that is not a job (a sleep or a walk stays put).
+    // The movable part of the game's queue: its end, after the started top task and
+    // after anything that cannot be queued again as it was. A not-yet-started sleep
+    // or walk can (gameTaskRebuilder): it keeps its turn in the plan, but if a job
+    // in front of it changes, it is cancelled and handed over again behind it.
     function movableGameTail(game) {
         let from = game.length;
-        while (from > 0 && game[from - 1].swappable) from--;
+        while (from > 0 && (game[from - 1].swappable || game[from - 1].rebuild)) from--;
         return from;
     }
 
@@ -4314,7 +4342,7 @@
         const from = movableGameTail(game);
         const tail = game.slice(from);
         const start = (from > 0 && game[from - 1].pos) || startPos;
-        const gameJobs = tail.map(g => makeJobEntry(
+        const gameJobs = tail.map(g => g.rebuild ? g.rebuild() : makeJobEntry(
             { jobId: g.jobId, x: g.x, y: g.y, duration: g.duration }, jobNameOf(g.jobId)));
         const plan = planRoute(gameJobs.concat(jobs), start, rate, candidatesOf);
         // A game task stays only if it keeps both its turn and its place.
@@ -5200,5 +5228,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
     else onDOMReady();
 
-    console.log('[Lisa] Modular v12.22 loaded.');
+    console.log('[Lisa] Modular v12.23 loaded.');
 })();
